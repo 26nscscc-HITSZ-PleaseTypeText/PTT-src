@@ -1,2 +1,5 @@
 # LAsrc
-这个仓库用来存储我们不同版本的rtl代码
+This repository is used to store different versions of our RTL code.
+
+
+BLG  是亚军！！！
