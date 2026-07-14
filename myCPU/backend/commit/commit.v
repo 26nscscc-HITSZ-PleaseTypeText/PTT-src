@@ -300,7 +300,12 @@ wire cmt1_has_excp = |cmt1_excp_i;
 wire cmt0_has_priv = |cmt0_priv_vec_i;
 wire cmt1_has_priv = |cmt1_priv_vec_i;
 
-wire int_take = !flush_pending_i && has_int_i && cmt0_valid_i && !uncached_ld_inflight_i;
+// 真 idle（非套件 `b 0`/0x50000000）：即使已有 has_int 也先退休完成，
+// FLUSH 到 pc+4；中断挂到后继 nop。这样 ERA/s4/NEMU 一致为 idle+4。
+// 若在 idle 上 int_take，NEMU（尤其 tcfg InitVal=0）会把 ERA 记成 idle 自身。
+wire cmt0_true_idle = cmt0_priv_vec_i[`PRIV_IDLE] && (cmt0_inst_i != 32'h50000000);
+wire int_take = !flush_pending_i && has_int_i && cmt0_valid_i && !uncached_ld_inflight_i
+                && !cmt0_true_idle;
 wire cmt0_ibar_block = cmt0_ready && cmt0_priv_vec_i[`PRIV_IBAR] && !sb_empty_i;
 wire cmt1_ibar_block = cmt1_ready && cmt1_priv_vec_i[`PRIV_IBAR] && !sb_empty_i;
 wire cmt0_store_block = cmt0_ready && cmt0_is_store_i && sb_full_i && !cmt0_has_excp;
@@ -383,10 +388,14 @@ assign rob_pop_o = (cmt0_valid_i || cmt1_valid_i) &&
 
 assign arf_we0_o = cmt0_effect && cmt0_rf_we_i && (cmt0_rd_i != 5'b0);
 assign arf_waddr0_o = cmt0_rd_i;
-assign arf_wdata0_o = cmt0_result_i;
+// sc.w 成功走 LSU，ROB result 是 store data（SB 仍用它入队）；ARF/差分要写回 1。
+// 失败走 ALU 且 result=0，is_store=0，保持 result。
+assign arf_wdata0_o = (cmt0_effect && cmt0_priv_vec_i[`PRIV_SC] && cmt0_is_store_i)
+                      ? 32'd1 : cmt0_result_i;
 assign arf_we1_o = cmt1_effect && cmt1_rf_we_i && (cmt1_rd_i != 5'b0);
 assign arf_waddr1_o = cmt1_rd_i;
-assign arf_wdata1_o = cmt1_result_i;
+assign arf_wdata1_o = (cmt1_effect && cmt1_priv_vec_i[`PRIV_SC] && cmt1_is_store_i)
+                      ? 32'd1 : cmt1_result_i;
 
 assign rat_cmt_en0_o = arf_we0_o;
 assign rat_cmt_addr0_o = cmt0_rd_i;
@@ -395,13 +404,18 @@ assign rat_cmt_en1_o = arf_we1_o;
 assign rat_cmt_addr1_o = cmt1_rd_i;
 assign rat_cmt_num1_o = cmt1_robid;
 
-assign sb_push_valid_o = (cmt0_effect && cmt0_is_store_i) ||
-                         (!cmt0_effect && cmt1_effect && cmt1_is_store_i);
-assign sb_push_paddr_o = (cmt0_effect && cmt0_is_store_i) ? cmt0_paddr_i : cmt1_paddr_i;
-assign sb_push_data_o = (cmt0_effect && cmt0_is_store_i) ? cmt0_result_i : cmt1_result_i;
-assign sb_push_wstrb_o = (cmt0_effect && cmt0_is_store_i) ? cmt0_wstrb_i : cmt1_wstrb_i;
-assign sb_push_size_o = (cmt0_effect && cmt0_is_store_i) ? cmt0_size_i : cmt1_size_i;
-assign sb_push_uncached_o = (cmt0_effect && cmt0_is_store_i) ? cmt0_uncached_i : cmt1_uncached_i;
+// 单 SB 入队口：优先槽0 store；槽1 store 在「本拍槽0 不是 store」时入队。
+// 旧式 `!cmt0_effect && cmt1_effect && store` 会丢掉双提交里的 (非store, store)：
+// 槽1 已退休却未入 SB，后续 load 读到旧值 0（func_lab19 n14_ld_w）。
+// 双 store 仍由 cmt1_single_limit 串行化，避免同拍丢槽1。
+wire sb_push_from0 = cmt0_effect && cmt0_is_store_i;
+wire sb_push_from1 = cmt1_effect && cmt1_is_store_i && !sb_push_from0;
+assign sb_push_valid_o = sb_push_from0 || sb_push_from1;
+assign sb_push_paddr_o = sb_push_from0 ? cmt0_paddr_i : cmt1_paddr_i;
+assign sb_push_data_o = sb_push_from0 ? cmt0_result_i : cmt1_result_i;
+assign sb_push_wstrb_o = sb_push_from0 ? cmt0_wstrb_i : cmt1_wstrb_i;
+assign sb_push_size_o = sb_push_from0 ? cmt0_size_i : cmt1_size_i;
+assign sb_push_uncached_o = sb_push_from0 ? cmt0_uncached_i : cmt1_uncached_i;
 
 assign csr_cmt_valid_o = cmt0_retire || cmt1_retire;
 assign csr_cmt_pc_o = sel_pc;
@@ -473,12 +487,12 @@ assign flush_type_o = selected_excp_take ? `FLUSH_EXCP :
                       selected_priv_flush ? `FLUSH_REFETCH :
                       selected_mispred ? `FLUSH_MISPRED :
                       `FLUSH_NONE;
-// idle：重取指目标必须是 idle 自身 PC（不是 pc+4）。定时器到期唤醒后 idle_pc 再入流水，
-// 携带 has_int → 提交拍 int_take 进 EENTRY，此时 ERA=idle_pc（与手册/测试套件 int_ex handler
-// 的 `bne r27,ERA`(r27=idle_pc) 检查一致）；handler 清 TICLR 后 ex_finish 做 ERA+4 返回 idle_pc+4。
-// 若取 pc+4，ERA=idle_pc+4，handler 校验失败提前返回、不清 TICLR → 定时器中断反复触发活锁。
+// 真 idle：FLUSH 到 pc+4 + ctrl 冻取指；唤醒后取后继并 int_take（ERA=后继）。
+// 套件 `b 0`(0x50000000)：仍 FLUSH 回自身，int_take 可附着其上（n49 ERA=循环 PC）。
 assign flush_pc_o = selected_excp_take ? csr_next_pc_i :
                     (selected_effect && sel_priv[`PRIV_ERTN]) ? csr_next_pc_i :
+                    (selected_priv_flush && sel_priv[`PRIV_IDLE] &&
+                     (sel_inst != 32'h50000000)) ? (sel_pc + 32'd4) :
                     (selected_priv_flush && sel_priv[`PRIV_IDLE]) ? sel_pc :
                     selected_priv_flush ? (sel_pc + 32'd4) :
                     selected_mispred ? (sel_br_taken ? sel_br_target : (sel_pc + 32'd4)) :
@@ -489,13 +503,13 @@ assign debug0_valid_o = cmt0_effect;
 assign debug0_pc_o = cmt0_pc_i;
 assign debug0_rf_wen_o = arf_we0_o ? 4'hf : 4'h0;
 assign debug0_rf_wnum_o = cmt0_rd_i;
-assign debug0_rf_wdata_o = cmt0_result_i;
+assign debug0_rf_wdata_o = arf_wdata0_o;
 assign debug0_inst_o = cmt0_inst_i;
 assign debug1_valid_o = cmt1_effect;
 assign debug1_pc_o = cmt1_pc_i;
 assign debug1_rf_wen_o = arf_we1_o ? 4'hf : 4'h0;
 assign debug1_rf_wnum_o = cmt1_rd_i;
-assign debug1_rf_wdata_o = cmt1_result_i;
+assign debug1_rf_wdata_o = arf_wdata1_o;
 assign debug1_inst_o = cmt1_inst_i;
 
 endmodule

@@ -1589,8 +1589,14 @@ module core_top #(
     wire        sb_q_hit;
     wire [31:0] sb_q_data;
     wire        sb_q_partial;
-    // ROB 队头（uncached load 许可）
+    // ROB 队头（uncached load 许可 / store 序）
+    // LSU 约定 head_robid 编码：MSB=槽0 是否仍未提交，低位=head 对指针。
+    // rob.head_robid0_o 本身是真 robid ({0,head})，供 commit/RAT 用，不能改；
+    // 这里用 cmt0_valid 拼装后只喂给 LSU。
     wire [`ROB_W-1:0] rob_head_robid0;
+    wire        rob_cmt0_valid,    rob_cmt1_valid;
+    wire [`ROB_W-1:0] lsu_rob_head_enc =
+        {rob_cmt0_valid, rob_head_robid0[`ROB_PAIR_W-1:0]};
     wire        lsu_unc_inflight;
 
     lsu u_lsu(
@@ -1630,7 +1636,7 @@ module core_top #(
         .sb_query_hit_i   (sb_q_hit),
         .sb_query_data_i  (sb_q_data),
         .sb_query_partial_i(sb_q_partial),
-        .rob_head_robid_i (rob_head_robid0),
+        .rob_head_robid_i (lsu_rob_head_enc),
         .rob_head_valid_i (~rob_empty),
         .uncached_ld_inflight_o(lsu_unc_inflight),
         .wb_valid_o       (mem_wb_valid),
@@ -1698,8 +1704,7 @@ module core_top #(
 //--------------------------------------------------
 // ROB / commit 信号声明
 //--------------------------------------------------
-    // ROB 提交口（队头一对）
-    wire        rob_cmt0_valid,    rob_cmt1_valid;
+    // ROB 提交口（队头一对；cmt*_valid 已在 LSU 前声明）
     wire        rob_cmt0_complete, rob_cmt1_complete;
     wire [31:0] rob_cmt0_pc,       rob_cmt1_pc;
     wire [31:0] rob_cmt0_inst,     rob_cmt1_inst;
@@ -2601,6 +2606,17 @@ module core_top #(
     wire dbg0_is_ld_bu= (cmt_dbg0_inst[31:26] == 6'h0a) && (cmt_dbg0_inst[25:22] == 4'h8);
     wire dbg0_is_ll_w = (cmt_dbg0_inst[31:29] == 3'b001) && (cmt_dbg0_inst[28:24] == 5'b00000);
     wire dbg0_is_sc_w = (cmt_dbg0_inst[31:29] == 3'b001) && (cmt_dbg0_inst[28:24] == 5'b00001);
+    // rdcntvl/vh：提交时把 DUT 读到的半字同步进 NEMU（见 difftest.cpp is_CNTinst）
+    wire dbg0_is_rdcntvl = (cmt_dbg0_inst[31:15] == 17'b0) && (cmt_dbg0_inst[14:10] == 5'h18)
+                        && (cmt_dbg0_inst[9:5] == 5'h0) && (cmt_dbg0_inst[4:0] != 5'h0);
+    wire dbg0_is_rdcntvh = (cmt_dbg0_inst[31:15] == 17'b0) && (cmt_dbg0_inst[14:10] == 5'h19)
+                        && (cmt_dbg0_inst[9:5] == 5'h0);
+    wire dbg0_is_cntinst = dbg0_is_rdcntvl | dbg0_is_rdcntvh;
+    wire [63:0] dbg0_timer64 = dbg0_is_rdcntvh ? {cmt_dbg0_wdata, 32'b0}
+                                               : {32'b0, cmt_dbg0_wdata};
+    // tlbfill：须把提交拍使用的 rand_index 同步给 NEMU，否则两边写入不同表项
+    wire dbg0_is_tlbfill = (cmt_dbg0_inst[31:10] == 22'h1920d) // 01_1001_00_10000_01101
+                        && (cmt_dbg0_inst[9:0] == 10'b0);
     wire dbg1_is_st_w = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h6);
     wire dbg1_is_st_h = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h5);
     wire dbg1_is_st_b = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h4);
@@ -2611,6 +2627,15 @@ module core_top #(
     wire dbg1_is_ld_bu= (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h8);
     wire dbg1_is_ll_w = (cmt_dbg1_inst[31:29] == 3'b001) && (cmt_dbg1_inst[28:24] == 5'b00000);
     wire dbg1_is_sc_w = (cmt_dbg1_inst[31:29] == 3'b001) && (cmt_dbg1_inst[28:24] == 5'b00001);
+    wire dbg1_is_rdcntvl = (cmt_dbg1_inst[31:15] == 17'b0) && (cmt_dbg1_inst[14:10] == 5'h18)
+                        && (cmt_dbg1_inst[9:5] == 5'h0) && (cmt_dbg1_inst[4:0] != 5'h0);
+    wire dbg1_is_rdcntvh = (cmt_dbg1_inst[31:15] == 17'b0) && (cmt_dbg1_inst[14:10] == 5'h19)
+                        && (cmt_dbg1_inst[9:5] == 5'h0);
+    wire dbg1_is_cntinst = dbg1_is_rdcntvl | dbg1_is_rdcntvh;
+    wire [63:0] dbg1_timer64 = dbg1_is_rdcntvh ? {cmt_dbg1_wdata, 32'b0}
+                                               : {32'b0, cmt_dbg1_wdata};
+    wire dbg1_is_tlbfill = (cmt_dbg1_inst[31:10] == 22'h1920d)
+                        && (cmt_dbg1_inst[9:0] == 10'b0);
 
     // 提交拍打一拍后送 DPI（槽 0）
     reg         cmt0_valid_r;
@@ -2620,6 +2645,10 @@ module core_top #(
     reg  [7:0]  cmt0_ld_en_r, cmt0_st_en_r;
     reg  [31:0] cmt0_ld_paddr_r, cmt0_ld_vaddr_r;
     reg  [31:0] cmt0_st_paddr_r, cmt0_st_vaddr_r, cmt0_st_data_r;
+    reg         cmt0_is_cnt_r;
+    reg  [63:0] cmt0_timer64_r;
+    reg         cmt0_is_tlbfill_r;
+    reg  [4:0]  cmt0_tlbfill_idx_r;
     reg         excp_flush_r, ertn_flush_r;
     reg  [31:0] excp_pc_r, excp_inst_r;
     reg  [7:0]  excp_ecode_r;
@@ -2631,6 +2660,10 @@ module core_top #(
     reg  [7:0]  cmt1_ld_en_r, cmt1_st_en_r;
     reg  [31:0] cmt1_ld_paddr_r, cmt1_ld_vaddr_r;
     reg  [31:0] cmt1_st_paddr_r, cmt1_st_vaddr_r, cmt1_st_data_r;
+    reg         cmt1_is_cnt_r;
+    reg  [63:0] cmt1_timer64_r;
+    reg         cmt1_is_tlbfill_r;
+    reg  [4:0]  cmt1_tlbfill_idx_r;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -2641,12 +2674,16 @@ module core_top #(
             cmt0_ld_en_r <= 8'b0;  cmt0_st_en_r <= 8'b0;
             cmt0_ld_paddr_r <= 32'b0; cmt0_ld_vaddr_r <= 32'b0;
             cmt0_st_paddr_r <= 32'b0; cmt0_st_vaddr_r <= 32'b0; cmt0_st_data_r <= 32'b0;
+            cmt0_is_cnt_r <= 1'b0; cmt0_timer64_r <= 64'b0;
+            cmt0_is_tlbfill_r <= 1'b0; cmt0_tlbfill_idx_r <= 5'b0;
             excp_pc_r <= 32'b0;    excp_inst_r <= 32'b0;  excp_ecode_r <= 8'b0;
             cmt1_pc_r <= 32'b0;    cmt1_inst_r <= 32'b0;  cmt1_wdata_r <= 32'b0;
             cmt1_wdest_r <= 8'b0;  cmt1_wen_r <= 1'b0;
             cmt1_ld_en_r <= 8'b0;  cmt1_st_en_r <= 8'b0;
             cmt1_ld_paddr_r <= 32'b0; cmt1_ld_vaddr_r <= 32'b0;
             cmt1_st_paddr_r <= 32'b0; cmt1_st_vaddr_r <= 32'b0; cmt1_st_data_r <= 32'b0;
+            cmt1_is_cnt_r <= 1'b0; cmt1_timer64_r <= 64'b0;
+            cmt1_is_tlbfill_r <= 1'b0; cmt1_tlbfill_idx_r <= 5'b0;
         end else begin
             cmt0_valid_r    <= cmt_dbg0_valid;
             cmt0_pc_r       <= cmt_dbg0_pc;
@@ -2664,6 +2701,10 @@ module core_top #(
             cmt0_st_paddr_r <= rob_cmt0_paddr;
             cmt0_st_vaddr_r <= rob_cmt0_vaddr;
             cmt0_st_data_r  <= rob_cmt0_result;
+            cmt0_is_cnt_r   <= cmt_dbg0_valid && dbg0_is_cntinst;
+            cmt0_timer64_r  <= dbg0_timer64;
+            cmt0_is_tlbfill_r  <= cmt_dbg0_valid && dbg0_is_tlbfill;
+            cmt0_tlbfill_idx_r <= csr_rand_index;
             excp_flush_r    <= cmt_flush_req && (cmt_flush_type == `FLUSH_EXCP);
             ertn_flush_r    <= cmt_flush_req && (cmt_flush_type == `FLUSH_ERTN);
             excp_pc_r       <= cmt_csr_pc;
@@ -2685,6 +2726,10 @@ module core_top #(
             cmt1_st_paddr_r <= rob_cmt1_paddr;
             cmt1_st_vaddr_r <= rob_cmt1_vaddr;
             cmt1_st_data_r  <= rob_cmt1_result;
+            cmt1_is_cnt_r   <= cmt_dbg1_valid && dbg1_is_cntinst;
+            cmt1_timer64_r  <= dbg1_timer64;
+            cmt1_is_tlbfill_r  <= cmt_dbg1_valid && dbg1_is_tlbfill;
+            cmt1_tlbfill_idx_r <= csr_rand_index;
         end
     end
 
@@ -2709,8 +2754,29 @@ module core_top #(
     wire [7:0]  diff_st0_en    = cmt0_valid_r ? cmt0_st_en_r : cmt1_st_en_r;
     wire [31:0] diff_st0_paddr = cmt0_valid_r ? cmt0_st_paddr_r : cmt1_st_paddr_r;
     wire [31:0] diff_st0_vaddr = cmt0_valid_r ? cmt0_st_vaddr_r : cmt1_st_vaddr_r;
-    wire [31:0] diff_st0_data  = cmt0_valid_r ? cmt0_st_data_r  : cmt1_st_data_r;
-    wire [7:0]  diff_st1_en    = diff_cmt1_v ? cmt1_st_en_r : 8'b0;
+    // LSU/ROB 中 store data 是按写选通复制的内存字（便于 SB/DCache）；
+    // NEMU StoreEvent 要「落在目标字节道、其余为 0」：st.b@+0→0xa，st.h@+2→0x00f00000。
+    // 用 vaddr[1:0] 生成字节掩码，从复制字里剥出与 REF 同口径的值。
+    function automatic [31:0] diff_store_nbytes;
+        input [7:0]  st_en;
+        input [31:0] st_data;
+        input [31:0] st_vaddr;
+        reg   [31:0] mask;
+        begin
+            if (st_en[0])      mask = 32'h000000ff << {st_vaddr[1:0], 3'b0};
+            else if (st_en[1]) mask = 32'h0000ffff << {st_vaddr[1], 4'b0};
+            else               mask = 32'hffffffff;
+            diff_store_nbytes = st_data & mask;
+        end
+    endfunction
+    wire [31:0] diff_st0_data_raw = cmt0_valid_r ? cmt0_st_data_r : cmt1_st_data_r;
+    wire [31:0] diff_st0_data = diff_store_nbytes(diff_st0_en, diff_st0_data_raw, diff_st0_vaddr);
+    wire [7:0]  diff_st1_en   = diff_cmt1_v ? cmt1_st_en_r : 8'b0;
+    wire [31:0] diff_st1_data = diff_store_nbytes(diff_st1_en, cmt1_st_data_r, cmt1_st_vaddr_r);
+    wire        diff_cmt0_cnt = cmt0_valid_r ? cmt0_is_cnt_r : cmt1_is_cnt_r;
+    wire [63:0] diff_cmt0_tmr = cmt0_valid_r ? cmt0_timer64_r : cmt1_timer64_r;
+    wire        diff_cmt0_fill = cmt0_valid_r ? cmt0_is_tlbfill_r : cmt1_is_tlbfill_r;
+    wire [4:0]  diff_cmt0_fidx = cmt0_valid_r ? cmt0_tlbfill_idx_r : cmt1_tlbfill_idx_r;
 
     DifftestInstrCommit diff_instr_commit0(
         .clock          (clk),
@@ -2720,10 +2786,10 @@ module core_top #(
         .pc             ({32'b0, diff_cmt0_pc}),
         .instr          (diff_cmt0_inst),
         .skip           (1'b0),
-        .is_TLBFILL     (1'b0),               //TODO: tlbfill 提交拍置位 + rand_index
-        .TLBFILL_index  (5'b0),
-        .is_CNTinst     (1'b0),               //TODO: rdcnt 提交拍置位 + timer_64
-        .timer_64_value (64'b0),
+        .is_TLBFILL     (diff_cmt0_fill),
+        .TLBFILL_index  (diff_cmt0_fidx),
+        .is_CNTinst     (diff_cmt0_cnt),
+        .timer_64_value (diff_cmt0_tmr),
         .wen            (diff_cmt0_wen),
         .wdest          (diff_cmt0_wdest),
         .wdata          ({32'b0, diff_cmt0_wdata}),
@@ -2739,10 +2805,10 @@ module core_top #(
         .pc             ({32'b0, cmt1_pc_r}),
         .instr          (cmt1_inst_r),
         .skip           (1'b0),
-        .is_TLBFILL     (1'b0),
-        .TLBFILL_index  (5'b0),
-        .is_CNTinst     (1'b0),
-        .timer_64_value (64'b0),
+        .is_TLBFILL     (diff_cmt1_v & cmt1_is_tlbfill_r),
+        .TLBFILL_index  (cmt1_tlbfill_idx_r),
+        .is_CNTinst     (diff_cmt1_v & cmt1_is_cnt_r),
+        .timer_64_value (cmt1_timer64_r),
         .wen            (cmt1_wen_r),
         .wdest          (cmt1_wdest_r),
         .wdata          ({32'b0, cmt1_wdata_r}),
@@ -2788,7 +2854,7 @@ module core_top #(
         .valid      (diff_st1_en),
         .storePAddr ({32'b0, cmt1_st_paddr_r}),
         .storeVAddr ({32'b0, cmt1_st_vaddr_r}),
-        .storeData  ({32'b0, cmt1_st_data_r})
+        .storeData  ({32'b0, diff_st1_data})
     );
 
     DifftestLoadEvent diff_load_event0(

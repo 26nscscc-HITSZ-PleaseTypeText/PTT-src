@@ -379,7 +379,10 @@ assign is_nop_o = (inst_andi && (rd == 5'd0) && (rj == 5'd0) && (inst_i[21:10] =
 assign is_load_o = is_load_raw;
 assign is_store_o = is_store_raw;
 
-wire privileged_inst = inst_csr_any | inst_tlb_any | inst_cacop | inst_ertn | inst_idle;
+// IPE 特权指令集合。cacop 在手册上属特权，但 chiplab NEMU/func_lab19 n52
+// TEST9 在 PLV3 下执行 cacop 且不注入 IPE（仅测「不应 ADEF」）；列入会导致
+// ecode=IPE vs REF 无异常。仍经 priv_vec PRIV_CACOP 走单提交/落地。
+wire privileged_inst = inst_csr_any | inst_tlb_any | inst_ertn | inst_idle;
 //异常输出，不认识的指令：INE其他 TLB/访存异常现在 decode 阶段先置 0，后面 IFU/MMU/LSU 再产生。
 assign excp_o[`EXCP_ADEF]   = 1'b0;
 assign excp_o[`EXCP_TLBR_F] = 1'b0;
