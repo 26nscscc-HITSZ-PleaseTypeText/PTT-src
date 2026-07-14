@@ -20,6 +20,8 @@ module ftb(
     input  wire [31:0]                query_pc_i,          // 块起始 PC
 
     output wire                       hit_o,               // （相对查询晚 1 拍）
+    output wire                       resp_valid_o,
+    output wire [1:0]                 hit_way_o,
     output wire [31:0]                jump_target_o,       // 块内分支的跳转目标
     output wire [31:0]                fall_through_o,      // 块顺序出口地址（start_pc + 4*块长）
     output wire [`BR_TYPE_W-1:0]      br_type_o,           // 分支类型
@@ -107,6 +109,8 @@ wire [ENTRY_W-1:0] q_entry = way_rdata[q_way];
 wire [`BLK_LEN_W-1:0] q_len = q_entry[32 +: `BLK_LEN_W];
 
 assign hit_o          = |q_hit;
+assign resp_valid_o   = q_valid_r;
+assign hit_way_o      = q_way;
 assign jump_target_o  = q_entry[31:0];
 assign fall_through_o = q_pc_r + {27'b0, q_len, 2'b00};
 assign br_type_o      = q_entry[32+`BLK_LEN_W +: `BR_TYPE_W];
@@ -180,6 +184,37 @@ end
 
 // lint 吸收（alloc 标志当前未区分语义：命中即原地更新，未命中即分配）
 wire ftb_lint = u0_alloc;
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+reg [63:0] ftb_query_total;
+reg [63:0] ftb_query_suppressed_by_train;
+reg [63:0] ftb_response_total;
+reg [63:0] ftb_hit_total;
+reg [63:0] ftb_train_total;
+
+always @(posedge clk) begin
+    if (reset) begin
+        ftb_query_total               <= 64'd0;
+        ftb_query_suppressed_by_train <= 64'd0;
+        ftb_response_total            <= 64'd0;
+        ftb_hit_total                 <= 64'd0;
+        ftb_train_total               <= 64'd0;
+    end else begin
+        if (query_valid_i)
+            ftb_query_total <= ftb_query_total + 64'd1;
+        if (query_valid_i && rd_steal && !initing)
+            ftb_query_suppressed_by_train <= ftb_query_suppressed_by_train + 64'd1;
+        if (q_valid_r)
+            ftb_response_total <= ftb_response_total + 64'd1;
+        if (hit_o)
+            ftb_hit_total <= ftb_hit_total + 64'd1;
+        if (update_valid_i)
+            ftb_train_total <= ftb_train_total + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
 
 endmodule
 

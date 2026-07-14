@@ -26,6 +26,7 @@ module ftq(
     input  wire [`BR_TYPE_W-1:0]      p0_br_type_i,
 
     input  wire                       p1_valid_i,          // 覆盖 bpu_ptr-1 处的块（主预测修正）
+    input  wire                       p1_meta_valid_i,
     input  wire [31:0]                p1_pc_i,
     input  wire [`BLK_LEN_W-1:0]      p1_length_i,
     input  wire                       p1_taken_i,
@@ -195,6 +196,8 @@ always @(posedge clk) begin
             blk_taken[bpu_prev]  <= p1_taken_i;
             blk_target[bpu_prev] <= p1_target_i;
             blk_btype[bpu_prev]  <= p1_br_type_i;
+        end
+        if (p1_meta_valid_i) begin
             blk_meta[bpu_prev]   <= p1_meta_i;
         end
 
@@ -245,5 +248,43 @@ assign train_meta_o         = train_meta_r;
 
 // lint 吸收（blk_btype 读口暂未对外）
 wire ftq_lint = (|blk_btype[0]);
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+reg [63:0] p1_meta_saved_count;
+reg [63:0] p1_correction_count;
+reg [63:0] commit_cond_branch_count;
+reg [63:0] commit_cond_mispred_count;
+reg [63:0] commit_cond_meta_valid_count;
+reg [63:0] commit_cond_meta_invalid_count;
+
+localparam META_TAGE_VALID_BIT = 38;
+
+always @(posedge clk) begin
+    if (reset) begin
+        p1_meta_saved_count       <= 64'd0;
+        p1_correction_count       <= 64'd0;
+        commit_cond_branch_count  <= 64'd0;
+        commit_cond_mispred_count <= 64'd0;
+        commit_cond_meta_valid_count <= 64'd0;
+        commit_cond_meta_invalid_count <= 64'd0;
+    end else begin
+        if (p1_meta_valid_i)
+            p1_meta_saved_count <= p1_meta_saved_count + 64'd1;
+        if (p1_valid_i)
+            p1_correction_count <= p1_correction_count + 64'd1;
+        if (cmt_valid_i && cmt_is_branch_i && (cmt_br_type_i == `BR_TYPE_COND)) begin
+            commit_cond_branch_count <= commit_cond_branch_count + 64'd1;
+            if (blk_meta[cmt_ftq_id_i][META_TAGE_VALID_BIT])
+                commit_cond_meta_valid_count <= commit_cond_meta_valid_count + 64'd1;
+            else
+                commit_cond_meta_invalid_count <= commit_cond_meta_invalid_count + 64'd1;
+        end
+        if (cmt_valid_i && cmt_is_branch_i && (cmt_br_type_i == `BR_TYPE_COND) && cmt_mispred_i)
+            commit_cond_mispred_count <= commit_cond_mispred_count + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
 
 endmodule

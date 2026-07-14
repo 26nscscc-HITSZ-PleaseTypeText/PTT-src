@@ -24,6 +24,7 @@ module tage(
     input  wire [31:0]                query_pc_i,         // 预测块起始 PC
 
     output wire                       taken_o,            // 方向预测（晚 1 拍）
+    output wire                       resp_valid_o,
     output wire [`BPU_META_W-1:0]     meta_o,             // 训练元数据
 
     // ---------------- 训练口（提交级，仅条件分支）----------------
@@ -36,7 +37,20 @@ module tage(
 
 localparam BASE_IDXW = 13;          // 8192
 localparam TIDXW     = 10;          // 1024
-localparam TENTRY_W  = `TAGE_TAG_W + 3 + 2;   // {tag, ctr, useful} = 17
+localparam TENTRY_W  = 1 + `TAGE_TAG_W + 3 + 2;   // {valid, tag, ctr, useful} = 18
+localparam META_RAW_W              = 38;
+localparam META_HITS_LSB           = 0;
+localparam META_BASE_IDX_LSB       = 4;
+localparam META_BASE_CTR_LSB       = 17;
+localparam META_ALT_TAKEN_BIT      = 19;
+localparam META_PROVIDER_VALID_BIT = 20;
+localparam META_PROVIDER_ID_LSB    = 21;
+localparam META_PROVIDER_IDX_LSB   = 23;
+localparam META_PROVIDER_CTR_LSB   = 33;
+localparam META_PROVIDER_U_LSB     = 36;
+localparam META_TAGE_VALID_BIT     = 38;
+localparam META_PROVIDER_TAG_LSB   = 43;
+localparam META_PROVIDER_TAG_W     = `TAGE_TAG_W;
 
 // ---------------- GHR ----------------
 reg [`GHR_LEN-1:0] ghr;
@@ -89,8 +103,10 @@ endfunction
 
 // ---------------- 训练流水寄存器（T0 借读口）----------------
 reg        t0_valid;
+reg        t0_ghr_valid;
 reg [31:0] t0_pc;
 reg        t0_taken, t0_mispred;
+reg        t0_ghr_taken;
 reg [`BPU_META_W-1:0] t0_meta;
 reg        t1_valid;
 reg        t1_taken, t1_mispred;
@@ -157,7 +173,9 @@ end
 wire [3:0] thit;
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_thit
-    assign thit[g] = q_valid_r && (t_rdata[g][TENTRY_W-1 -: `TAGE_TAG_W] == q_tag_r[g]);
+    assign thit[g] = q_valid_r
+                    && t_rdata[g][TENTRY_W-1]
+                    && (t_rdata[g][TENTRY_W-2 -: `TAGE_TAG_W] == q_tag_r[g]);
 end
 endgenerate
 
@@ -166,26 +184,33 @@ wire       prov_valid = |thit;
 wire [1:0] prov_id    = thit[3] ? 2'd3 : thit[2] ? 2'd2 : thit[1] ? 2'd1 : 2'd0;
 wire [2:0] prov_ctr   = t_rdata[prov_id][4:2];
 wire [1:0] prov_u     = t_rdata[prov_id][1:0];
+wire [`TAGE_TAG_W-1:0] prov_tag = t_rdata[prov_id][TENTRY_W-2 -: `TAGE_TAG_W];
 wire       base_taken = base_rdata[1];
 
-assign taken_o = prov_valid ? prov_ctr[2] : base_taken;
+assign resp_valid_o = q_valid_r;
+assign taken_o = q_valid_r && (prov_valid ? prov_ctr[2] : base_taken);
 
 // meta 打包：{prov_useful(2), prov_ctr(3), prov_idx(10), prov_id(2), prov_valid(1),
 //             alt_taken(1), base_ctr(2), base_idx(13), hits(4)}  共 38 位
-assign meta_o = { {(`BPU_META_W-38){1'b0}},
-                  prov_u, prov_ctr, q_idx_r[prov_id], prov_id, prov_valid,
-                  base_taken, base_rdata, q_bidx_r, thit };
+wire [`BPU_META_W-1:0] meta_raw =
+    { {(`BPU_META_W-META_RAW_W){1'b0}},
+      prov_u, prov_ctr, q_idx_r[prov_id], prov_id, prov_valid,
+      base_taken, base_rdata, q_bidx_r, thit };
+wire [`BPU_META_W-1:0] meta_provider_tag =
+    { {(`BPU_META_W-META_PROVIDER_TAG_W){1'b0}}, prov_tag } << META_PROVIDER_TAG_LSB;
+assign meta_o = q_valid_r ? (meta_raw | meta_provider_tag) : {`BPU_META_W{1'b0}};
 
 // meta 解包（训练端）
-wire [3:0]            m_hits     = t1_meta[3:0];
-wire [BASE_IDXW-1:0]  m_base_idx = t1_meta[4 +: BASE_IDXW];
-wire [1:0]            m_base_ctr = t1_meta[17 +: 2];
-wire                  m_alt      = t1_meta[19];
-wire                  m_pvalid   = t1_meta[20];
-wire [1:0]            m_pid      = t1_meta[21 +: 2];
-wire [TIDXW-1:0]      m_pidx     = t1_meta[23 +: TIDXW];
-wire [2:0]            m_pctr     = t1_meta[33 +: 3];
-wire [1:0]            m_pu       = t1_meta[36 +: 2];
+wire                  train_meta_valid = train_meta_i[META_TAGE_VALID_BIT];
+wire [3:0]            m_hits     = t1_meta[META_HITS_LSB +: 4];
+wire [BASE_IDXW-1:0]  m_base_idx = t1_meta[META_BASE_IDX_LSB +: BASE_IDXW];
+wire [1:0]            m_base_ctr = t1_meta[META_BASE_CTR_LSB +: 2];
+wire                  m_alt      = t1_meta[META_ALT_TAKEN_BIT];
+wire                  m_pvalid   = t1_meta[META_PROVIDER_VALID_BIT];
+wire [1:0]            m_pid      = t1_meta[META_PROVIDER_ID_LSB +: 2];
+wire [TIDXW-1:0]      m_pidx     = t1_meta[META_PROVIDER_IDX_LSB +: TIDXW];
+wire [2:0]            m_pctr     = t1_meta[META_PROVIDER_CTR_LSB +: 3];
+wire [1:0]            m_pu       = t1_meta[META_PROVIDER_U_LSB +: 2];
 
 // ---------------- 训练 ----------------
 // 饱和计数
@@ -210,7 +235,8 @@ endfunction
 wire [3:0] alloc_cand;
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_alloc
-    assign alloc_cand[g] = (t1_rd_entry[g][1:0] == 2'b00)
+    assign alloc_cand[g] = (!t1_rd_entry[g][TENTRY_W-1]
+                         || (t1_rd_entry[g][1:0] == 2'b00))
                         && (!m_pvalid || (g[1:0] > m_pid));
 end
 endgenerate
@@ -232,7 +258,8 @@ always @(*) begin
     t_we       = 4'b0;
     for (tk = 0; tk < 4; tk = tk + 1) begin
         t_waddr[tk] = t1_alloc_idx[tk];
-        t_wdata[tk] = {t1_alloc_tag[tk], t1_taken ? 3'd4 : 3'd3, 2'b00};
+        t_wdata[tk] = {1'b1, t1_alloc_tag[tk],
+                       t1_taken ? 3'd4 : 3'd3, 2'b00};
     end
         if (t1_valid) begin
         // 基础表恒训练
@@ -241,7 +268,8 @@ always @(*) begin
             // provider 原地更新（ctr + useful）
             t_we[m_pid]    = 1'b1;
             t_waddr[m_pid] = m_pidx;
-            t_wdata[m_pid] = {t1_rd_entry[m_pid][TENTRY_W-1 -: `TAGE_TAG_W],
+            t_wdata[m_pid] = {1'b1,
+                              t1_rd_entry[m_pid][TENTRY_W-2 -: `TAGE_TAG_W],
                               sat3(m_pctr, t1_taken), t1_u_new};
         end
         // 误预测：向更长表分配（与 provider 更新不同表，无冲突）
@@ -254,7 +282,8 @@ always @(*) begin
                     if (t1_rd_entry[tk][1:0] != 2'b00) begin
                         t_we[tk]    = 1'b1;
                         t_waddr[tk] = t1_alloc_idx[tk];
-                        t_wdata[tk] = {t1_rd_entry[tk][TENTRY_W-1 -: `TAGE_TAG_W],
+                        t_wdata[tk] = {t1_rd_entry[tk][TENTRY_W-1],
+                                       t1_rd_entry[tk][TENTRY_W-2 -: `TAGE_TAG_W],
                                        t1_rd_entry[tk][4:2], 2'b00};
                     end
                 end
@@ -268,13 +297,16 @@ reg [`TAGE_TAG_W-1:0] t1_rd_tag [0:3];  // lint 吸收用
 integer pk;
 always @(posedge clk) begin
     if (reset) begin
-        t0_valid <= 1'b0;
-        t1_valid <= 1'b0;
-        ghr      <= {`GHR_LEN{1'b0}};
+        t0_valid     <= 1'b0;
+        t0_ghr_valid <= 1'b0;
+        t1_valid     <= 1'b0;
+        ghr          <= {`GHR_LEN{1'b0}};
     end else begin
         // T0：捕获训练（借读口；读地址按"训练前 GHR"算，与 GHR 移位同拍安全：
         //     ghr 在 T0 捕获拍尚未移位，T0 读用旧 GHR，T1 写 idx 也用 T0 算好的）
-        t0_valid <= train_valid_i;
+        t0_valid     <= train_valid_i && train_meta_valid;
+        t0_ghr_valid <= train_valid_i;
+        t0_ghr_taken <= train_taken_i;
         if (train_valid_i) begin
             t0_pc      <= train_pc_i;
             t0_taken   <= train_taken_i;
@@ -292,15 +324,112 @@ always @(posedge clk) begin
                 t1_alloc_idx[pk]  <= tidx(t0_pc, pk);
                 t1_alloc_tag[pk]  <= ttag(t0_pc, pk);
                 t1_rd_entry[pk]   <= t_rdata[pk];
-                t1_rd_tag[pk]     <= t_rdata[pk][TENTRY_W-1 -: `TAGE_TAG_W];
+                t1_rd_tag[pk]     <= t_rdata[pk][TENTRY_W-2 -: `TAGE_TAG_W];
             end
-            ghr <= {ghr[`GHR_LEN-2:0], t0_taken};
         end
+        if (t0_ghr_valid)
+            ghr <= {ghr[`GHR_LEN-2:0], t0_ghr_taken};
     end
 end
 
 // lint 吸收
 wire tage_lint = (|m_hits) | t0_mispred;
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+reg tage_useful_clear_fire;
+integer stat_tk;
+always @(*) begin
+    tage_useful_clear_fire = 1'b0;
+    if (t1_valid && t1_mispred && !alloc_any) begin
+        for (stat_tk = 0; stat_tk < 4; stat_tk = stat_tk + 1) begin
+            if ((!m_pvalid || (stat_tk[1:0] > m_pid)) &&
+                (t1_rd_entry[stat_tk][1:0] != 2'b00)) begin
+                tage_useful_clear_fire = 1'b1;
+            end
+        end
+    end
+end
+
+wire [`TAGE_TAG_W-1:0] stat_meta_provider_tag =
+    t1_meta[META_PROVIDER_TAG_LSB +: META_PROVIDER_TAG_W];
+wire stat_provider_update_fire =
+    t1_valid && m_pvalid && t_we[m_pid];
+wire stat_allocation_fire =
+    t1_valid && t1_mispred && alloc_any && !(m_pvalid && (alloc_sel == m_pid)) && t_we[alloc_sel];
+wire stat_provider_tag_match =
+    t1_rd_entry[m_pid][TENTRY_W-1] &&
+    (t1_rd_entry[m_pid][TENTRY_W-2 -: `TAGE_TAG_W] == stat_meta_provider_tag);
+
+reg [63:0] tage_query_total;
+reg [63:0] tage_query_suppressed_by_train;
+reg [63:0] tage_response_total;
+reg [63:0] tage_train_total;                 // training request count
+reg [63:0] tage_mispred_train_total;
+reg [63:0] tage_train_request_count;
+reg [63:0] tage_train_meta_valid_count;
+reg [63:0] tage_train_meta_invalid_count;
+reg [63:0] tage_train_accepted_count;
+reg [63:0] tage_base_update_count;
+reg [63:0] tage_provider_update_count;
+reg [63:0] tage_allocation_count;
+reg [63:0] tage_useful_clear_count;
+reg [63:0] tage_provider_tag_check_count;
+reg [63:0] tage_provider_tag_mismatch_count;
+
+always @(posedge clk) begin
+    if (reset) begin
+        tage_query_total               <= 64'd0;
+        tage_query_suppressed_by_train <= 64'd0;
+        tage_response_total            <= 64'd0;
+        tage_train_total               <= 64'd0;
+        tage_mispred_train_total       <= 64'd0;
+        tage_train_request_count       <= 64'd0;
+        tage_train_meta_valid_count    <= 64'd0;
+        tage_train_meta_invalid_count  <= 64'd0;
+        tage_train_accepted_count      <= 64'd0;
+        tage_base_update_count         <= 64'd0;
+        tage_provider_update_count     <= 64'd0;
+        tage_allocation_count          <= 64'd0;
+        tage_useful_clear_count        <= 64'd0;
+        tage_provider_tag_check_count  <= 64'd0;
+        tage_provider_tag_mismatch_count <= 64'd0;
+    end else begin
+        if (query_valid_i)
+            tage_query_total <= tage_query_total + 64'd1;
+        if (query_valid_i && rd_steal)
+            tage_query_suppressed_by_train <= tage_query_suppressed_by_train + 64'd1;
+        if (q_valid_r)
+            tage_response_total <= tage_response_total + 64'd1;
+        if (train_valid_i) begin
+            tage_train_total <= tage_train_total + 64'd1;
+            tage_train_request_count <= tage_train_request_count + 64'd1;
+            if (train_meta_i[META_TAGE_VALID_BIT])
+                tage_train_meta_valid_count <= tage_train_meta_valid_count + 64'd1;
+            else
+                tage_train_meta_invalid_count <= tage_train_meta_invalid_count + 64'd1;
+        end
+        if (train_valid_i && train_mispred_i)
+            tage_mispred_train_total <= tage_mispred_train_total + 64'd1;
+        if (t0_valid)
+            tage_train_accepted_count <= tage_train_accepted_count + 64'd1;
+        if (base_we)
+            tage_base_update_count <= tage_base_update_count + 64'd1;
+        if (stat_provider_update_fire)
+            tage_provider_update_count <= tage_provider_update_count + 64'd1;
+        if (stat_allocation_fire)
+            tage_allocation_count <= tage_allocation_count + 64'd1;
+        if (tage_useful_clear_fire)
+            tage_useful_clear_count <= tage_useful_clear_count + 64'd1;
+        if (t1_valid && m_pvalid) begin
+            tage_provider_tag_check_count <= tage_provider_tag_check_count + 64'd1;
+            if (!stat_provider_tag_match)
+                tage_provider_tag_mismatch_count <= tage_provider_tag_mismatch_count + 64'd1;
+        end
+    end
+end
+// synthesis translate_on
+`endif
 
 endmodule
 
@@ -326,18 +455,20 @@ always @(posedge clk) begin
 end
 endmodule
 
-module tage_tag_ram(
+module tage_tag_ram #(
+    parameter ENTRY_W = 1 + `TAGE_TAG_W + 3 + 2
+)(
     input  wire        clk,
     input  wire [9:0]  raddr,
-    output reg  [16:0] rdata,
+    output reg  [ENTRY_W-1:0] rdata,
     input  wire        we,
     input  wire [9:0]  waddr,
-    input  wire [16:0] wdata
+    input  wire [ENTRY_W-1:0] wdata
 );
-reg [16:0] mem [0:`TAGE_TAG_DEPTH-1];
+reg [ENTRY_W-1:0] mem [0:`TAGE_TAG_DEPTH-1];
 integer i;
 initial begin
-    for (i = 0; i < `TAGE_TAG_DEPTH; i = i + 1) mem[i] = 17'b0;
+    for (i = 0; i < `TAGE_TAG_DEPTH; i = i + 1) mem[i] = {ENTRY_W{1'b0}};
 end
 always @(posedge clk) begin
     rdata <= mem[raddr];

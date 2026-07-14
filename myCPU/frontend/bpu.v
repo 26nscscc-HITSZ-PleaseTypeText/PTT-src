@@ -30,6 +30,7 @@ module bpu(
     output wire [`BR_TYPE_W-1:0]      p0_br_type_o,
 
     output wire                       p1_valid_o,
+    output wire                       p1_meta_valid_o,
     output wire [31:0]                p1_pc_o,
     output wire [`BLK_LEN_W-1:0]      p1_length_o,
     output wire                       p1_taken_o,
@@ -51,6 +52,11 @@ module bpu(
     input  wire                       cmt_is_ret_i,
     input  wire [31:0]                cmt_call_retaddr_i
 );
+
+localparam META_TAGE_VALID_BIT = 38;
+localparam META_FTB_RESP_BIT   = 39;
+localparam META_FTB_HIT_BIT    = 40;
+localparam META_FTB_WAY_LSB    = 41;
 
 // ---------------- 取指 PC ----------------
 reg [31:0] pc;
@@ -101,15 +107,21 @@ wire [`BLK_LEN_W-1:0]      ubtb_length;
 wire [`BR_TYPE_W-1:0]      ubtb_btype;
 
 wire                       ftb_hit;
+wire                       ftb_resp_valid;
+wire [1:0]                 ftb_hit_way;
 wire [31:0]                ftb_target;
 wire [31:0]                ftb_fall;
 wire [`BR_TYPE_W-1:0]      ftb_btype;
 
 wire                       tage_taken;
+wire                       tage_resp_valid;
 wire [`BPU_META_W-1:0]     tage_meta;
 
 wire [31:0]                ras_top;
 wire                       ras_empty;
+wire                       ras_spec_push;
+wire                       ras_spec_pop;
+wire                       p1_diff;
 
 wire query_en = ~ftq_freeze && ~flush_i;
 
@@ -138,6 +150,8 @@ ftb u_ftb(
     .query_valid_i       (query_en),
     .query_pc_i          (pc),
     .hit_o               (ftb_hit),
+    .resp_valid_o        (ftb_resp_valid),
+    .hit_way_o           (ftb_hit_way),
     .jump_target_o       (ftb_target),
     .fall_through_o      (ftb_fall),
     .br_type_o           (ftb_btype),
@@ -155,6 +169,7 @@ tage u_tage(
     .query_valid_i   (query_en),
     .query_pc_i      (pc),
     .taken_o         (tage_taken),
+    .resp_valid_o    (tage_resp_valid),
     .meta_o          (tage_meta),
     .train_valid_i   (train_valid_i && train_is_branch_i && (train_br_type_i == `BR_TYPE_COND)),
     .train_pc_i      (train_pc_i),
@@ -211,22 +226,109 @@ wire p1_taken_c = (ftb_btype == `BR_TYPE_COND) ? tage_taken : 1'b1;
 wire [31:0] p1_target_c = (ftb_btype == `BR_TYPE_RET && !ras_empty) ? ras_top :
                           (ftb_btype == `BR_TYPE_RET) ? ftb_fall : ftb_target;
 
-wire p1_diff = ftb_hit && p0_wrote_r && !ftq_freeze_r && !flush_r && !flush_i &&
-               ((p1_len_c != p0_length_r) || (p1_taken_c != p0_taken_r) ||
-                (p1_target_c != p0_target_r));
+wire p1_result_valid = p0_wrote_r && !ftq_freeze_r && !flush_r && !flush_i &&
+                       !predec_redirect_i && tage_resp_valid;
+
+assign p1_diff = p1_result_valid && ftb_resp_valid && ftb_hit &&
+                 ((p1_len_c != p0_length_r) || (p1_taken_c != p0_taken_r) ||
+                  (p1_target_c != p0_target_r));
+
+reg [`BPU_META_W-1:0] p1_meta_pack;
+always @(*) begin
+    p1_meta_pack = tage_meta;
+    p1_meta_pack[META_TAGE_VALID_BIT] = tage_resp_valid;
+    p1_meta_pack[META_FTB_RESP_BIT]   = ftb_resp_valid;
+    p1_meta_pack[META_FTB_HIT_BIT]    = ftb_hit;
+    p1_meta_pack[META_FTB_WAY_LSB +: 2] = ftb_hit_way;
+end
 
 assign p1_valid_o   = p1_diff;
+assign p1_meta_valid_o = p1_result_valid;
 assign p1_pc_o      = pc_r;
 assign p1_length_o  = p1_len_c;
 assign p1_taken_o   = p1_taken_c;
 assign p1_target_o  = p1_target_c;
 assign p1_br_type_o = ftb_btype;
-assign p1_meta_o    = tage_meta;
+assign p1_meta_o    = p1_meta_pack;
 
 wire [31:0] p1_next = p1_taken_c ? p1_target_c : ftb_fall;
 
-wire ras_spec_push = p1_diff && (ftb_btype == `BR_TYPE_CALL);
-wire ras_spec_pop  = p1_diff && (ftb_btype == `BR_TYPE_RET) && !ras_empty;
+assign ras_spec_push = p1_diff && (ftb_btype == `BR_TYPE_CALL);
+assign ras_spec_pop  = p1_diff && (ftb_btype == `BR_TYPE_RET) && !ras_empty;
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+reg [63:0] p1_result_valid_count;
+reg [63:0] p1_meta_saved_count;
+reg [63:0] p1_correction_count;
+reg [63:0] commit_cond_branch_count;
+reg [63:0] commit_cond_mispred_count;
+reg [63:0] commit_cond_meta_valid_count;
+reg [63:0] commit_cond_meta_invalid_count;
+reg [63:0] commit_cond_ftb_resp_valid;
+reg [63:0] commit_cond_ftb_resp_invalid;
+reg [63:0] commit_cond_ftb_hit;
+reg [63:0] commit_cond_ftb_miss;
+reg [63:0] commit_cond_mispred_ftb_resp_invalid;
+reg [63:0] commit_cond_mispred_ftb_hit;
+reg [63:0] commit_cond_mispred_ftb_miss;
+
+wire stat_commit_cond = train_valid_i && train_is_branch_i && (train_br_type_i == `BR_TYPE_COND);
+wire stat_train_meta_tage_valid = train_meta_i[META_TAGE_VALID_BIT];
+wire stat_train_meta_ftb_resp   = train_meta_i[META_FTB_RESP_BIT];
+wire stat_train_meta_ftb_hit    = train_meta_i[META_FTB_HIT_BIT];
+
+always @(posedge clk) begin
+    if (reset) begin
+        p1_result_valid_count   <= 64'd0;
+        p1_meta_saved_count     <= 64'd0;
+        p1_correction_count     <= 64'd0;
+        commit_cond_branch_count<= 64'd0;
+        commit_cond_mispred_count <= 64'd0;
+        commit_cond_meta_valid_count <= 64'd0;
+        commit_cond_meta_invalid_count <= 64'd0;
+        commit_cond_ftb_resp_valid <= 64'd0;
+        commit_cond_ftb_resp_invalid <= 64'd0;
+        commit_cond_ftb_hit <= 64'd0;
+        commit_cond_ftb_miss <= 64'd0;
+        commit_cond_mispred_ftb_resp_invalid <= 64'd0;
+        commit_cond_mispred_ftb_hit <= 64'd0;
+        commit_cond_mispred_ftb_miss <= 64'd0;
+    end else begin
+        if (p1_result_valid)
+            p1_result_valid_count <= p1_result_valid_count + 64'd1;
+        if (p1_meta_valid_o)
+            p1_meta_saved_count <= p1_meta_saved_count + 64'd1;
+        if (p1_valid_o)
+            p1_correction_count <= p1_correction_count + 64'd1;
+        if (stat_commit_cond) begin
+            commit_cond_branch_count <= commit_cond_branch_count + 64'd1;
+            if (stat_train_meta_tage_valid)
+                commit_cond_meta_valid_count <= commit_cond_meta_valid_count + 64'd1;
+            else
+                commit_cond_meta_invalid_count <= commit_cond_meta_invalid_count + 64'd1;
+            if (stat_train_meta_ftb_resp)
+                commit_cond_ftb_resp_valid <= commit_cond_ftb_resp_valid + 64'd1;
+            else
+                commit_cond_ftb_resp_invalid <= commit_cond_ftb_resp_invalid + 64'd1;
+            if (stat_train_meta_ftb_resp && stat_train_meta_ftb_hit)
+                commit_cond_ftb_hit <= commit_cond_ftb_hit + 64'd1;
+            if (stat_train_meta_ftb_resp && !stat_train_meta_ftb_hit)
+                commit_cond_ftb_miss <= commit_cond_ftb_miss + 64'd1;
+        end
+        if (stat_commit_cond && train_mispred_i) begin
+            commit_cond_mispred_count <= commit_cond_mispred_count + 64'd1;
+            if (!stat_train_meta_ftb_resp)
+                commit_cond_mispred_ftb_resp_invalid <= commit_cond_mispred_ftb_resp_invalid + 64'd1;
+            if (stat_train_meta_ftb_resp && stat_train_meta_ftb_hit)
+                commit_cond_mispred_ftb_hit <= commit_cond_mispred_ftb_hit + 64'd1;
+            if (stat_train_meta_ftb_resp && !stat_train_meta_ftb_hit)
+                commit_cond_mispred_ftb_miss <= commit_cond_mispred_ftb_miss + 64'd1;
+        end
+    end
+end
+// synthesis translate_on
+`endif
 
 // ---------------- PC 更新 ----------------
 always @(posedge clk) begin
@@ -251,6 +353,7 @@ always @(posedge clk) begin
         pc <= p0_next;
 end
 
+`ifndef SYNTHESIS
 // synthesis translate_off
 // 临时调试：捕获 PC 离开 1c 代码段的时刻（调通后删除）
 always @(posedge clk) begin
@@ -270,5 +373,6 @@ always @(posedge clk) begin
     end
 end
 // synthesis translate_on
+`endif
 
 endmodule

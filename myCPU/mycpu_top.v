@@ -153,6 +153,7 @@ module core_top #(
     wire [31:0]               bpu_p0_target;
     wire [`BR_TYPE_W-1:0]     bpu_p0_br_type;
     wire                      bpu_p1_valid;
+    wire                      bpu_p1_meta_valid;
     wire [31:0]               bpu_p1_pc;
     wire [`BLK_LEN_W-1:0]     bpu_p1_length;
     wire                      bpu_p1_taken;
@@ -259,6 +260,7 @@ module core_top #(
         .p0_target_o          (bpu_p0_target),
         .p0_br_type_o         (bpu_p0_br_type),
         .p1_valid_o           (bpu_p1_valid),
+        .p1_meta_valid_o      (bpu_p1_meta_valid),
         .p1_pc_o              (bpu_p1_pc),
         .p1_length_o          (bpu_p1_length),
         .p1_taken_o           (bpu_p1_taken),
@@ -293,6 +295,7 @@ module core_top #(
         .p0_target_i          (bpu_p0_target),
         .p0_br_type_i         (bpu_p0_br_type),
         .p1_valid_i           (bpu_p1_valid),
+        .p1_meta_valid_i      (bpu_p1_meta_valid),
         .p1_pc_i              (bpu_p1_pc),
         .p1_length_i          (bpu_p1_length),
         .p1_taken_i           (bpu_p1_taken),
