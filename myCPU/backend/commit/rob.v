@@ -185,7 +185,7 @@ module rob(
 //
 //TODO: 指针与满判据（mariver 137~142 行的精髓）：
 //      reg [`ROB_PAIR_W-1:0] head, tail;
-//      assign rob_full_o  = (head == tail + `ROB_GUARD);   // 保留 5 对安全间距！
+//      assign rob_full_o  = (head == trunc(tail + ROB_GUARD)); // 保留安全间距，必须环形截断
 //      assign rob_empty_o = (head == tail);
 //      为什么留间距：提交后（clear/pop）该表项的 result 仍可能在同拍/下拍被
 //      dispatch 读口用旧编号读取（rename 在它提交前一拍刚查到这个标签）；
@@ -278,7 +278,12 @@ wire [4:0] head0_idx  = {1'b0, head};
 wire [4:0] head1_idx  = {1'b1, head};
 
 assign rob_tail_o = tail;
-assign rob_full_o = (head == (tail + `ROB_GUARD));
+// 满判据必须按 ROB_PAIR_W 位宽环形加：`ROB_GUARD` 是无宽度十进制字面量，
+// 若写成 (head == tail+ROB_GUARD)，右边被扩成 32 位（如 11+5=16），与 4 位
+// head 比较永远对不上 wrap 后的 0，SB 阻塞 head 时 tail 会绕回覆盖尚未提交项
+// （linux pagetable_init：ae24@0080 被 OVW → digftest 看见 @00c0）。
+wire [`ROB_PAIR_W-1:0] rob_full_mark = tail + `ROB_GUARD;
+assign rob_full_o = (head == rob_full_mark);
 assign rob_empty_o = (head == tail);
 assign head_robid0_o = head0_idx;
 
