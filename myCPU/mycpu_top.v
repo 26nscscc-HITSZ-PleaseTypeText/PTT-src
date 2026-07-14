@@ -2601,6 +2601,16 @@ module core_top #(
     wire dbg0_is_ld_bu= (cmt_dbg0_inst[31:26] == 6'h0a) && (cmt_dbg0_inst[25:22] == 4'h8);
     wire dbg0_is_ll_w = (cmt_dbg0_inst[31:29] == 3'b001) && (cmt_dbg0_inst[28:24] == 5'b00000);
     wire dbg0_is_sc_w = (cmt_dbg0_inst[31:29] == 3'b001) && (cmt_dbg0_inst[28:24] == 5'b00001);
+    wire dbg1_is_st_w = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h6);
+    wire dbg1_is_st_h = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h5);
+    wire dbg1_is_st_b = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h4);
+    wire dbg1_is_ld_w = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h2);
+    wire dbg1_is_ld_h = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h1);
+    wire dbg1_is_ld_b = (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h0);
+    wire dbg1_is_ld_hu= (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h9);
+    wire dbg1_is_ld_bu= (cmt_dbg1_inst[31:26] == 6'h0a) && (cmt_dbg1_inst[25:22] == 4'h8);
+    wire dbg1_is_ll_w = (cmt_dbg1_inst[31:29] == 3'b001) && (cmt_dbg1_inst[28:24] == 5'b00000);
+    wire dbg1_is_sc_w = (cmt_dbg1_inst[31:29] == 3'b001) && (cmt_dbg1_inst[28:24] == 5'b00001);
 
     // 提交拍打一拍后送 DPI（槽 0）
     reg         cmt0_valid_r;
@@ -2618,8 +2628,9 @@ module core_top #(
     reg  [31:0] cmt1_pc_r, cmt1_inst_r, cmt1_wdata_r;
     reg  [7:0]  cmt1_wdest_r;
     reg         cmt1_wen_r;
-    reg  [7:0]  cmt1_ld_en_r;
+    reg  [7:0]  cmt1_ld_en_r, cmt1_st_en_r;
     reg  [31:0] cmt1_ld_paddr_r, cmt1_ld_vaddr_r;
+    reg  [31:0] cmt1_st_paddr_r, cmt1_st_vaddr_r, cmt1_st_data_r;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -2633,7 +2644,9 @@ module core_top #(
             excp_pc_r <= 32'b0;    excp_inst_r <= 32'b0;  excp_ecode_r <= 8'b0;
             cmt1_pc_r <= 32'b0;    cmt1_inst_r <= 32'b0;  cmt1_wdata_r <= 32'b0;
             cmt1_wdest_r <= 8'b0;  cmt1_wen_r <= 1'b0;
-            cmt1_ld_en_r <= 8'b0;  cmt1_ld_paddr_r <= 32'b0; cmt1_ld_vaddr_r <= 32'b0;
+            cmt1_ld_en_r <= 8'b0;  cmt1_st_en_r <= 8'b0;
+            cmt1_ld_paddr_r <= 32'b0; cmt1_ld_vaddr_r <= 32'b0;
+            cmt1_st_paddr_r <= 32'b0; cmt1_st_vaddr_r <= 32'b0; cmt1_st_data_r <= 32'b0;
         end else begin
             cmt0_valid_r    <= cmt_dbg0_valid;
             cmt0_pc_r       <= cmt_dbg0_pc;
@@ -2662,27 +2675,58 @@ module core_top #(
             cmt1_wen_r      <= cmt_dbg1_wen[0];
             cmt1_wdest_r    <= {3'b0, cmt_dbg1_wnum};
             cmt1_wdata_r    <= cmt_dbg1_wdata;
-            cmt1_ld_en_r    <= 8'b0;   //TODO: 槽 1 的 load 掩码按 cmt_dbg1_inst 同样生成
+            cmt1_ld_en_r    <= (cmt_dbg1_valid && rob_cmt1_is_load)
+                               ? {2'b0, dbg1_is_ll_w, dbg1_is_ld_w, dbg1_is_ld_hu,
+                                  dbg1_is_ld_h, dbg1_is_ld_bu, dbg1_is_ld_b} : 8'b0;
             cmt1_ld_paddr_r <= rob_cmt1_paddr;
             cmt1_ld_vaddr_r <= rob_cmt1_vaddr;
+            cmt1_st_en_r    <= (cmt_dbg1_valid && rob_cmt1_is_store)
+                               ? {4'b0, dbg1_is_sc_w, dbg1_is_st_w, dbg1_is_st_h, dbg1_is_st_b} : 8'b0;
+            cmt1_st_paddr_r <= rob_cmt1_paddr;
+            cmt1_st_vaddr_r <= rob_cmt1_vaddr;
+            cmt1_st_data_r  <= rob_cmt1_result;
         end
     end
+
+    // DifftestInstrCommit 的 DPI 带 WITH_EN(valid)：valid=0 时不会调用 C 侧，
+    // 而 Difftest::step() 又要求 commit[] 从 index0 连续有效。
+    // ROB 成对分配后可能出现「只退 odd 槽」(cmt1_head)：若直接绑到 index1，
+    // 会留下空洞 → 本拍丢提交、且 stale commit[1] 会和下拍 index0 拼成假双提交
+    // （func_lab19 开头表现为 this_pc: right=1c000008 wrong=1c000004）。
+    // 出口处压成无空洞队列：仅槽1时并入 index0；双提交时保持 0/1 原序。
+    // Store/LoadEvent 必须与打包后的 commit 下标对齐，否则会漏报 cmt1_head 的 store。
+    wire        diff_cmt_slot1_only = cmt1_valid_r && !cmt0_valid_r;
+    wire        diff_cmt0_v    = cmt0_valid_r | diff_cmt_slot1_only;
+    wire        diff_cmt1_v    = cmt0_valid_r & cmt1_valid_r;
+    wire [31:0] diff_cmt0_pc   = cmt0_valid_r ? cmt0_pc_r    : cmt1_pc_r;
+    wire [31:0] diff_cmt0_inst = cmt0_valid_r ? cmt0_inst_r  : cmt1_inst_r;
+    wire        diff_cmt0_wen  = cmt0_valid_r ? cmt0_wen_r   : cmt1_wen_r;
+    wire [7:0]  diff_cmt0_wdest= cmt0_valid_r ? cmt0_wdest_r : cmt1_wdest_r;
+    wire [31:0] diff_cmt0_wdata= cmt0_valid_r ? cmt0_wdata_r : cmt1_wdata_r;
+    wire [7:0]  diff_cmt0_ld_en= cmt0_valid_r ? cmt0_ld_en_r : cmt1_ld_en_r;
+    wire [31:0] diff_cmt0_ld_paddr = cmt0_valid_r ? cmt0_ld_paddr_r : cmt1_ld_paddr_r;
+    wire [31:0] diff_cmt0_ld_vaddr = cmt0_valid_r ? cmt0_ld_vaddr_r : cmt1_ld_vaddr_r;
+    wire [7:0]  diff_st0_en    = cmt0_valid_r ? cmt0_st_en_r : cmt1_st_en_r;
+    wire [31:0] diff_st0_paddr = cmt0_valid_r ? cmt0_st_paddr_r : cmt1_st_paddr_r;
+    wire [31:0] diff_st0_vaddr = cmt0_valid_r ? cmt0_st_vaddr_r : cmt1_st_vaddr_r;
+    wire [31:0] diff_st0_data  = cmt0_valid_r ? cmt0_st_data_r  : cmt1_st_data_r;
+    wire [7:0]  diff_st1_en    = diff_cmt1_v ? cmt1_st_en_r : 8'b0;
 
     DifftestInstrCommit diff_instr_commit0(
         .clock          (clk),
         .coreid         (DIFFTEST_COREID),
         .index          (8'd0),
-        .valid          (cmt0_valid_r),
-        .pc             ({32'b0, cmt0_pc_r}),
-        .instr          (cmt0_inst_r),
+        .valid          (diff_cmt0_v),
+        .pc             ({32'b0, diff_cmt0_pc}),
+        .instr          (diff_cmt0_inst),
         .skip           (1'b0),
         .is_TLBFILL     (1'b0),               //TODO: tlbfill 提交拍置位 + rand_index
         .TLBFILL_index  (5'b0),
         .is_CNTinst     (1'b0),               //TODO: rdcnt 提交拍置位 + timer_64
         .timer_64_value (64'b0),
-        .wen            (cmt0_wen_r),
-        .wdest          (cmt0_wdest_r),
-        .wdata          ({32'b0, cmt0_wdata_r}),
+        .wen            (diff_cmt0_wen),
+        .wdest          (diff_cmt0_wdest),
+        .wdata          ({32'b0, diff_cmt0_wdata}),
         .csr_rstat      (1'b0),               //TODO: csrrd ESTAT 检测
         .csr_data       (32'b0)
     );
@@ -2691,7 +2735,7 @@ module core_top #(
         .clock          (clk),
         .coreid         (DIFFTEST_COREID),
         .index          (8'd1),
-        .valid          (cmt1_valid_r),
+        .valid          (diff_cmt1_v),
         .pc             ({32'b0, cmt1_pc_r}),
         .instr          (cmt1_inst_r),
         .skip           (1'b0),
@@ -2727,30 +2771,40 @@ module core_top #(
         .instrCnt (64'b0)
     );
 
-    DifftestStoreEvent diff_store_event(
+    DifftestStoreEvent diff_store_event0(
         .clock      (clk),
         .coreid     (DIFFTEST_COREID),
         .index      (8'd0),
-        .valid      (cmt0_st_en_r),
-        .storePAddr ({32'b0, cmt0_st_paddr_r}),
-        .storeVAddr ({32'b0, cmt0_st_vaddr_r}),
-        .storeData  ({32'b0, cmt0_st_data_r})
+        .valid      (diff_st0_en),
+        .storePAddr ({32'b0, diff_st0_paddr}),
+        .storeVAddr ({32'b0, diff_st0_vaddr}),
+        .storeData  ({32'b0, diff_st0_data})
+    );
+
+    DifftestStoreEvent diff_store_event1(
+        .clock      (clk),
+        .coreid     (DIFFTEST_COREID),
+        .index      (8'd1),
+        .valid      (diff_st1_en),
+        .storePAddr ({32'b0, cmt1_st_paddr_r}),
+        .storeVAddr ({32'b0, cmt1_st_vaddr_r}),
+        .storeData  ({32'b0, cmt1_st_data_r})
     );
 
     DifftestLoadEvent diff_load_event0(
         .clock  (clk),
         .coreid (DIFFTEST_COREID),
         .index  (8'd0),
-        .valid  (cmt0_ld_en_r),
-        .paddr  ({32'b0, cmt0_ld_paddr_r}),
-        .vaddr  ({32'b0, cmt0_ld_vaddr_r})
+        .valid  (diff_cmt0_ld_en),
+        .paddr  ({32'b0, diff_cmt0_ld_paddr}),
+        .vaddr  ({32'b0, diff_cmt0_ld_vaddr})
     );
 
     DifftestLoadEvent diff_load_event1(
         .clock  (clk),
         .coreid (DIFFTEST_COREID),
         .index  (8'd1),
-        .valid  (cmt1_ld_en_r),
+        .valid  (diff_cmt1_v ? cmt1_ld_en_r : 8'b0),
         .paddr  ({32'b0, cmt1_ld_paddr_r}),
         .vaddr  ({32'b0, cmt1_ld_vaddr_r})
     );
