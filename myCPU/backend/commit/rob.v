@@ -272,10 +272,10 @@ reg [`EXCP_NUM-1:0]       excp_dynamic [0:`ROB_SIZE-1];
 
 integer i;
 
-wire [4:0] alloc0_idx = {1'b0, tail};
-wire [4:0] alloc1_idx = {1'b1, tail};
-wire [4:0] head0_idx  = {1'b0, head};
-wire [4:0] head1_idx  = {1'b1, head};
+wire [`ROB_W-1:0] alloc0_idx = {1'b0, tail};
+wire [`ROB_W-1:0] alloc1_idx = {1'b1, tail};
+wire [`ROB_W-1:0] head0_idx  = {1'b0, head};
+wire [`ROB_W-1:0] head1_idx  = {1'b1, head};
 
 assign rob_tail_o = tail;
 // 满判据必须按 ROB_PAIR_W 位宽环形加：`ROB_GUARD` 是无宽度十进制字面量，

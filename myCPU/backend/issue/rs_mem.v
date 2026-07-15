@@ -1,12 +1,12 @@
 // ============================================================
-// rs_mem 模块（访存保留站，`RS_MEM_SIZE=4 项，FIFO 严格顺序发射）
+// rs_mem 模块（访存保留站，`RS_MEM_SIZE 项，FIFO + 有限 load 越过）
 // ------------------------------------------------------------
 // 功能：
 // - 缓存等待操作数的访存类指令（load/store/ll/sc/cacop）。
-// - 与 ALU 保留站的本质区别：**严格按程序序发射**（FIFO）——
-//   队头指令操作数没就绪时，后面的指令即使就绪也不能发射。
-//   原因：访存指令乱序需要 load/store 地址消歧（LSQ），一期不做；
-//   保持访存程序序 + store 提交后写（store buffer）即可天然保证正确性。
+// - 默认按程序序发射；例外：普通 load 可越过前方**未就绪的普通 load**。
+// - store / ll / sc / cacop 仍为序屏障：前方有未发射的屏障项时不可越过。
+//   （无地址消歧时不能让 load 越过未知/未发 store。）
+// - 越过时在发射拍把选中项与队头交换，再按 head 出队，保持 FIFO 紧凑。
 // - 唤醒机制与 rs_alu 相同（4 路写回总线 + 预留提前唤醒）。
 //
 // 端口：与 rs_alu 同构，差异：
@@ -35,7 +35,7 @@ module rs_mem(
     input  wire [31:0]                push_imm_i,          // si12/si14 偏移
 
     output wire                       can_accept_o,
-    output wire [2:0]                 occupancy_o,
+    output wire [`RS_MEM_OCC_W-1:0]   occupancy_o,
 
     // ---------------- 写回唤醒总线 ×4 ----------------
     input  wire                       wb0_valid_i,
@@ -104,44 +104,57 @@ reg [31:0]              pc [0:`RS_MEM_SIZE-1];
 reg [`MEM_OP_NUM-1:0]   mem_op [0:`RS_MEM_SIZE-1];
 reg                     is_cacop [0:`RS_MEM_SIZE-1];
 reg                     s0_ready [0:`RS_MEM_SIZE-1];
+reg                     s0_val_valid [0:`RS_MEM_SIZE-1];
 reg [31:0]              s0_val [0:`RS_MEM_SIZE-1];
 reg [`ROB_W-1:0]        s0_robid [0:`RS_MEM_SIZE-1];
 reg                     s1_ready [0:`RS_MEM_SIZE-1];
+reg                     s1_val_valid [0:`RS_MEM_SIZE-1];
 reg [31:0]              s1_val [0:`RS_MEM_SIZE-1];
 reg [`ROB_W-1:0]        s1_robid [0:`RS_MEM_SIZE-1];
 reg [31:0]              imm [0:`RS_MEM_SIZE-1];
-reg [1:0]               head;
-reg [1:0]               tail;
-reg [2:0]               count;
+reg [`RS_MEM_IDX_W-1:0] head;
+reg [`RS_MEM_IDX_W-1:0] tail;
+reg [`RS_MEM_OCC_W-1:0] count;
 
 integer i;
-wire head_ready;
+integer a;
 wire issue_fire;
+reg  [`RS_MEM_IDX_W-1:0] issue_idx;
+reg                      issue_sel_valid;
+reg                      scan_stop;
+reg  [`RS_MEM_IDX_W-1:0] scan_idx;
+wire                     issue_need_swap;
 
-// 每项唤醒命中/旁路数据用【generate 预计算 wire 数组】而非 function 调用：
-// xsim 在 continuous assign 里对"带可变下标的 function"存在求值缺陷（见 rob.v），
-// 会返回上一次求值下标的旧值。改为纯数组变址读（s0_wbhit[idx] 等）即可规避。
+wire            s0_wb_match [0:`RS_MEM_SIZE-1];
+wire            s1_wb_match [0:`RS_MEM_SIZE-1];
 wire            s0_wbhit [0:`RS_MEM_SIZE-1];
 wire            s1_wbhit [0:`RS_MEM_SIZE-1];
+wire            s0_earlyhit [0:`RS_MEM_SIZE-1];
+wire            s1_earlyhit [0:`RS_MEM_SIZE-1];
 wire [31:0]     s0_wbdat [0:`RS_MEM_SIZE-1];
 wire [31:0]     s1_wbdat [0:`RS_MEM_SIZE-1];
+wire            entry_ready [0:`RS_MEM_SIZE-1];
+wire            is_ord_barrier [0:`RS_MEM_SIZE-1];
 genvar gw;
 generate
 for (gw = 0; gw < `RS_MEM_SIZE; gw = gw + 1) begin : g_wake
-    // 关键修复：已 ready 的操作数必须"冻结"，绝不能再被唤醒覆盖。
-    // ready-from-ARF 操作数的 tag 是 don't-care（常为 0，而 0 是合法 robid），
-    // 会与真实的 robid=0 写回误匹配 -> 把正确的 ARF 值覆盖成写回数据（n42 store base 被污染即此）。
-    // 故命中判定必须带 !ready 门控（覆盖 clocked 唤醒环 / issue 旁路 / head_ready 三处）。
-    assign s0_wbhit[gw] = !s0_ready[gw] &&
-                          ((wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ||
-                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ||
-                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ||
-                           (wb3_valid_i && (wb3_robid_i == s0_robid[gw])));
-    assign s1_wbhit[gw] = !s1_ready[gw] &&
-                          ((wb0_valid_i && (wb0_robid_i == s1_robid[gw])) ||
-                           (wb1_valid_i && (wb1_robid_i == s1_robid[gw])) ||
-                           (wb2_valid_i && (wb2_robid_i == s1_robid[gw])) ||
-                           (wb3_valid_i && (wb3_robid_i == s1_robid[gw])));
+    assign s0_wb_match[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ||
+                             (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ||
+                             (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ||
+                             (wb3_valid_i && (wb3_robid_i == s0_robid[gw]));
+    assign s1_wb_match[gw] = (wb0_valid_i && (wb0_robid_i == s1_robid[gw])) ||
+                             (wb1_valid_i && (wb1_robid_i == s1_robid[gw])) ||
+                             (wb2_valid_i && (wb2_robid_i == s1_robid[gw])) ||
+                             (wb3_valid_i && (wb3_robid_i == s1_robid[gw]));
+    // val_valid 冻结真值；仅 early 时允许 WB 再捕获/旁路
+    assign s0_wbhit[gw] = !s0_val_valid[gw] && s0_wb_match[gw];
+    assign s1_wbhit[gw] = !s1_val_valid[gw] && s1_wb_match[gw];
+    assign s0_earlyhit[gw] = !s0_ready[gw] && !s0_wbhit[gw] &&
+                             ((early0_valid_i && (early0_robid_i == s0_robid[gw])) ||
+                              (early1_valid_i && (early1_robid_i == s0_robid[gw])));
+    assign s1_earlyhit[gw] = !s1_ready[gw] && !s1_wbhit[gw] &&
+                             ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
+                              (early1_valid_i && (early1_robid_i == s1_robid[gw])));
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :
@@ -150,8 +163,44 @@ for (gw = 0; gw < `RS_MEM_SIZE; gw = gw + 1) begin : g_wake
                           (wb1_valid_i && (wb1_robid_i == s1_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s1_robid[gw])) ? wb2_data_i :
                           (wb3_valid_i && (wb3_robid_i == s1_robid[gw])) ? wb3_data_i : 32'b0;
+    // 仅 early 的 ready 不够：必须已有真值或本拍 WB 可旁路
+    assign entry_ready[gw] = valid[gw] &&
+                             ((s0_ready[gw] && s0_val_valid[gw]) || s0_wbhit[gw]) &&
+                             ((s1_ready[gw] && s1_val_valid[gw]) || s1_wbhit[gw]);
+    assign is_ord_barrier[gw] = is_cacop[gw]
+                             || mem_op[gw][`MEM_OP_ST_W] || mem_op[gw][`MEM_OP_ST_B]
+                             || mem_op[gw][`MEM_OP_ST_H] || mem_op[gw][`MEM_OP_SC_W]
+                             || mem_op[gw][`MEM_OP_LL_W];
 end
 endgenerate
+
+// 年龄序扫描：
+// - 普通 load 可越过前方未就绪的普通 load
+// - store/ll/sc/cacop 仅在其已是队内最老项时发射（不可越过未发 load）
+// - 前方有未就绪屏障则停止
+always @(*) begin
+    issue_idx = head;
+    issue_sel_valid = 1'b0;
+    scan_stop = 1'b0;
+    for (a = 0; a < `RS_MEM_SIZE; a = a + 1) begin
+        scan_idx = head + a[`RS_MEM_IDX_W-1:0];
+        if (!issue_sel_valid && !scan_stop && (a[`RS_MEM_OCC_W-1:0] < count) && valid[scan_idx]) begin
+            if (entry_ready[scan_idx]) begin
+                if (!is_ord_barrier[scan_idx] || (a == 0)) begin
+                    issue_idx = scan_idx;
+                    issue_sel_valid = 1'b1;
+                end else begin
+                    // 更年轻的就绪屏障：不能越过前方未发 load，停扫
+                    scan_stop = 1'b1;
+                end
+            end else if (is_ord_barrier[scan_idx]) begin
+                scan_stop = 1'b1;
+            end
+        end
+    end
+end
+
+assign issue_need_swap = issue_fire && (issue_idx != head);
 
 // push 口的唤醒命中/旁路（参数是端口信号，非数组变址；同样内联以彻底去除 function）
 // push 同理带 !push_srcX_ready 门控：ready-from-ARF 的入站操作数直接取 push_srcX_val，
@@ -166,6 +215,12 @@ wire        push_s1_wbhit = !push_src1_ready_i &&
                             (wb1_valid_i && (wb1_robid_i == push_src1_robid_i)) ||
                             (wb2_valid_i && (wb2_robid_i == push_src1_robid_i)) ||
                             (wb3_valid_i && (wb3_robid_i == push_src1_robid_i)));
+wire        push_s0_early = !push_src0_ready_i && !push_s0_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push_src0_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push_src0_robid_i)));
+wire        push_s1_early = !push_src1_ready_i && !push_s1_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push_src1_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push_src1_robid_i)));
 wire [31:0] push_s0_wbdat = (wb0_valid_i && (wb0_robid_i == push_src0_robid_i)) ? wb0_data_i :
                             (wb1_valid_i && (wb1_robid_i == push_src0_robid_i)) ? wb1_data_i :
                             (wb2_valid_i && (wb2_robid_i == push_src0_robid_i)) ? wb2_data_i :
@@ -177,45 +232,68 @@ wire [31:0] push_s1_wbdat = (wb0_valid_i && (wb0_robid_i == push_src1_robid_i)) 
 
 assign occupancy_o = count;
 assign can_accept_o = (count != `RS_MEM_SIZE);
-assign head_ready = (count != 3'b0) && valid[head] &&
-                    (s0_ready[head] || s0_wbhit[head]) &&
-                    (s1_ready[head] || s1_wbhit[head]);
-assign issue_valid_o = head_ready && lsu_ready_i;
+assign issue_valid_o = issue_sel_valid && lsu_ready_i;
 assign issue_fire = issue_valid_o;
 
-assign issue_robid_o = robid[head];
-assign issue_pc_o = pc[head];
-assign issue_mem_op_o = mem_op[head];
-assign issue_is_cacop_o = is_cacop[head];
-assign issue_base_o = s0_wbhit[head] ? s0_wbdat[head] : s0_val[head];
-assign issue_wdata_o = s1_wbhit[head] ? s1_wbdat[head] : s1_val[head];
-assign issue_imm_o = imm[head];
+assign issue_robid_o = robid[issue_idx];
+assign issue_pc_o = pc[issue_idx];
+assign issue_mem_op_o = mem_op[issue_idx];
+assign issue_is_cacop_o = is_cacop[issue_idx];
+assign issue_base_o = s0_wbhit[issue_idx] ? s0_wbdat[issue_idx] : s0_val[issue_idx];
+assign issue_wdata_o = s1_wbhit[issue_idx] ? s1_wbdat[issue_idx] : s1_val[issue_idx];
+assign issue_imm_o = imm[issue_idx];
 
 always @(posedge clk) begin
     if (reset || flush_i) begin
-        head <= 2'b0;
-        tail <= 2'b0;
-        count <= 3'b0;
+        head <= {`RS_MEM_IDX_W{1'b0}};
+        tail <= {`RS_MEM_IDX_W{1'b0}};
+        count <= {`RS_MEM_OCC_W{1'b0}};
         for (i = 0; i < `RS_MEM_SIZE; i = i + 1) begin
             valid[i] <= 1'b0;
         end
     end else begin
         for (i = 0; i < `RS_MEM_SIZE; i = i + 1) begin
-            if (valid[i] && !(issue_fire && (i[1:0] == head))) begin
+            // 发射项出队；swap 时 head 内容写入 issue_idx（见下），两边都跳过常规唤醒
+            if (valid[i]
+                && !(issue_fire && (i[`RS_MEM_IDX_W-1:0] == issue_idx))
+                && !(issue_need_swap && (i[`RS_MEM_IDX_W-1:0] == head))) begin
                 if (s0_wbhit[i]) begin
-                    s0_ready[i] <= 1'b1;
-                    s0_val[i] <= s0_wbdat[i];
+                    s0_ready[i]     <= 1'b1;
+                    s0_val_valid[i] <= 1'b1;
+                    s0_val[i]       <= s0_wbdat[i];
+                end else if (s0_earlyhit[i]) begin
+                    s0_ready[i]     <= 1'b1;
                 end
                 if (s1_wbhit[i]) begin
-                    s1_ready[i] <= 1'b1;
-                    s1_val[i] <= s1_wbdat[i];
+                    s1_ready[i]     <= 1'b1;
+                    s1_val_valid[i] <= 1'b1;
+                    s1_val[i]       <= s1_wbdat[i];
+                end else if (s1_earlyhit[i]) begin
+                    s1_ready[i]     <= 1'b1;
                 end
             end
         end
 
         if (issue_fire) begin
+            if (issue_need_swap) begin
+                // 未就绪队头挪到被越过槽，保持年龄序；本拍发射项按已位于 head 出队
+                robid[issue_idx]     <= robid[head];
+                pc[issue_idx]        <= pc[head];
+                mem_op[issue_idx]    <= mem_op[head];
+                is_cacop[issue_idx]  <= is_cacop[head];
+                s0_ready[issue_idx]  <= s0_ready[head] || s0_wbhit[head] || s0_earlyhit[head];
+                s0_val_valid[issue_idx] <= s0_val_valid[head] || s0_wbhit[head];
+                s0_val[issue_idx]    <= s0_wbhit[head] ? s0_wbdat[head] : s0_val[head];
+                s0_robid[issue_idx]  <= s0_robid[head];
+                s1_ready[issue_idx]  <= s1_ready[head] || s1_wbhit[head] || s1_earlyhit[head];
+                s1_val_valid[issue_idx] <= s1_val_valid[head] || s1_wbhit[head];
+                s1_val[issue_idx]    <= s1_wbhit[head] ? s1_wbdat[head] : s1_val[head];
+                s1_robid[issue_idx]  <= s1_robid[head];
+                imm[issue_idx]       <= imm[head];
+                valid[issue_idx]     <= 1'b1;
+            end
             valid[head] <= 1'b0;
-            head <= head + 2'b01;
+            head <= head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1};
         end
 
         if (push_valid_i && can_accept_o) begin
@@ -224,24 +302,48 @@ always @(posedge clk) begin
             pc[tail] <= push_pc_i;
             mem_op[tail] <= push_mem_op_i;
             is_cacop[tail] <= push_is_cacop_i;
-            s0_ready[tail] <= push_src0_ready_i || push_s0_wbhit;
+            s0_ready[tail] <= push_src0_ready_i || push_s0_wbhit || push_s0_early;
+            s0_val_valid[tail] <= push_src0_ready_i || push_s0_wbhit;
             s0_val[tail] <= push_s0_wbhit ? push_s0_wbdat :
                             push_src0_ready_i ? push_src0_val_i : 32'b0;
             s0_robid[tail] <= push_src0_robid_i;
-            s1_ready[tail] <= push_src1_ready_i || push_s1_wbhit;
+            s1_ready[tail] <= push_src1_ready_i || push_s1_wbhit || push_s1_early;
+            s1_val_valid[tail] <= push_src1_ready_i || push_s1_wbhit;
             s1_val[tail] <= push_s1_wbhit ? push_s1_wbdat :
                             push_src1_ready_i ? push_src1_val_i : 32'b0;
             s1_robid[tail] <= push_src1_robid_i;
             imm[tail] <= push_imm_i;
-            tail <= tail + 2'b01;
+            tail <= tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1};
         end
 
         case ({push_valid_i && can_accept_o, issue_fire})
-            2'b10: count <= count + 3'b001;
-            2'b01: count <= count - 3'b001;
+            2'b10: count <= count + {{(`RS_MEM_OCC_W-1){1'b0}}, 1'b1};
+            2'b01: count <= count - {{(`RS_MEM_OCC_W-1){1'b0}}, 1'b1};
             default: count <= count;
         endcase
     end
 end
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+reg [63:0] rsm_full_stall_cyc;
+reg [63:0] rsm_src_stall_cyc;
+reg [63:0] rsm_lsu_stall_cyc;
+always @(posedge clk) begin
+    if (reset) begin
+        rsm_full_stall_cyc <= 64'd0;
+        rsm_src_stall_cyc  <= 64'd0;
+        rsm_lsu_stall_cyc  <= 64'd0;
+    end else if (!flush_i) begin
+        if (!can_accept_o && push_valid_i)
+            rsm_full_stall_cyc <= rsm_full_stall_cyc + 64'd1;
+        if ((count != {`RS_MEM_OCC_W{1'b0}}) && !issue_sel_valid)
+            rsm_src_stall_cyc <= rsm_src_stall_cyc + 64'd1;
+        if (issue_sel_valid && !lsu_ready_i)
+            rsm_lsu_stall_cyc <= rsm_lsu_stall_cyc + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
 
 endmodule

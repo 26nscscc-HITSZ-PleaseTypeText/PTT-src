@@ -32,9 +32,16 @@
 `define ROB_PAIR_W      4   // ROB_W-1，ROB 对指针(head/tail)位宽
 `define ROB_GUARD       5   // head/tail 安全间距（mariver：保证 dispatch 读 ROB
                             // 结果时，已提交但未被覆盖的数据仍可读，必须保留！）
+// 未决 store 提交判定：对指针距离 d=(R-head) 环形；存活项 d ∈ [0, N-GUARD)，
+// wrap 后 d ∈ [N-GUARD, N)。阈值须随 ROB_PAIR_W 伸缩（原写死 12 只适配 16 对）。
+`define ROB_WRAP_THR    ((1<<`ROB_PAIR_W)-`ROB_GUARD)
 
 `define RS_ALU_SIZE     4   // 每个 ALU 保留站项数（乱序发射）
+`define RS_ALU_IDX_W    2   // $clog2(RS_ALU_SIZE)
+`define RS_ALU_OCC_W    3   // $clog2(RS_ALU_SIZE+1)，occupancy 0..SIZE
 `define RS_MEM_SIZE     4   // 访存保留站项数（FIFO 顺序发射）
+`define RS_MEM_IDX_W    2   // $clog2(RS_MEM_SIZE)
+`define RS_MEM_OCC_W    3   // $clog2(RS_MEM_SIZE+1)
 `define RS_MDU_SIZE     2   // 乘除保留站项数（FIFO 顺序发射）
 
 `define SB_SIZE         8   // store buffer 项数（提交后写缓冲）
@@ -59,6 +66,7 @@
 `define CACHE_LINE_WORDS  8           // 每行 32bit 字数
 
 `define L1_NWAY           4           // L1 I/D cache 路数
+`define L1_NMSHR          1           // L1 D$ MSHR 项数（与当前单槽 dcache/lsu 一致）
 `define L1_NSET           128         // L1 每路组数（16KB/4路/32B）
 `define L1_INDEX_W        7           // $clog2(L1_NSET)
 `define L1_TAG_W          20          // 32 - 7 - 5
@@ -75,6 +83,8 @@
 `define FTB_NWAY          4           // FTB 路数
 `define FTB_NSET          1024        // FTB 每路组数（共 4096 项，BRAM 实现）
 `define FTB_INDEX_W       10          // $clog2(FTB_NSET)
+`define FTB_UPDATE_Q_DEPTH 8           // FTB 训练更新 FIFO 深度（2 的幂；查询优先不偷读口）
+`define TAGE_UPDATE_Q_DEPTH 16          // TAGE 训练更新 FIFO（COND 突发训练更密，需更深）
 
 `define TAGE_BASE_DEPTH   8192        // TAGE 基础表项数（2bit 饱和计数器）
 `define TAGE_TAG_NUM      4           // TAGE 标记表个数

@@ -21,8 +21,10 @@
 //     经 ld_mshr_data_ok_o/ld_mshr_rdata_o 独立通道返回一次；
 //   * store miss：分配拍即回 st_done（posted，写效果由 MSHR 合并进重填行
 //     保证落地），SB 立即排空下一条——隐藏 store miss 延迟；
-//   * MSHR 在飞期间【同 index 的新请求】一律等待（防替换路互踩/丢失更新，
-//     等待结束后重查表，多半直接命中刚安装的行）；
+//   * MSHR 在飞期间【同 index 的新请求】或第二 miss：优先挂到 1 项 pending
+//     缓冲并立刻回 IDLE，从而继续 hit-under-miss；pending 在 MSHR/写回空闲
+//     后经 RELOOK 完成（同组冲突在重填落地后常变命中）。pending 已占用且再
+//     撞冲突才退回 S_MWAIT（少见）；
 // - 写回缓冲（1 项，原 TODO 第三步·写回与重填并行）：
 //   脏 victim 在分配 MSHR 的同拍搬进写回缓冲，refill 读【立即发起】，
 //   写回走独立写通道后台排空——dirty miss 不再串行"先写回后重填"；
@@ -118,8 +120,8 @@ localparam LINEW = `CACHE_LINE_BITS;   // 256
 // ---------------- 前端 FSM ----------------
 localparam S_IDLE     = 4'd0;
 localparam S_LOOKUP   = 4'd1;
-localparam S_MWAIT    = 4'd2;   // 等 MSHR/写回缓冲排空（同组冲突/资源忙）
-localparam S_RELOOK   = 4'd3;   // 等待结束后重发 BRAM 读
+localparam S_MWAIT    = 4'd2;   // 等资源（uncached/双重 pending/cacop）；cached 优先走 pend
+localparam S_RELOOK   = 4'd3;   // pending/资源等待结束后重发 BRAM 读
 localparam S_UC_RREQ  = 4'd4;   // uncached 读请求
 localparam S_UC_RDATA = 4'd5;
 localparam S_UC_RESP  = 4'd6;
@@ -192,6 +194,16 @@ reg        cacop_pend;
 reg [1:0]  cacop_pend_op;
 reg [31:0] cacop_pend_addr;
 
+// cached 二次 miss / 同组撞 MSHR：挂起缓冲（释放前端继续 hit-under-miss）
+reg        pend_valid;
+reg        pend_is_st;
+reg        pend_is_ld;
+reg [31:0] pend_paddr;
+reg [31:0] pend_wdata;
+reg [3:0]  pend_wstrb;
+reg [2:0]  pend_size;
+reg        pend_uncached;
+
 // cacop 写回中间量 / uncached 读数据
 reg [TAGW-1:0]   cwb_tag;
 reg [LINEW-1:0]  cwb_line;
@@ -232,7 +244,12 @@ wire [1:0]      cac_way = req_paddr[1:0];
 
 // ---------------- 接受仲裁（IDLE 拍）----------------
 // MSHR 安装拍需要独占 RAM 口：安装等待期间暂停接受新请求（一拍气泡）
-wire accept_ok = (state == S_IDLE) && (mshr_state != M_INSTALL);
+// pending 可 drain 时优先恢复挂起请求（不接受新请求），否则在 pend 占用时仍可
+// 接受新请求以维持 hit-under-miss（再 miss/撞组才落 S_MWAIT）
+wire mshr_res_idle = !mshr_busy && wb_all_idle;
+wire pend_drain = (state == S_IDLE) && pend_valid && mshr_res_idle
+               && (mshr_state != M_INSTALL);
+wire accept_ok = (state == S_IDLE) && (mshr_state != M_INSTALL) && !pend_drain;
 wire cacop_take = accept_ok && cacop_pend;
 wire st_take    = accept_ok && !cacop_pend && st_req_i;
 wire ld_take    = accept_ok && !cacop_pend && !st_req_i && ld_req_i;
@@ -268,6 +285,12 @@ wire lk_st_alloc = lk_st_miss && mshr_alloc_ok;
 // uncached 进入条件：独占读/写通道（MSHR 与写回缓冲全空，保守串行——
 // uncached 本身就是强序访问，性能无关紧要）
 wire lk_uc_ok = !mshr_busy && wb_all_idle;
+
+// cached 资源冲突：可挂 pending（释放前端）；pend 已占用则被迫 MWAIT
+wire lk_cache_block = lk_set_conf
+                   || ((lk_ld_miss || lk_st_miss) && !mshr_alloc_ok);
+wire lk_to_pend = lk_cache_block && !pend_valid;
+wire lk_to_mwait_cache = lk_cache_block && pend_valid;
 
 // ---------------- 命中数据通路 ----------------
 wire [LINEW-1:0] hit_line = data_out[hit_way];
@@ -403,6 +426,7 @@ always @(posedge clk) begin
     if (!resetn) begin
         state      <= S_IDLE;
         cacop_pend <= 1'b0;
+        pend_valid <= 1'b0;
         for (s = 0; s < NWAY; s = s + 1) begin
             valid_arr[s] <= {NSET{1'b0}};
             dirty_arr[s] <= {NSET{1'b0}};
@@ -424,7 +448,19 @@ always @(posedge clk) begin
 
         case (state)
             S_IDLE: begin
-                if (cacop_take) begin
+                if (pend_drain) begin
+                    // 恢复挂起请求，重查（可能已因 refill 变命中）
+                    req_is_cacop <= 1'b0;
+                    req_is_st    <= pend_is_st;
+                    req_is_ld    <= pend_is_ld;
+                    req_paddr    <= pend_paddr;
+                    req_wdata    <= pend_wdata;
+                    req_wstrb    <= pend_wstrb;
+                    req_size     <= pend_size;
+                    req_uncached <= pend_uncached;
+                    pend_valid   <= 1'b0;
+                    state        <= S_RELOOK;
+                end else if (cacop_take) begin
                     req_is_cacop <= 1'b1;
                     req_is_st    <= 1'b0;
                     req_is_ld    <= 1'b0;
@@ -455,7 +491,19 @@ always @(posedge clk) begin
             end
 
             S_LOOKUP: begin
-                if (lk_set_conf || lk_cacop_wait) begin
+                if (lk_cacop_wait) begin
+                    state <= S_MWAIT;
+                end else if (lk_to_pend) begin
+                    pend_valid    <= 1'b1;
+                    pend_is_st    <= req_is_st;
+                    pend_is_ld    <= req_is_ld;
+                    pend_paddr    <= req_paddr;
+                    pend_wdata    <= req_wdata;
+                    pend_wstrb    <= req_wstrb;
+                    pend_size     <= req_size;
+                    pend_uncached <= req_uncached;
+                    state         <= S_IDLE;
+                end else if (lk_to_mwait_cache) begin
                     state <= S_MWAIT;
                 end else if (lk_cacop) begin
                     // 到这里保证 MSHR/写回缓冲全静默（lk_cacop_wait 已滤掉）
@@ -512,17 +560,15 @@ always @(posedge clk) begin
                     rr_ptr[req_set] <= rr_ptr[req_set] + 2'd1;
                     state <= S_IDLE;
                 end else begin
-                    // MSHR/写回缓冲忙：挂起等待（阻塞式回退路径）
+                    // 兜底（理论上 lk_* 已覆盖 cached block）
                     state <= S_MWAIT;
                 end
             end
 
             S_MWAIT: begin
-                // 等 MSHR/写回缓冲全静默后重查（两者都只依赖下层 AXI 推进，
-                // 与前端无环形依赖，必然在有限拍内退出）。被冲刷的 load 也
-                // 照常等到响应——由 LSU 的 drop 标志配对丢弃（见头注契约）。
+                // uncached / 双重 pending / cacop：等资源后重查
                 if (!mshr_busy && wb_all_idle) begin
-                    state <= S_RELOOK;         // 资源空了：重查表
+                    state <= S_RELOOK;
                 end
             end
 
@@ -632,6 +678,61 @@ end
 
 // lint 吸收（cancel 端口按契约忽略：响应由 LSU 配对丢弃；见头注）
 wire dcache_lint = (|ld_vaddr_i[4:0]) | (|ld_size_i) | ld_cancel_i;
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+// 仿真性能统计：cached LOOKUP（load+store）；set 冲突不算命中也不算访问完成
+reg [63:0] dc_access_total;
+reg [63:0] dc_hit_total;
+reg [63:0] dc_ld_access_total;
+reg [63:0] dc_ld_hit_total;
+reg [63:0] dc_st_access_total;
+reg [63:0] dc_st_hit_total;
+reg [63:0] dc_mwait_cycles;
+reg [63:0] dc_pend_cycles;
+reg [63:0] dc_mshr_busy_cycles;
+reg [63:0] dc_pend_push_total;
+always @(posedge clk) begin
+    if (!resetn) begin
+        dc_access_total     <= 64'd0;
+        dc_hit_total        <= 64'd0;
+        dc_ld_access_total  <= 64'd0;
+        dc_ld_hit_total     <= 64'd0;
+        dc_st_access_total  <= 64'd0;
+        dc_st_hit_total     <= 64'd0;
+        dc_mwait_cycles     <= 64'd0;
+        dc_pend_cycles      <= 64'd0;
+        dc_mshr_busy_cycles <= 64'd0;
+        dc_pend_push_total  <= 64'd0;
+    end else begin
+        if (lk_cached_ld && !lk_set_conf) begin
+            dc_access_total    <= dc_access_total + 64'd1;
+            dc_ld_access_total <= dc_ld_access_total + 64'd1;
+            if (hit_any) begin
+                dc_hit_total    <= dc_hit_total + 64'd1;
+                dc_ld_hit_total <= dc_ld_hit_total + 64'd1;
+            end
+        end
+        if (lk_cached_st && !lk_set_conf) begin
+            dc_access_total    <= dc_access_total + 64'd1;
+            dc_st_access_total <= dc_st_access_total + 64'd1;
+            if (hit_any) begin
+                dc_hit_total    <= dc_hit_total + 64'd1;
+                dc_st_hit_total <= dc_st_hit_total + 64'd1;
+            end
+        end
+        if (state == S_MWAIT)
+            dc_mwait_cycles <= dc_mwait_cycles + 64'd1;
+        if (pend_valid)
+            dc_pend_cycles <= dc_pend_cycles + 64'd1;
+        if (mshr_busy)
+            dc_mshr_busy_cycles <= dc_mshr_busy_cycles + 64'd1;
+        if ((state == S_LOOKUP) && lk_to_pend)
+            dc_pend_push_total <= dc_pend_push_total + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
 
 endmodule
 

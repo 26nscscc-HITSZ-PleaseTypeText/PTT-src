@@ -269,14 +269,68 @@ reg [63:0] commit_cond_ftb_resp_valid;
 reg [63:0] commit_cond_ftb_resp_invalid;
 reg [63:0] commit_cond_ftb_hit;
 reg [63:0] commit_cond_ftb_miss;
+reg [63:0] commit_cond_mispred_meta_valid_count;
+reg [63:0] commit_cond_mispred_meta_invalid_count;
+reg [63:0] commit_cond_mispred_ftb_resp_valid;
 reg [63:0] commit_cond_mispred_ftb_resp_invalid;
 reg [63:0] commit_cond_mispred_ftb_hit;
 reg [63:0] commit_cond_mispred_ftb_miss;
+// Deprecated compatibility counters: these now mean meta-valid FTB response invalid/valid,
+// not "FTB query suppressed by training".
+reg [63:0] commit_cond_with_ftb_suppressed;
+reg [63:0] commit_cond_mispred_with_ftb_suppressed;
+reg [63:0] commit_cond_without_ftb_suppressed;
+reg [63:0] commit_cond_mispred_without_ftb_suppressed;
+reg [63:0] p1_candidate_count;
+reg [63:0] bpu_p1_reason_hit_no_p0_write;
+reg [63:0] bpu_p1_reason_hit_ftq_freeze;
+reg [63:0] bpu_p1_reason_hit_flush_r;
+reg [63:0] bpu_p1_reason_hit_flush_i;
+reg [63:0] bpu_p1_reason_hit_predecode_redirect;
+reg [63:0] bpu_p1_reason_hit_ftb_resp_invalid;
+reg [63:0] bpu_p1_reason_hit_tage_resp_invalid;
+// Primary drop priority: flush > predecode redirect > ftq freeze >
+// no p0 write > TAGE response invalid > FTB response invalid.
+reg [63:0] bpu_p1_drop_primary_flush;
+reg [63:0] bpu_p1_drop_primary_predecode_redirect;
+reg [63:0] bpu_p1_drop_primary_ftq_freeze;
+reg [63:0] bpu_p1_drop_primary_no_p0_write;
+reg [63:0] bpu_p1_drop_primary_tage_resp_invalid;
+reg [63:0] bpu_p1_drop_primary_ftb_resp_invalid;
+// PERF（mycpu_top）：全分支精度 — 训练口所有分支（含 CALL/RET/B/COND）
+reg [63:0] commit_all_branch_count;
+reg [63:0] commit_all_mispred_count;
 
 wire stat_commit_cond = train_valid_i && train_is_branch_i && (train_br_type_i == `BR_TYPE_COND);
+wire stat_commit_br   = train_valid_i && train_is_branch_i;
 wire stat_train_meta_tage_valid = train_meta_i[META_TAGE_VALID_BIT];
 wire stat_train_meta_ftb_resp   = train_meta_i[META_FTB_RESP_BIT];
 wire stat_train_meta_ftb_hit    = train_meta_i[META_FTB_HIT_BIT];
+wire stat_train_meta_valid      = stat_train_meta_tage_valid;
+wire stat_train_meta_invalid    = !stat_train_meta_valid;
+
+wire p1_candidate = p1_result_valid ||
+                    ftq_freeze_r || flush_r || flush_i ||
+                    predec_redirect_i || !p0_wrote_r || !tage_resp_valid;
+wire p1_drop_candidate = p1_candidate && !p1_result_valid;
+wire p1_reason_no_p0_write        = p1_candidate && !p0_wrote_r;
+wire p1_reason_ftq_freeze         = p1_candidate && ftq_freeze_r;
+wire p1_reason_flush_r            = p1_candidate && flush_r;
+wire p1_reason_flush_i            = p1_candidate && flush_i;
+wire p1_reason_predecode_redirect = p1_candidate && predec_redirect_i;
+wire p1_reason_ftb_resp_invalid   = p1_candidate && !ftb_resp_valid;
+wire p1_reason_tage_resp_invalid  = p1_candidate && !tage_resp_valid;
+wire p1_primary_flush              = p1_drop_candidate && (flush_r || flush_i);
+wire p1_primary_predecode_redirect = p1_drop_candidate && !p1_primary_flush && predec_redirect_i;
+wire p1_primary_ftq_freeze         = p1_drop_candidate && !p1_primary_flush &&
+                                     !p1_primary_predecode_redirect && ftq_freeze_r;
+wire p1_primary_no_p0_write        = p1_drop_candidate && !p1_primary_flush &&
+                                     !p1_primary_predecode_redirect && !p1_primary_ftq_freeze &&
+                                     !p0_wrote_r;
+wire p1_primary_tage_resp_invalid  = p1_drop_candidate && !p1_primary_flush &&
+                                     !p1_primary_predecode_redirect && !p1_primary_ftq_freeze &&
+                                     !p1_primary_no_p0_write && !tage_resp_valid;
+wire p1_primary_ftb_resp_invalid   = 1'b0; // P1 result validity does not depend on FTB resp valid.
 
 always @(posedge clk) begin
     if (reset) begin
@@ -291,39 +345,109 @@ always @(posedge clk) begin
         commit_cond_ftb_resp_invalid <= 64'd0;
         commit_cond_ftb_hit <= 64'd0;
         commit_cond_ftb_miss <= 64'd0;
+        commit_cond_mispred_meta_valid_count <= 64'd0;
+        commit_cond_mispred_meta_invalid_count <= 64'd0;
+        commit_cond_mispred_ftb_resp_valid <= 64'd0;
         commit_cond_mispred_ftb_resp_invalid <= 64'd0;
         commit_cond_mispred_ftb_hit <= 64'd0;
         commit_cond_mispred_ftb_miss <= 64'd0;
+        commit_cond_with_ftb_suppressed <= 64'd0;
+        commit_cond_mispred_with_ftb_suppressed <= 64'd0;
+        commit_cond_without_ftb_suppressed <= 64'd0;
+        commit_cond_mispred_without_ftb_suppressed <= 64'd0;
+        p1_candidate_count <= 64'd0;
+        bpu_p1_reason_hit_no_p0_write <= 64'd0;
+        bpu_p1_reason_hit_ftq_freeze <= 64'd0;
+        bpu_p1_reason_hit_flush_r <= 64'd0;
+        bpu_p1_reason_hit_flush_i <= 64'd0;
+        bpu_p1_reason_hit_predecode_redirect <= 64'd0;
+        bpu_p1_reason_hit_ftb_resp_invalid <= 64'd0;
+        bpu_p1_reason_hit_tage_resp_invalid <= 64'd0;
+        bpu_p1_drop_primary_flush <= 64'd0;
+        bpu_p1_drop_primary_predecode_redirect <= 64'd0;
+        bpu_p1_drop_primary_ftq_freeze <= 64'd0;
+        bpu_p1_drop_primary_no_p0_write <= 64'd0;
+        bpu_p1_drop_primary_tage_resp_invalid <= 64'd0;
+        bpu_p1_drop_primary_ftb_resp_invalid <= 64'd0;
+        commit_all_branch_count <= 64'd0;
+        commit_all_mispred_count <= 64'd0;
     end else begin
+        if (p1_candidate)
+            p1_candidate_count <= p1_candidate_count + 64'd1;
         if (p1_result_valid)
             p1_result_valid_count <= p1_result_valid_count + 64'd1;
         if (p1_meta_valid_o)
             p1_meta_saved_count <= p1_meta_saved_count + 64'd1;
         if (p1_valid_o)
             p1_correction_count <= p1_correction_count + 64'd1;
+        if (p1_reason_no_p0_write)
+            bpu_p1_reason_hit_no_p0_write <= bpu_p1_reason_hit_no_p0_write + 64'd1;
+        if (p1_reason_ftq_freeze)
+            bpu_p1_reason_hit_ftq_freeze <= bpu_p1_reason_hit_ftq_freeze + 64'd1;
+        if (p1_reason_flush_r)
+            bpu_p1_reason_hit_flush_r <= bpu_p1_reason_hit_flush_r + 64'd1;
+        if (p1_reason_flush_i)
+            bpu_p1_reason_hit_flush_i <= bpu_p1_reason_hit_flush_i + 64'd1;
+        if (p1_reason_predecode_redirect)
+            bpu_p1_reason_hit_predecode_redirect <= bpu_p1_reason_hit_predecode_redirect + 64'd1;
+        if (p1_reason_ftb_resp_invalid)
+            bpu_p1_reason_hit_ftb_resp_invalid <= bpu_p1_reason_hit_ftb_resp_invalid + 64'd1;
+        if (p1_reason_tage_resp_invalid)
+            bpu_p1_reason_hit_tage_resp_invalid <= bpu_p1_reason_hit_tage_resp_invalid + 64'd1;
+        if (p1_primary_flush)
+            bpu_p1_drop_primary_flush <= bpu_p1_drop_primary_flush + 64'd1;
+        if (p1_primary_predecode_redirect)
+            bpu_p1_drop_primary_predecode_redirect <= bpu_p1_drop_primary_predecode_redirect + 64'd1;
+        if (p1_primary_ftq_freeze)
+            bpu_p1_drop_primary_ftq_freeze <= bpu_p1_drop_primary_ftq_freeze + 64'd1;
+        if (p1_primary_no_p0_write)
+            bpu_p1_drop_primary_no_p0_write <= bpu_p1_drop_primary_no_p0_write + 64'd1;
+        if (p1_primary_tage_resp_invalid)
+            bpu_p1_drop_primary_tage_resp_invalid <= bpu_p1_drop_primary_tage_resp_invalid + 64'd1;
+        if (p1_primary_ftb_resp_invalid)
+            bpu_p1_drop_primary_ftb_resp_invalid <= bpu_p1_drop_primary_ftb_resp_invalid + 64'd1;
+        if (stat_commit_br) begin
+            commit_all_branch_count <= commit_all_branch_count + 64'd1;
+            if (train_mispred_i)
+                commit_all_mispred_count <= commit_all_mispred_count + 64'd1;
+        end
         if (stat_commit_cond) begin
             commit_cond_branch_count <= commit_cond_branch_count + 64'd1;
-            if (stat_train_meta_tage_valid)
+            if (stat_train_meta_valid)
                 commit_cond_meta_valid_count <= commit_cond_meta_valid_count + 64'd1;
             else
                 commit_cond_meta_invalid_count <= commit_cond_meta_invalid_count + 64'd1;
-            if (stat_train_meta_ftb_resp)
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp)
                 commit_cond_ftb_resp_valid <= commit_cond_ftb_resp_valid + 64'd1;
-            else
+            if (stat_train_meta_valid && !stat_train_meta_ftb_resp)
                 commit_cond_ftb_resp_invalid <= commit_cond_ftb_resp_invalid + 64'd1;
-            if (stat_train_meta_ftb_resp && stat_train_meta_ftb_hit)
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp && stat_train_meta_ftb_hit)
                 commit_cond_ftb_hit <= commit_cond_ftb_hit + 64'd1;
-            if (stat_train_meta_ftb_resp && !stat_train_meta_ftb_hit)
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp && !stat_train_meta_ftb_hit)
                 commit_cond_ftb_miss <= commit_cond_ftb_miss + 64'd1;
+            if (stat_train_meta_valid && !stat_train_meta_ftb_resp)
+                commit_cond_with_ftb_suppressed <= commit_cond_with_ftb_suppressed + 64'd1;
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp)
+                commit_cond_without_ftb_suppressed <= commit_cond_without_ftb_suppressed + 64'd1;
         end
         if (stat_commit_cond && train_mispred_i) begin
             commit_cond_mispred_count <= commit_cond_mispred_count + 64'd1;
-            if (!stat_train_meta_ftb_resp)
+            if (stat_train_meta_valid)
+                commit_cond_mispred_meta_valid_count <= commit_cond_mispred_meta_valid_count + 64'd1;
+            if (stat_train_meta_invalid)
+                commit_cond_mispred_meta_invalid_count <= commit_cond_mispred_meta_invalid_count + 64'd1;
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp)
+                commit_cond_mispred_ftb_resp_valid <= commit_cond_mispred_ftb_resp_valid + 64'd1;
+            if (stat_train_meta_valid && !stat_train_meta_ftb_resp)
                 commit_cond_mispred_ftb_resp_invalid <= commit_cond_mispred_ftb_resp_invalid + 64'd1;
-            if (stat_train_meta_ftb_resp && stat_train_meta_ftb_hit)
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp && stat_train_meta_ftb_hit)
                 commit_cond_mispred_ftb_hit <= commit_cond_mispred_ftb_hit + 64'd1;
-            if (stat_train_meta_ftb_resp && !stat_train_meta_ftb_hit)
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp && !stat_train_meta_ftb_hit)
                 commit_cond_mispred_ftb_miss <= commit_cond_mispred_ftb_miss + 64'd1;
+            if (stat_train_meta_valid && !stat_train_meta_ftb_resp)
+                commit_cond_mispred_with_ftb_suppressed <= commit_cond_mispred_with_ftb_suppressed + 64'd1;
+            if (stat_train_meta_valid && stat_train_meta_ftb_resp)
+                commit_cond_mispred_without_ftb_suppressed <= commit_cond_mispred_without_ftb_suppressed + 64'd1;
         end
     end
 end

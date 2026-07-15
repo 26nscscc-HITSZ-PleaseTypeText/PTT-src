@@ -249,6 +249,7 @@ assign train_meta_o         = train_meta_r;
 // lint 吸收（blk_btype 读口暂未对外）
 wire ftq_lint = (|blk_btype[0]);
 
+
 `ifndef SYNTHESIS
 // synthesis translate_off
 reg [63:0] p1_meta_saved_count;

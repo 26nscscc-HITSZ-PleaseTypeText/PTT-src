@@ -1058,7 +1058,7 @@ module core_top #(
     wire [`ROB_W-1:0]         alu0_early_robid, alu1_early_robid, lsu_early_robid;
     // rs_alu0 入站/发射
     wire                      rsa0_can_accept;
-    wire [2:0]                rsa0_occupancy;
+    wire [`RS_ALU_OCC_W-1:0]  rsa0_occupancy;
     wire                      rsa0_push_valid;
     wire [`ROB_W-1:0]         rsa0_push_robid;
     wire [31:0]               rsa0_push_pc;
@@ -1081,7 +1081,7 @@ module core_top #(
     wire [31:0]               rsa0_issue_br_offs;
     // rs_alu1 入站/发射
     wire                      rsa1_can_accept;
-    wire [2:0]                rsa1_occupancy;
+    wire [`RS_ALU_OCC_W-1:0]  rsa1_occupancy;
     wire                      rsa1_push_valid;
     wire [`ROB_W-1:0]         rsa1_push_robid;
     wire [31:0]               rsa1_push_pc;
@@ -1104,7 +1104,7 @@ module core_top #(
     wire [31:0]               rsa1_issue_br_offs;
     // rs_mem 入站/发射
     wire                      rsm_can_accept;
-    wire [2:0]                rsm_occupancy;
+    wire [`RS_MEM_OCC_W-1:0]  rsm_occupancy;
     wire                      rsm_push_valid;
     wire [`ROB_W-1:0]         rsm_push_robid;
     wire [31:0]               rsm_push_pc;
@@ -2591,8 +2591,7 @@ module core_top #(
 //--------------------------------------------------
     localparam [7:0] DIFFTEST_COREID = 8'd0;
 
-    //TODO: difftest 提交信息细化（参考旧实现的 skip/csr_rstat/rdcnt 处理）：
-    //      1. cmt_csr_rstat：提交 csrrd ESTAT 时置位并给 csr_data（按 inst 译码判断）
+    // Difftest 提交：csrrd ESTAT → csr_rstat/csr_data；rdcnt → is_CNTinst；tlbfill → index
     //      2. is_CNTinst/timer_64_value：rdcntvl/vh/id 提交拍锁存 timer
     //      3. 异常/ertn 走 ExcpEvent（excp_flush/ertn_flush），普通提交走 InstrCommit
     //      4. store/load 事件的 8 位类型掩码按 inst 编码生成（下面给了 st/ld 模板）
@@ -2640,6 +2639,15 @@ module core_top #(
     wire dbg1_is_tlbfill = (cmt_dbg1_inst[31:10] == 22'h1920d)
                         && (cmt_dbg1_inst[9:0] == 10'b0);
 
+    // csrrd/csrwr/csrxchg ESTAT：digftest 用 csr_rstat/csr_data 同步 DUT ESTAT 进 NEMU
+    // （手册要求三种 CSR 指令都要拉高；csr_data 用提交后建筑态 ESTAT，csrwr 时 wdata 是旧值）
+    wire dbg0_is_csr_op = (cmt_dbg0_inst[31:24] == 8'h04);
+    wire dbg1_is_csr_op = (cmt_dbg1_inst[31:24] == 8'h04);
+    wire dbg0_is_csr_estat = dbg0_is_csr_op
+                          && (cmt_dbg0_inst[23:10] == {2'b0, `CSR_ESTAT});
+    wire dbg1_is_csr_estat = dbg1_is_csr_op
+                          && (cmt_dbg1_inst[23:10] == {2'b0, `CSR_ESTAT});
+
     // 提交拍打一拍后送 DPI（槽 0）
     reg         cmt0_valid_r;
     reg  [31:0] cmt0_pc_r, cmt0_inst_r, cmt0_wdata_r;
@@ -2652,6 +2660,8 @@ module core_top #(
     reg  [63:0] cmt0_timer64_r;
     reg         cmt0_is_tlbfill_r;
     reg  [4:0]  cmt0_tlbfill_idx_r;
+    reg         cmt0_csr_rstat_r;
+    reg  [31:0] cmt0_csr_data_r;
     reg         excp_flush_r, ertn_flush_r;
     reg  [31:0] excp_pc_r, excp_inst_r;
     reg  [7:0]  excp_ecode_r;
@@ -2667,6 +2677,8 @@ module core_top #(
     reg  [63:0] cmt1_timer64_r;
     reg         cmt1_is_tlbfill_r;
     reg  [4:0]  cmt1_tlbfill_idx_r;
+    reg         cmt1_csr_rstat_r;
+    reg  [31:0] cmt1_csr_data_r;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -2679,6 +2691,7 @@ module core_top #(
             cmt0_st_paddr_r <= 32'b0; cmt0_st_vaddr_r <= 32'b0; cmt0_st_data_r <= 32'b0;
             cmt0_is_cnt_r <= 1'b0; cmt0_timer64_r <= 64'b0;
             cmt0_is_tlbfill_r <= 1'b0; cmt0_tlbfill_idx_r <= 5'b0;
+            cmt0_csr_rstat_r <= 1'b0; cmt0_csr_data_r <= 32'b0;
             excp_pc_r <= 32'b0;    excp_inst_r <= 32'b0;  excp_ecode_r <= 8'b0;
             cmt1_pc_r <= 32'b0;    cmt1_inst_r <= 32'b0;  cmt1_wdata_r <= 32'b0;
             cmt1_wdest_r <= 8'b0;  cmt1_wen_r <= 1'b0;
@@ -2687,6 +2700,7 @@ module core_top #(
             cmt1_st_paddr_r <= 32'b0; cmt1_st_vaddr_r <= 32'b0; cmt1_st_data_r <= 32'b0;
             cmt1_is_cnt_r <= 1'b0; cmt1_timer64_r <= 64'b0;
             cmt1_is_tlbfill_r <= 1'b0; cmt1_tlbfill_idx_r <= 5'b0;
+            cmt1_csr_rstat_r <= 1'b0; cmt1_csr_data_r <= 32'b0;
         end else begin
             cmt0_valid_r    <= cmt_dbg0_valid;
             cmt0_pc_r       <= cmt_dbg0_pc;
@@ -2708,6 +2722,8 @@ module core_top #(
             cmt0_timer64_r  <= dbg0_timer64;
             cmt0_is_tlbfill_r  <= cmt_dbg0_valid && dbg0_is_tlbfill;
             cmt0_tlbfill_idx_r <= csr_rand_index;
+            cmt0_csr_rstat_r <= cmt_dbg0_valid && dbg0_is_csr_estat;
+            cmt0_csr_data_r  <= diff_csr_estat;
             excp_flush_r    <= cmt_flush_req && (cmt_flush_type == `FLUSH_EXCP);
             ertn_flush_r    <= cmt_flush_req && (cmt_flush_type == `FLUSH_ERTN);
             excp_pc_r       <= cmt_csr_pc;
@@ -2733,6 +2749,8 @@ module core_top #(
             cmt1_timer64_r  <= dbg1_timer64;
             cmt1_is_tlbfill_r  <= cmt_dbg1_valid && dbg1_is_tlbfill;
             cmt1_tlbfill_idx_r <= csr_rand_index;
+            cmt1_csr_rstat_r <= cmt_dbg1_valid && dbg1_is_csr_estat;
+            cmt1_csr_data_r  <= diff_csr_estat;
         end
     end
 
@@ -2780,6 +2798,8 @@ module core_top #(
     wire [63:0] diff_cmt0_tmr = cmt0_valid_r ? cmt0_timer64_r : cmt1_timer64_r;
     wire        diff_cmt0_fill = cmt0_valid_r ? cmt0_is_tlbfill_r : cmt1_is_tlbfill_r;
     wire [4:0]  diff_cmt0_fidx = cmt0_valid_r ? cmt0_tlbfill_idx_r : cmt1_tlbfill_idx_r;
+    wire        diff_cmt0_rstat = cmt0_valid_r ? cmt0_csr_rstat_r : cmt1_csr_rstat_r;
+    wire [31:0] diff_cmt0_cdata = cmt0_valid_r ? cmt0_csr_data_r  : cmt1_csr_data_r;
 
     DifftestInstrCommit diff_instr_commit0(
         .clock          (clk),
@@ -2796,8 +2816,8 @@ module core_top #(
         .wen            (diff_cmt0_wen),
         .wdest          (diff_cmt0_wdest),
         .wdata          ({32'b0, diff_cmt0_wdata}),
-        .csr_rstat      (1'b0),               //TODO: csrrd ESTAT 检测
-        .csr_data       (32'b0)
+        .csr_rstat      (diff_cmt0_v & diff_cmt0_rstat),
+        .csr_data       (diff_cmt0_cdata)
     );
 
     DifftestInstrCommit diff_instr_commit1(
@@ -2815,8 +2835,8 @@ module core_top #(
         .wen            (cmt1_wen_r),
         .wdest          (cmt1_wdest_r),
         .wdata          ({32'b0, cmt1_wdata_r}),
-        .csr_rstat      (1'b0),
-        .csr_data       (32'b0)
+        .csr_rstat      (diff_cmt1_v & cmt1_csr_rstat_r),
+        .csr_data       (cmt1_csr_data_r)
     );
 
     DifftestExcpEvent diff_excp_event(
@@ -2946,6 +2966,148 @@ module core_top #(
         .gpr_30 ({32'b0, diff_gpr_30}),
         .gpr_31 ({32'b0, diff_gpr_31})
     );
+`endif
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+// 性能仿真结束时打印前端/cache/IPC（无 digftest 时 testbench 的 inst_total 恒为 0）
+reg [63:0] perf_cycle_count;
+reg [63:0] perf_retire_count;
+reg [63:0] stall_rob_full_cyc;
+reg [63:0] stall_sb_full_cyc;
+reg [63:0] perf_cmt_dual_cyc;     // 双提交拍数
+reg [63:0] perf_cmt_any_cyc;      // 至少提交 1 条的拍数
+reg [63:0] perf_dis_dual_cyc;     // 同拍双分发
+reg [63:0] perf_dis_any_cyc;      // 至少分发 1 条
+reg [63:0] perf_dis_dual_alu_cyc; // 同拍双 ALU 入站（alu0+alu1 push）
+always @(posedge clk) begin
+    if (reset) begin
+        perf_cycle_count      <= 64'd0;
+        perf_retire_count     <= 64'd0;
+        stall_rob_full_cyc    <= 64'd0;
+        stall_sb_full_cyc     <= 64'd0;
+        perf_cmt_dual_cyc     <= 64'd0;
+        perf_cmt_any_cyc      <= 64'd0;
+        perf_dis_dual_cyc     <= 64'd0;
+        perf_dis_any_cyc      <= 64'd0;
+        perf_dis_dual_alu_cyc <= 64'd0;
+    end else begin
+        perf_cycle_count  <= perf_cycle_count + 64'd1;
+        perf_retire_count <= perf_retire_count
+                           + {63'd0, cmt_dbg0_valid}
+                           + {63'd0, cmt_dbg1_valid};
+        if (rob_full)
+            stall_rob_full_cyc <= stall_rob_full_cyc + 64'd1;
+        if (sb_full)
+            stall_sb_full_cyc <= stall_sb_full_cyc + 64'd1;
+        if (cmt_dbg0_valid && cmt_dbg1_valid)
+            perf_cmt_dual_cyc <= perf_cmt_dual_cyc + 64'd1;
+        if (cmt_dbg0_valid || cmt_dbg1_valid)
+            perf_cmt_any_cyc <= perf_cmt_any_cyc + 64'd1;
+        if (dis0_fire && dis1_fire)
+            perf_dis_dual_cyc <= perf_dis_dual_cyc + 64'd1;
+        if (dis0_fire || dis1_fire)
+            perf_dis_any_cyc <= perf_dis_any_cyc + 64'd1;
+        if (u_dispatch.rs_alu0_push_valid_o && u_dispatch.rs_alu1_push_valid_o)
+            perf_dis_dual_alu_cyc <= perf_dis_dual_alu_cyc + 64'd1;
+    end
+end
+
+function automatic real perf_rate;
+    input [63:0] num;
+    input [63:0] den;
+    begin
+        if (den == 64'd0)
+            perf_rate = 0.0;
+        else
+            perf_rate = 100.0 * num / den;
+    end
+endfunction
+
+function automatic real perf_ipc;
+    input [63:0] insts;
+    input [63:0] cycles;
+    begin
+        if (cycles == 64'd0)
+            perf_ipc = 0.0;
+        else
+            perf_ipc = 1.0 * insts / cycles;
+    end
+endfunction
+
+final begin
+    $display("");
+    $display("==================== myCPU PERF (sim) ====================");
+    $display("Commit IPC:         retire=%0d  cycles=%0d  IPC=%.6f",
+             perf_retire_count, perf_cycle_count,
+             perf_ipc(perf_retire_count, perf_cycle_count));
+    $display("Commit dual-issue:  dual_cyc=%0d  any_cyc=%0d  dual_rate=%.2f%%  (of commit cycles)",
+             perf_cmt_dual_cyc, perf_cmt_any_cyc,
+             perf_rate(perf_cmt_dual_cyc, perf_cmt_any_cyc));
+    $display("  vs all cycles:    dual_rate=%.2f%%  IPC_util=%.2f%% of 2.0 peak",
+             perf_rate(perf_cmt_dual_cyc, perf_cycle_count),
+             perf_rate(perf_retire_count, perf_cycle_count * 2));
+    $display("Dispatch dual:      dual_cyc=%0d  any_cyc=%0d  dual_rate=%.2f%%  dual_ALU=%0d",
+             perf_dis_dual_cyc, perf_dis_any_cyc,
+             perf_rate(perf_dis_dual_cyc, perf_dis_any_cyc),
+             perf_dis_dual_alu_cyc);
+    $display("BPU all-branch:     total=%0d  mispred=%0d  accuracy=%.2f%%",
+             u_bpu.commit_all_branch_count,
+             u_bpu.commit_all_mispred_count,
+             perf_rate(u_bpu.commit_all_branch_count - u_bpu.commit_all_mispred_count,
+                       u_bpu.commit_all_branch_count));
+    $display("BPU cond-branch:    total=%0d  mispred=%0d  accuracy=%.2f%%",
+             u_bpu.commit_cond_branch_count,
+             u_bpu.commit_cond_mispred_count,
+             perf_rate(u_bpu.commit_cond_branch_count - u_bpu.commit_cond_mispred_count,
+                       u_bpu.commit_cond_branch_count));
+    $display("FTB (P1 response):  resp=%0d  hit=%0d  hit_rate=%.2f%%",
+             u_bpu.u_ftb.ftb_response_total,
+             u_bpu.u_ftb.ftb_hit_total,
+             perf_rate(u_bpu.u_ftb.ftb_hit_total, u_bpu.u_ftb.ftb_response_total));
+    $display("ICache (cached):    access=%0d  hit=%0d  hit_rate=%.2f%%",
+             u_icache.ic_access_total,
+             u_icache.ic_hit_total,
+             perf_rate(u_icache.ic_hit_total, u_icache.ic_access_total));
+    $display("DCache (cached):    access=%0d  hit=%0d  hit_rate=%.2f%%",
+             u_dcache.dc_access_total,
+             u_dcache.dc_hit_total,
+             perf_rate(u_dcache.dc_hit_total, u_dcache.dc_access_total));
+    $display("  DCache load:      access=%0d  hit=%0d  hit_rate=%.2f%%",
+             u_dcache.dc_ld_access_total,
+             u_dcache.dc_ld_hit_total,
+             perf_rate(u_dcache.dc_ld_hit_total, u_dcache.dc_ld_access_total));
+    $display("  DCache store:     access=%0d  hit=%0d  hit_rate=%.2f%%",
+             u_dcache.dc_st_access_total,
+             u_dcache.dc_st_hit_total,
+             perf_rate(u_dcache.dc_st_hit_total, u_dcache.dc_st_access_total));
+    $display("---- stall / mem ----");
+    $display("ROB full cycles:    %0d  (%.2f%%)",
+             stall_rob_full_cyc, perf_rate(stall_rob_full_cyc, perf_cycle_count));
+    $display("SB  full cycles:    %0d  (%.2f%%)",
+             stall_sb_full_cyc, perf_rate(stall_sb_full_cyc, perf_cycle_count));
+    $display("D$ MWAIT cycles:    %0d  (%.2f%%)",
+             u_dcache.dc_mwait_cycles, perf_rate(u_dcache.dc_mwait_cycles, perf_cycle_count));
+    $display("D$ pend cycles:     %0d  (%.2f%%)  push=%0d",
+             u_dcache.dc_pend_cycles, perf_rate(u_dcache.dc_pend_cycles, perf_cycle_count),
+             u_dcache.dc_pend_push_total);
+    $display("D$ MSHR busy:       %0d  (%.2f%%)",
+             u_dcache.dc_mshr_busy_cycles, perf_rate(u_dcache.dc_mshr_busy_cycles, perf_cycle_count));
+    $display("LSU store-order:    %0d  (%.2f%%)",
+             u_lsu.lsu_store_order_stall_cyc,
+             perf_rate(u_lsu.lsu_store_order_stall_cyc, perf_cycle_count));
+    $display("LSU DC wait:        %0d  (%.2f%%)",
+             u_lsu.lsu_dc_wait_cyc, perf_rate(u_lsu.lsu_dc_wait_cyc, perf_cycle_count));
+    $display("RS_MEM src stall:   %0d  (%.2f%%)",
+             u_rs_mem.rsm_src_stall_cyc, perf_rate(u_rs_mem.rsm_src_stall_cyc, perf_cycle_count));
+    $display("RS_MEM LSU stall:   %0d  (%.2f%%)",
+             u_rs_mem.rsm_lsu_stall_cyc, perf_rate(u_rs_mem.rsm_lsu_stall_cyc, perf_cycle_count));
+    $display("RS_MEM full stall:  %0d  (%.2f%%)",
+             u_rs_mem.rsm_full_stall_cyc, perf_rate(u_rs_mem.rsm_full_stall_cyc, perf_cycle_count));
+    $display("==========================================================");
+    $display("");
+end
+// synthesis translate_on
 `endif
 
 endmodule

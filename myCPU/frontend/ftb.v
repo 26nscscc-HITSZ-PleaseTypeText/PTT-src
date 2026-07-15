@@ -37,6 +37,11 @@ module ftb(
 
 localparam TAGW    = 20;                          // pc[31:12]
 localparam ENTRY_W = 1 + TAGW + `BR_TYPE_W + `BLK_LEN_W + 32;  // 58
+localparam FTB_UPDATE_Q_DEPTH = `FTB_UPDATE_Q_DEPTH;
+localparam FTB_UPDATE_Q_PTR_W =
+    (FTB_UPDATE_Q_DEPTH <= 1) ? 1 : $clog2(FTB_UPDATE_Q_DEPTH);
+localparam FTB_UPDATE_Q_CNT_W = $clog2(FTB_UPDATE_Q_DEPTH + 1);
+localparam [FTB_UPDATE_Q_CNT_W-1:0] FTB_UPDATE_Q_DEPTH_C = FTB_UPDATE_Q_DEPTH;
 
 // ---------------- 更新流水 U0/U1 ----------------
 reg                   u0_valid;
@@ -52,13 +57,46 @@ wire [`FTB_INDEX_W-1:0] q_index = query_pc_i[2 +: `FTB_INDEX_W];
 wire [`FTB_INDEX_W-1:0] u0_index= u0_pc[2 +: `FTB_INDEX_W];
 wire [`FTB_INDEX_W-1:0] u1_index= u1_pc[2 +: `FTB_INDEX_W];
 
-// 读口仲裁：U0 借口
-wire                     rd_steal = u0_valid;
-wire [`FTB_INDEX_W-1:0]  rd_index = rd_steal ? u0_index : q_index;
-
-// ---------------- 初始化（复位逐组清 valid）----------------
+// 读口仲裁：查询优先，训练请求进入小 FIFO 后在空闲周期借口
 reg                     initing;
 reg [`FTB_INDEX_W-1:0]  init_set;
+
+reg [31:0]           uq_pc      [0:FTB_UPDATE_Q_DEPTH-1];
+reg [31:0]           uq_target  [0:FTB_UPDATE_Q_DEPTH-1];
+reg [31:0]           uq_ft      [0:FTB_UPDATE_Q_DEPTH-1];
+reg [`BR_TYPE_W-1:0] uq_btype   [0:FTB_UPDATE_Q_DEPTH-1];
+reg                  uq_alloc   [0:FTB_UPDATE_Q_DEPTH-1];
+reg [FTB_UPDATE_Q_PTR_W-1:0] uq_rptr, uq_wptr;
+reg [FTB_UPDATE_Q_CNT_W-1:0] uq_count;
+
+wire update_queue_empty = (uq_count == {FTB_UPDATE_Q_CNT_W{1'b0}});
+wire update_queue_full  = (uq_count == FTB_UPDATE_Q_DEPTH_C);
+wire service_update     = !initing && !query_valid_i && !update_queue_empty;
+wire update_accept      = !initing && update_valid_i;
+wire update_enqueue     = update_accept && (!update_queue_full || service_update);
+wire update_overflow    = update_accept && update_queue_full && !service_update;
+wire update_dequeue     = service_update;
+wire [FTB_UPDATE_Q_CNT_W-1:0] uq_count_next =
+    (update_enqueue && !update_dequeue) ? (uq_count + {{(FTB_UPDATE_Q_CNT_W-1){1'b0}},1'b1}) :
+    (!update_enqueue && update_dequeue) ? (uq_count - {{(FTB_UPDATE_Q_CNT_W-1){1'b0}},1'b1}) :
+                                          uq_count;
+wire [63:0] uq_count_next_64 = {{(64-FTB_UPDATE_Q_CNT_W){1'b0}}, uq_count_next};
+
+wire [`FTB_INDEX_W-1:0] service_index = uq_pc[uq_rptr][2 +: `FTB_INDEX_W];
+wire [`FTB_INDEX_W-1:0] rd_index = service_update ? service_index : q_index;
+
+
+`ifndef SYNTHESIS
+// synthesis translate_off
+initial begin
+    if (FTB_UPDATE_Q_DEPTH < 2)
+        $fatal(1, "FTB_UPDATE_Q_DEPTH must be >= 2");
+    if ((FTB_UPDATE_Q_DEPTH & (FTB_UPDATE_Q_DEPTH - 1)) != 0)
+        $fatal(1, "FTB_UPDATE_Q_DEPTH must be a power of two");
+end
+// synthesis translate_on
+`endif
+
 
 // ---------------- 4 路 BRAM ----------------
 wire [ENTRY_W-1:0] way_rdata [0:`FTB_NWAY-1];
@@ -84,7 +122,7 @@ endgenerate
 reg        q_valid_r;
 reg [31:0] q_pc_r;
 always @(posedge clk) begin
-    q_valid_r <= query_valid_i && !rd_steal && !initing;
+    q_valid_r <= query_valid_i && !initing;
     q_pc_r    <= query_pc_i;
 end
 
@@ -156,18 +194,37 @@ always @(posedge clk) begin
         victim_rr <= 2'd0;
         initing   <= 1'b1;
         init_set  <= {`FTB_INDEX_W{1'b0}};
+        uq_rptr   <= {FTB_UPDATE_Q_PTR_W{1'b0}};
+        uq_wptr   <= {FTB_UPDATE_Q_PTR_W{1'b0}};
+        uq_count  <= {FTB_UPDATE_Q_CNT_W{1'b0}};
     end else if (initing) begin
+        u0_valid <= 1'b0;
+        u1_valid <= 1'b0;
         init_set <= init_set + 1'b1;
         if (init_set == {`FTB_INDEX_W{1'b1}}) initing <= 1'b0;
     end else begin
-        // U0：捕获更新请求（借读口）
-        u0_valid <= update_valid_i;
-        if (update_valid_i) begin
-            u0_pc     <= update_block_pc_i;
-            u0_target <= update_jump_target_i;
-            u0_ft     <= update_fall_through_i;
-            u0_btype  <= update_br_type_i;
-            u0_alloc  <= update_alloc_i;
+        // 更新请求先进入 FIFO；空闲周期再借读口进入 U0
+        if (update_enqueue) begin
+            uq_pc[uq_wptr]     <= update_block_pc_i;
+            uq_target[uq_wptr] <= update_jump_target_i;
+            uq_ft[uq_wptr]     <= update_fall_through_i;
+            uq_btype[uq_wptr]  <= update_br_type_i;
+            uq_alloc[uq_wptr]  <= update_alloc_i;
+            uq_wptr            <= uq_wptr + {{(FTB_UPDATE_Q_PTR_W-1){1'b0}},1'b1};
+        end
+
+        if (update_dequeue) begin
+            uq_rptr <= uq_rptr + {{(FTB_UPDATE_Q_PTR_W-1){1'b0}},1'b1};
+        end
+        uq_count <= uq_count_next;
+
+        u0_valid <= update_dequeue;
+        if (update_dequeue) begin
+            u0_pc     <= uq_pc[uq_rptr];
+            u0_target <= uq_target[uq_rptr];
+            u0_ft     <= uq_ft[uq_rptr];
+            u0_btype  <= uq_btype[uq_rptr];
+            u0_alloc  <= uq_alloc[uq_rptr];
         end
         // U1：写入
         u1_valid <= u0_valid;
@@ -192,6 +249,15 @@ reg [63:0] ftb_query_suppressed_by_train;
 reg [63:0] ftb_response_total;
 reg [63:0] ftb_hit_total;
 reg [63:0] ftb_train_total;
+reg [63:0] ftb_update_request_count;
+reg [63:0] ftb_update_enqueue_count;
+reg [63:0] ftb_update_dequeue_count;
+reg [63:0] ftb_update_write_count;
+reg [63:0] ftb_update_overflow_count;
+reg [63:0] ftb_update_queue_max_occupancy;
+reg [63:0] ftb_update_queue_pending_count;
+reg [63:0] ftb_query_while_update_arrives_count;
+reg [63:0] ftb_update_service_idle_cycle_count;
 
 always @(posedge clk) begin
     if (reset) begin
@@ -200,17 +266,41 @@ always @(posedge clk) begin
         ftb_response_total            <= 64'd0;
         ftb_hit_total                 <= 64'd0;
         ftb_train_total               <= 64'd0;
+        ftb_update_request_count      <= 64'd0;
+        ftb_update_enqueue_count      <= 64'd0;
+        ftb_update_dequeue_count      <= 64'd0;
+        ftb_update_write_count        <= 64'd0;
+        ftb_update_overflow_count     <= 64'd0;
+        ftb_update_queue_max_occupancy <= 64'd0;
+        ftb_update_queue_pending_count <= 64'd0;
+        ftb_query_while_update_arrives_count <= 64'd0;
+        ftb_update_service_idle_cycle_count  <= 64'd0;
     end else begin
         if (query_valid_i)
             ftb_query_total <= ftb_query_total + 64'd1;
-        if (query_valid_i && rd_steal && !initing)
-            ftb_query_suppressed_by_train <= ftb_query_suppressed_by_train + 64'd1;
         if (q_valid_r)
             ftb_response_total <= ftb_response_total + 64'd1;
         if (hit_o)
             ftb_hit_total <= ftb_hit_total + 64'd1;
         if (update_valid_i)
             ftb_train_total <= ftb_train_total + 64'd1;
+        if (update_accept)
+            ftb_update_request_count <= ftb_update_request_count + 64'd1;
+        if (update_enqueue)
+            ftb_update_enqueue_count <= ftb_update_enqueue_count + 64'd1;
+        if (update_dequeue)
+            ftb_update_dequeue_count <= ftb_update_dequeue_count + 64'd1;
+        if (u1_valid)
+            ftb_update_write_count <= ftb_update_write_count + 64'd1;
+        if (update_overflow)
+            ftb_update_overflow_count <= ftb_update_overflow_count + 64'd1;
+        if (uq_count_next_64 > ftb_update_queue_max_occupancy)
+            ftb_update_queue_max_occupancy <= uq_count_next_64;
+        ftb_update_queue_pending_count <= uq_count_next_64;
+        if (query_valid_i && update_valid_i && !initing)
+            ftb_query_while_update_arrives_count <= ftb_query_while_update_arrives_count + 64'd1;
+        if (update_dequeue)
+            ftb_update_service_idle_cycle_count <= ftb_update_service_idle_cycle_count + 64'd1;
     end
 end
 // synthesis translate_on

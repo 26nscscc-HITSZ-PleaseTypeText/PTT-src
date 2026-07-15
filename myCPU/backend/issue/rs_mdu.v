@@ -90,9 +90,11 @@ reg [13:0]              csr_num [0:`RS_MDU_SIZE-1];
 reg [`TLB_OP_NUM-1:0]   tlb_op [0:`RS_MDU_SIZE-1];
 reg [`WB_SRC_NUM-1:0]   wb_src_op [0:`RS_MDU_SIZE-1];
 reg                     s0_ready [0:`RS_MDU_SIZE-1];
+reg                     s0_val_valid [0:`RS_MDU_SIZE-1];
 reg [31:0]              s0_val [0:`RS_MDU_SIZE-1];
 reg [`ROB_W-1:0]        s0_robid [0:`RS_MDU_SIZE-1];
 reg                     s1_ready [0:`RS_MDU_SIZE-1];
+reg                     s1_val_valid [0:`RS_MDU_SIZE-1];
 reg [31:0]              s1_val [0:`RS_MDU_SIZE-1];
 reg [`ROB_W-1:0]        s1_robid [0:`RS_MDU_SIZE-1];
 reg                     head;
@@ -103,27 +105,33 @@ integer i;
 wire head_ready;
 wire issue_fire;
 
-// 每项唤醒命中/旁路数据用【generate 预计算 wire 数组】而非 function 调用：
-// xsim 在 continuous assign 里对"带可变下标的 function"存在求值缺陷（见 rob.v），
-// 会返回上一次求值下标的旧值。改为纯数组变址读（s0_wbhit[idx] 等）即可规避。
+wire            s0_wb_match [0:`RS_MDU_SIZE-1];
+wire            s1_wb_match [0:`RS_MDU_SIZE-1];
 wire            s0_wbhit [0:`RS_MDU_SIZE-1];
 wire            s1_wbhit [0:`RS_MDU_SIZE-1];
+wire            s0_earlyhit [0:`RS_MDU_SIZE-1];
+wire            s1_earlyhit [0:`RS_MDU_SIZE-1];
 wire [31:0]     s0_wbdat [0:`RS_MDU_SIZE-1];
 wire [31:0]     s1_wbdat [0:`RS_MDU_SIZE-1];
 genvar gw;
 generate
 for (gw = 0; gw < `RS_MDU_SIZE; gw = gw + 1) begin : g_wake
-    // 关键修复：已 ready 的操作数必须"冻结"，绝不能再被唤醒覆盖（见 rs_mem 同款注释）。
-    assign s0_wbhit[gw] = !s0_ready[gw] &&
-                          ((wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ||
-                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ||
-                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ||
-                           (wb3_valid_i && (wb3_robid_i == s0_robid[gw])));
-    assign s1_wbhit[gw] = !s1_ready[gw] &&
-                          ((wb0_valid_i && (wb0_robid_i == s1_robid[gw])) ||
-                           (wb1_valid_i && (wb1_robid_i == s1_robid[gw])) ||
-                           (wb2_valid_i && (wb2_robid_i == s1_robid[gw])) ||
-                           (wb3_valid_i && (wb3_robid_i == s1_robid[gw])));
+    assign s0_wb_match[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ||
+                             (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ||
+                             (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ||
+                             (wb3_valid_i && (wb3_robid_i == s0_robid[gw]));
+    assign s1_wb_match[gw] = (wb0_valid_i && (wb0_robid_i == s1_robid[gw])) ||
+                             (wb1_valid_i && (wb1_robid_i == s1_robid[gw])) ||
+                             (wb2_valid_i && (wb2_robid_i == s1_robid[gw])) ||
+                             (wb3_valid_i && (wb3_robid_i == s1_robid[gw]));
+    assign s0_wbhit[gw] = !s0_val_valid[gw] && s0_wb_match[gw];
+    assign s1_wbhit[gw] = !s1_val_valid[gw] && s1_wb_match[gw];
+    assign s0_earlyhit[gw] = !s0_ready[gw] && !s0_wbhit[gw] &&
+                             ((early0_valid_i && (early0_robid_i == s0_robid[gw])) ||
+                              (early1_valid_i && (early1_robid_i == s0_robid[gw])));
+    assign s1_earlyhit[gw] = !s1_ready[gw] && !s1_wbhit[gw] &&
+                             ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
+                              (early1_valid_i && (early1_robid_i == s1_robid[gw])));
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :
@@ -135,8 +143,6 @@ for (gw = 0; gw < `RS_MDU_SIZE; gw = gw + 1) begin : g_wake
 end
 endgenerate
 
-// push 口的唤醒命中/旁路（参数是端口信号，非数组变址；同样内联以彻底去除 function）
-// push 同理带 !push_srcX_ready 门控（见 rs_mem 同款注释）。
 wire        push_s0_wbhit = !push_src0_ready_i &&
                            ((wb0_valid_i && (wb0_robid_i == push_src0_robid_i)) ||
                             (wb1_valid_i && (wb1_robid_i == push_src0_robid_i)) ||
@@ -147,6 +153,12 @@ wire        push_s1_wbhit = !push_src1_ready_i &&
                             (wb1_valid_i && (wb1_robid_i == push_src1_robid_i)) ||
                             (wb2_valid_i && (wb2_robid_i == push_src1_robid_i)) ||
                             (wb3_valid_i && (wb3_robid_i == push_src1_robid_i)));
+wire        push_s0_early = !push_src0_ready_i && !push_s0_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push_src0_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push_src0_robid_i)));
+wire        push_s1_early = !push_src1_ready_i && !push_s1_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push_src1_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push_src1_robid_i)));
 wire [31:0] push_s0_wbdat = (wb0_valid_i && (wb0_robid_i == push_src0_robid_i)) ? wb0_data_i :
                             (wb1_valid_i && (wb1_robid_i == push_src0_robid_i)) ? wb1_data_i :
                             (wb2_valid_i && (wb2_robid_i == push_src0_robid_i)) ? wb2_data_i :
@@ -159,8 +171,8 @@ wire [31:0] push_s1_wbdat = (wb0_valid_i && (wb0_robid_i == push_src1_robid_i)) 
 assign occupancy_o = count;
 assign can_accept_o = (count != `RS_MDU_SIZE);
 assign head_ready = (count != 2'b0) && valid[head] &&
-                    (s0_ready[head] || s0_wbhit[head]) &&
-                    (s1_ready[head] || s1_wbhit[head]);
+                    ((s0_ready[head] && s0_val_valid[head]) || s0_wbhit[head]) &&
+                    ((s1_ready[head] && s1_val_valid[head]) || s1_wbhit[head]);
 assign issue_valid_o = head_ready && mdu_ready_i;
 assign issue_fire = issue_valid_o;
 
@@ -185,12 +197,18 @@ always @(posedge clk) begin
         for (i = 0; i < `RS_MDU_SIZE; i = i + 1) begin
             if (valid[i] && !(issue_fire && (i[0] == head))) begin
                 if (s0_wbhit[i]) begin
-                    s0_ready[i] <= 1'b1;
-                    s0_val[i] <= s0_wbdat[i];
+                    s0_ready[i]     <= 1'b1;
+                    s0_val_valid[i] <= 1'b1;
+                    s0_val[i]       <= s0_wbdat[i];
+                end else if (s0_earlyhit[i]) begin
+                    s0_ready[i]     <= 1'b1;
                 end
                 if (s1_wbhit[i]) begin
-                    s1_ready[i] <= 1'b1;
-                    s1_val[i] <= s1_wbdat[i];
+                    s1_ready[i]     <= 1'b1;
+                    s1_val_valid[i] <= 1'b1;
+                    s1_val[i]       <= s1_wbdat[i];
+                end else if (s1_earlyhit[i]) begin
+                    s1_ready[i]     <= 1'b1;
                 end
             end
         end
@@ -208,11 +226,13 @@ always @(posedge clk) begin
             csr_num[tail] <= push_csr_num_i;
             tlb_op[tail] <= push_tlb_op_i;
             wb_src_op[tail] <= push_wb_src_op_i;
-            s0_ready[tail] <= push_src0_ready_i || push_s0_wbhit;
+            s0_ready[tail] <= push_src0_ready_i || push_s0_wbhit || push_s0_early;
+            s0_val_valid[tail] <= push_src0_ready_i || push_s0_wbhit;
             s0_val[tail] <= push_s0_wbhit ? push_s0_wbdat :
                             push_src0_ready_i ? push_src0_val_i : 32'b0;
             s0_robid[tail] <= push_src0_robid_i;
-            s1_ready[tail] <= push_src1_ready_i || push_s1_wbhit;
+            s1_ready[tail] <= push_src1_ready_i || push_s1_wbhit || push_s1_early;
+            s1_val_valid[tail] <= push_src1_ready_i || push_s1_wbhit;
             s1_val[tail] <= push_s1_wbhit ? push_s1_wbdat :
                             push_src1_ready_i ? push_src1_val_i : 32'b0;
             s1_robid[tail] <= push_src1_robid_i;

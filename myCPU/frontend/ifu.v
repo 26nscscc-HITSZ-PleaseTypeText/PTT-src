@@ -381,7 +381,10 @@ wire push_en = if_ready_go;
 
 // pred_taken 只标在推送块末指令：直接 B/BL 恒 1；cond 截断恒 0（前端实际
 // 走 fall-through，若实际 taken 由提交级 br_taken!=pred_taken 冲刷，
-// 不依赖目标比对，避免目标撞车漏检）；未截断块末用 FTQ 块级 taken
+// 不依赖目标比对，避免目标撞车漏检）；未截断块末仅真实 cond 分支用 FTQ taken。
+// 禁止对块末 ALU 标 pred_taken：否则 taken 脏 FTB 会令 BPU 跳到 target，而 IFU
+ // 仍推送块内 ALU；双提交又不检槽1 的 (!branch&&pred_taken) → 静默跳过后续指令
+// （Linux makecontext: 2e68/2e6c 后跳到 2ea8）。
 function slot_pred_taken;
     input [1:0] idx;
     input [`BLK_LEN_W-1:0] olen;
@@ -392,8 +395,7 @@ function slot_pred_taken;
                 slot_pred_taken = 1'b1;
             else if (predec_found && !predec_is_direct)
                 slot_pred_taken = 1'b0;
-            else if (if_taken && (cond_br[idx] ||
-                     (!predec_found && ((idx + 1'b1) == if_len_eff))))
+            else if (if_taken && cond_br[idx])
                 slot_pred_taken = 1'b1;
         end
     end

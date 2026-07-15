@@ -292,6 +292,40 @@ end
 // lint 吸收（cancel 端口按约定忽略：IFU 自行配对丢弃过期返回）
 wire icache_lint = ifu_cancel_i;
 
+`ifndef SYNTHESIS
+// synthesis translate_off
+// 仿真性能统计：cached LOOKUP 访问 / 命中（不含 uncached/cacop）
+reg [63:0] ic_access_total;
+reg [63:0] ic_hit_total;
+reg [63:0] ic_lookup_total;
+reg [63:0] ic_lookup_cached_total;
+reg [63:0] ic_lookup_uncached_total;
+reg [63:0] ic_lookup_cacop_total;
+always @(posedge clk) begin
+    if (!resetn) begin
+        ic_access_total <= 64'd0;
+        ic_hit_total    <= 64'd0;
+        ic_lookup_total <= 64'd0;
+        ic_lookup_cached_total <= 64'd0;
+        ic_lookup_uncached_total <= 64'd0;
+        ic_lookup_cacop_total <= 64'd0;
+    end else if ((state == S_LOOKUP) && !req_is_cacop && !req_uncached) begin
+        ic_access_total <= ic_access_total + 64'd1;
+        ic_lookup_total <= ic_lookup_total + 64'd1;
+        ic_lookup_cached_total <= ic_lookup_cached_total + 64'd1;
+        if (hit_any)
+            ic_hit_total <= ic_hit_total + 64'd1;
+    end else if (state == S_LOOKUP) begin
+        ic_lookup_total <= ic_lookup_total + 64'd1;
+        if (req_is_cacop)
+            ic_lookup_cacop_total <= ic_lookup_cacop_total + 64'd1;
+        else if (req_uncached)
+            ic_lookup_uncached_total <= ic_lookup_uncached_total + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
+
 endmodule
 
 // ------------------------------------------------------------

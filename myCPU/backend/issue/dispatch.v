@@ -7,9 +7,13 @@
 //      若该编号的指令已写回（ROB ready），直接取到值（ready 变 1）；
 //      仍未写回的，带着编号进保留站等唤醒。
 //   2) 按 futype 路由进 4 个保留站：
-//      FU_ALU -> rs_alu0 / rs_alu1（双 ALU 负载均衡：选剩余容量大的）
+//      FU_ALU -> rs_alu0 / rs_alu1
+//         * 双 ALU 且两站皆空：槽0→alu0、槽1→alu1，同拍双发；
+//         * 否则按 occupancy 负载均衡选站；
 //      FU_MEM -> rs_mem（一拍最多进 1 条）
 //      FU_MDU -> rs_mdu（一拍最多进 1 条）
+// - 入站不卡源就绪：未齐则带 robid 进 RS，由 wakeup 补齐（避免堵 rename）。
+// - 槽1 不可越过未发出的槽0；可与槽0 同拍双发。
 // - 本级纯组合（rename 的流水寄存器就是本级的输入寄存器）。
 //
 // 端口：
@@ -102,7 +106,7 @@ module dispatch(
 
     // =============== rs_alu0 入站口 ===============
     input  wire                       rs_alu0_can_accept_i,
-    input  wire [2:0]                 rs_alu0_occupancy_i,   // 占用项数（负载均衡用）
+    input  wire [`RS_ALU_OCC_W-1:0]   rs_alu0_occupancy_i,   // 占用项数（负载均衡用）
     output wire                       rs_alu0_push_valid_o,
     output wire [`ROB_W-1:0]          rs_alu0_push_robid_o,
     output wire [31:0]                rs_alu0_push_pc_o,
@@ -120,7 +124,7 @@ module dispatch(
 
     // =============== rs_alu1 入站口 ===============
     input  wire                       rs_alu1_can_accept_i,
-    input  wire [2:0]                 rs_alu1_occupancy_i,
+    input  wire [`RS_ALU_OCC_W-1:0]   rs_alu1_occupancy_i,
     output wire                       rs_alu1_push_valid_o,
     output wire [`ROB_W-1:0]          rs_alu1_push_robid_o,
     output wire [31:0]                rs_alu1_push_pc_o,
@@ -283,31 +287,28 @@ assign two_alu = dis0_is_alu && dis1_is_alu;
 assign two_mem = dis0_is_mem && dis1_is_mem;
 assign two_mdu = dis0_is_mdu && dis1_is_mdu;
 
+// 双 ALU 且两站都有空：固定程序序 槽0→rs_alu0、槽1→rs_alu1（同拍各压一条）
+wire dual_alu_ok = two_alu && rs_alu0_can_accept_i && rs_alu1_can_accept_i;
+
 assign single_alu_to_alu0 = rs_alu0_can_accept_i &&
                             (!rs_alu1_can_accept_i ||
                              (rs_alu0_occupancy_i <= rs_alu1_occupancy_i));
 
-assign slot0_to_alu0 = dis0_is_alu &&
-                       (two_alu ? (rs_alu0_occupancy_i <= rs_alu1_occupancy_i)
-                                : single_alu_to_alu0);
-assign slot0_to_alu1 = dis0_is_alu &&
-                       (two_alu ? (rs_alu0_occupancy_i > rs_alu1_occupancy_i)
-                                : !single_alu_to_alu0);
-assign slot1_to_alu0 = dis1_is_alu &&
-                       (two_alu ? (rs_alu0_occupancy_i > rs_alu1_occupancy_i)
-                                : single_alu_to_alu0);
-assign slot1_to_alu1 = dis1_is_alu &&
-                       (two_alu ? (rs_alu0_occupancy_i <= rs_alu1_occupancy_i)
-                                : !single_alu_to_alu0);
+assign slot0_to_alu0 = dis0_is_alu && (dual_alu_ok ? 1'b1 : single_alu_to_alu0);
+assign slot0_to_alu1 = dis0_is_alu && (dual_alu_ok ? 1'b0 : !single_alu_to_alu0);
+assign slot1_to_alu0 = dis1_is_alu && (dual_alu_ok ? 1'b0 : single_alu_to_alu0);
+assign slot1_to_alu1 = dis1_is_alu && (dual_alu_ok ? 1'b1 : !single_alu_to_alu0);
 assign slot0_to_mem = dis0_is_mem;
 assign slot1_to_mem = dis1_is_mem;
 assign slot0_to_mdu = dis0_is_mdu;
 assign slot1_to_mdu = dis1_is_mdu;
 
-assign dis0_will_take_alu0 = dis0_valid_i && dis0_ops_ready && dis0_is_alu && slot0_to_alu0;
-assign dis0_will_take_alu1 = dis0_valid_i && dis0_ops_ready && dis0_is_alu && slot0_to_alu1;
-assign dis0_will_take_mem  = dis0_valid_i && dis0_ops_ready && dis0_is_mem;
-assign dis0_will_take_mdu  = dis0_valid_i && dis0_ops_ready && dis0_is_mdu;
+// 入站不再要求源就绪：未齐则带 robid 进 RS，由 wakeup 补齐。
+// 避免槽0 因相关/长延迟占住 dis，拖死 rename（dispatch_ready）。
+assign dis0_will_take_alu0 = dis0_valid_i && dis0_is_alu && slot0_to_alu0;
+assign dis0_will_take_alu1 = dis0_valid_i && dis0_is_alu && slot0_to_alu1;
+assign dis0_will_take_mem  = dis0_valid_i && dis0_is_mem;
+assign dis0_will_take_mdu  = dis0_valid_i && dis0_is_mdu;
 
 assign dis0_rs_ok = dis0_is_alu ? (slot0_to_alu0 ? rs_alu0_can_accept_i : rs_alu1_can_accept_i) :
                     dis0_is_mem ? rs_mem_can_accept_i :
@@ -319,12 +320,12 @@ assign dis1_rs_ok = dis1_is_alu ? (slot1_to_alu0 ? (rs_alu0_can_accept_i && !dis
                     dis1_is_mdu ? (rs_mdu_can_accept_i && !dis0_will_take_mdu) :
                     1'b0;
 
-assign dis0_can_dispatch = dis0_valid_i && dis0_ops_ready && dis0_rs_ok;
-assign dis1_can_dispatch = dis1_valid_i && dis1_ops_ready && dis1_rs_ok;
+assign dis0_can_dispatch = dis0_valid_i && dis0_rs_ok;
+assign dis1_can_dispatch = dis1_valid_i && dis1_rs_ok;
 
 assign dis0_fire_o = dis0_can_dispatch;
-// 槽 1 只能在槽 0 已空后入站，避免同 rename 对内乱序
-assign dis1_fire_o = dis1_can_dispatch && !dis0_valid_i;
+// 禁止槽1越过未发出的槽0；允许与 dis0 同拍双发（如 dual_alu_ok → 两站各一条）
+assign dis1_fire_o = dis1_can_dispatch && (!dis0_valid_i || dis0_fire_o);
 assign dispatch_ready_o = !dis0_valid_i && !dis1_valid_i;
 
 wire rs_alu0_from_slot1 = slot1_to_alu0 && dis1_fire_o;

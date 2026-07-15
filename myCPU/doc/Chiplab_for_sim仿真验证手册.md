@@ -1,6 +1,6 @@
 # Chiplab_for_sim仿真验证手册
 
-> V1.4 2026.6.8 by dogandlamb
+> V1.5 2026.7.15 by dogandlamb
 
 >该手册默认使用环境是在wsl下的chiplab，可以直接使用我打包好的WSL_chiplab_for_sim.tar文件导入到wsl中
 
@@ -11,11 +11,17 @@
 
 ## 0. 替换 CPU 前检查/WSL_chiplab_for_sim环境简介
 
-| 项 | 说明 |
-|----|------|
-| RTL 目录 | 将你的核 Verilog 放入 `IP/myCPU/`（替换或覆盖原 myCPU 文件） |
-| 总线宽度 | `IP/myCPU/mycpu.h` 中 `BR_BUS_WD`、`FS_TO_DS_BUS_WD` 等与流水线接口一致 |
-| Linux 频率 | 使用 la32r v0.2 自编内核时，`chip/soc_demo/sim/config.h` 中 `` `define FREQ `` 保持 **33MHz** |
+| 类别 | 改动 | 位置 / 取值 |
+|------|------|-------------|
+| Verilator 找 RTL | 递归 find 子目录 + `-y`，不再只用扁平 `*.v` | `sims/verilator/run_prog/Makefile` |
+| timescale | 统一 `` `timescale 1ns / 1ps ``，避免 `TIMESCALEMOD` | `mycpu.h`、`simu_top.v`、`difftest.v`、`soc_top.v` |
+| Cache 几何（核） | L1：4-way × 128-set × 32B = 16KB；L2：2×512×32B=32KB | `IP/myCPU/mycpu.h` |
+| lab19 软件 cacop 宏 | `WAY=4` `OFFSET=5` `INDEX=7`（对齐上面 L1） | `func_lab19/include/test_define.h` |
+| 双提交 / digftest | `CPU_2CMT=n`（不用 SoC `debug1_*`）；双提交走核内 `DIFFTEST_EN` DPI×2 | `chip/config-generator.mak` + `mycpu_top.v` |
+| AXI | 仍 AXI32（`AXI64=n`），配合 32B 行 | `config-generator.mak` |
+| 总线随机延迟 | 默认开，基线 seed **5570815** | `Makefile_run` |
+| Linux 停仿 | UART 见 `/ #` → 干净退出打 PERF | `uart.cpp` / `testbench.cpp` |
+| FREQ | SoC 仍 **33 MHz**（勿乱改） | `chip/soc_demo/sim/config.h` |
 
 WSL_chiplab_for_sim环境默认myCPU是Openla500，把基本工具链、vmlinux、run_random都配置好了。同时还有Smartwave工具集成，可以让AI使用Smartwave查波形信号
 

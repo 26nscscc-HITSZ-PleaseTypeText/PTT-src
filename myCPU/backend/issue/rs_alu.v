@@ -1,5 +1,5 @@
 // ============================================================
-// rs_alu 模块（ALU 保留站，`RS_ALU_SIZE=4 项，乱序发射，顶层例化 2 份）
+// rs_alu 模块（ALU 保留站，`RS_ALU_SIZE 项，乱序发射，顶层例化 2 份）
 // ------------------------------------------------------------
 // 功能：
 // - 缓存等待操作数的 ALU/分支指令；监听 4 路写回唤醒总线捕获操作数；
@@ -16,9 +16,13 @@
 // - push_*          ：dispatch 入站口（一拍最多 1 条）
 // - can_accept/occupancy ：空位信息
 // - wb0~3_*         ：4 路写回唤醒总线（alu0/alu1/mem/mdu）
-// - early0~2_*      ：3 路提前唤醒总线（二期：alu0 发射/alu1 发射/lsu AGU）
+// - early0~2_*      ：提前唤醒（alu0/alu1 发射拍；early2=LSU 暂不用）
 // - issue_*         ：发射口（到 fu_alu，ALU 恒可接收）
 // - flush_i         ：全局冲刷清空
+//
+// early 语义：只置 ready、不带数据；下一拍生产者写回时由 WB 旁路补数。
+// 用 val_valid 区分「ARF/WB 已捕获真值」与「仅 early 唤醒」，避免
+// ready 置位后门控死 WB 捕获，也避免 tag don't-care 误覆盖 ARF 值。
 // ============================================================
 `include "mycpu.h"
 
@@ -44,7 +48,7 @@ module rs_alu(
     input  wire [31:0]                push_br_offs_i,
 
     output wire                       can_accept_o,      // 有空位
-    output wire [2:0]                 occupancy_o,       // 当前占用项数（dispatch 负载均衡）
+    output wire [`RS_ALU_OCC_W-1:0]   occupancy_o,       // 当前占用项数（dispatch 负载均衡）
 
     // ---------------- 写回唤醒总线 ×4（带数据）----------------
     input  wire                       wb0_valid_i,       // fu_alu0 写回
@@ -110,64 +114,62 @@ module rs_alu(
 //      发射成功（ALU 恒接收）当拍清该项 valid；其余项 prior 维护：
 //      比发射项年轻的项 prior-1（或用"发射后全体未满最大值的项-1"的简化策略）。
 //
-//TODO: 提前唤醒（二期，顶层总线已连好）：
-//      early 总线只置 sX_ready，不带数据；数据在"发射到执行"的路径上由
-//      旁路网络补（fu_alu 入口处再比一次 4 路 wb 总线把值换进来）。
-//      一期实现可直接忽略 early0~2 输入（fu/lsu 侧输出恒 0），功能完全正确。
-//
-//TODO: 冲刷：flush_i 时 valid 全清。
-//
-//TODO: 坑点提示：
-//      1. 唤醒比较器数量 = 项数(4) × 源数(2) × 总线数(4) = 32 个 5bit 比较器/站，
-//         这是乱序核的固有开销，注意写成 generate-for 保持代码整洁。
-//      2. "选最老"不能用 robid 直接比大小（环形编号会回绕）！必须用 prior
-//         时间戳（入站顺序计数），mariver 用 2bit prior 即可覆盖 4 项。
-//      3. 发射口是组合输出，fu_alu 当拍锁存——发射项的 val 字段若本拍刚被
-//         总线唤醒写入（非阻塞赋值未生效），需要把"本拍唤醒的新值"组合旁路
-//         到 issue_src 上（即 issue 数据 = 旧值与本拍总线值的二选一）。
-
 reg                     valid [0:`RS_ALU_SIZE-1];
 reg [`ROB_W-1:0]        robid [0:`RS_ALU_SIZE-1];
 reg [31:0]              pc [0:`RS_ALU_SIZE-1];
 reg [`ALU_OP_NUM-1:0]   alu_op [0:`RS_ALU_SIZE-1];
 reg [`BR_OP_NUM-1:0]    br_op [0:`RS_ALU_SIZE-1];
 reg                     s0_ready [0:`RS_ALU_SIZE-1];
+reg                     s0_val_valid [0:`RS_ALU_SIZE-1];
 reg [31:0]              s0_val [0:`RS_ALU_SIZE-1];
 reg [`ROB_W-1:0]        s0_robid [0:`RS_ALU_SIZE-1];
 reg                     s1_ready [0:`RS_ALU_SIZE-1];
+reg                     s1_val_valid [0:`RS_ALU_SIZE-1];
 reg [31:0]              s1_val [0:`RS_ALU_SIZE-1];
 reg [`ROB_W-1:0]        s1_robid [0:`RS_ALU_SIZE-1];
 reg [31:0]              imm [0:`RS_ALU_SIZE-1];
 reg                     use_imm [0:`RS_ALU_SIZE-1];
 reg [31:0]              br_offs [0:`RS_ALU_SIZE-1];
-reg [1:0]               prior [0:`RS_ALU_SIZE-1];
+reg [`RS_ALU_IDX_W-1:0] prior [0:`RS_ALU_SIZE-1];
 
 integer i;
-reg [1:0] free_idx;
-reg [1:0] issue_idx;
-reg       issue_sel_valid;
+reg [`RS_ALU_IDX_W-1:0] free_idx;
+reg [`RS_ALU_IDX_W-1:0] issue_idx;
+reg                     issue_sel_valid;
 
 // 每项唤醒命中/旁路数据用【generate 预计算 wire 数组】而非 function 调用：
 // xsim 在 continuous assign 里对"带可变下标的 function"存在求值缺陷（见 rob.v），
 // 会返回上一次求值下标的旧值。改为纯数组变址读（s0_wbhit[idx] 等）即可规避。
+wire            s0_wb_match [0:`RS_ALU_SIZE-1];
+wire            s1_wb_match [0:`RS_ALU_SIZE-1];
 wire            s0_wbhit [0:`RS_ALU_SIZE-1];
 wire            s1_wbhit [0:`RS_ALU_SIZE-1];
+wire            s0_earlyhit [0:`RS_ALU_SIZE-1];
+wire            s1_earlyhit [0:`RS_ALU_SIZE-1];
 wire [31:0]     s0_wbdat [0:`RS_ALU_SIZE-1];
 wire [31:0]     s1_wbdat [0:`RS_ALU_SIZE-1];
 genvar gw;
 generate
 for (gw = 0; gw < `RS_ALU_SIZE; gw = gw + 1) begin : g_wake
-    // 关键修复：已 ready 的操作数必须"冻结"，绝不能再被唤醒覆盖（见 rs_mem 同款注释）。
-    assign s0_wbhit[gw] = !s0_ready[gw] &&
-                          ((wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ||
-                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ||
-                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ||
-                           (wb3_valid_i && (wb3_robid_i == s0_robid[gw])));
-    assign s1_wbhit[gw] = !s1_ready[gw] &&
-                          ((wb0_valid_i && (wb0_robid_i == s1_robid[gw])) ||
-                           (wb1_valid_i && (wb1_robid_i == s1_robid[gw])) ||
-                           (wb2_valid_i && (wb2_robid_i == s1_robid[gw])) ||
-                           (wb3_valid_i && (wb3_robid_i == s1_robid[gw])));
+    // val_valid=1：ARF/WB 已有真值，冻结（防 tag don't-care 被 wb0=robid0 误覆盖）。
+    // val_valid=0：尚未捕获数据（含仅 early 唤醒），允许 WB 匹配捕获/旁路。
+    assign s0_wb_match[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ||
+                             (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ||
+                             (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ||
+                             (wb3_valid_i && (wb3_robid_i == s0_robid[gw]));
+    assign s1_wb_match[gw] = (wb0_valid_i && (wb0_robid_i == s1_robid[gw])) ||
+                             (wb1_valid_i && (wb1_robid_i == s1_robid[gw])) ||
+                             (wb2_valid_i && (wb2_robid_i == s1_robid[gw])) ||
+                             (wb3_valid_i && (wb3_robid_i == s1_robid[gw]));
+    assign s0_wbhit[gw] = !s0_val_valid[gw] && s0_wb_match[gw];
+    assign s1_wbhit[gw] = !s1_val_valid[gw] && s1_wb_match[gw];
+    // 只认 ALU early0/1；early2(LSU) 投机，暂不接入
+    assign s0_earlyhit[gw] = !s0_ready[gw] && !s0_wbhit[gw] &&
+                             ((early0_valid_i && (early0_robid_i == s0_robid[gw])) ||
+                              (early1_valid_i && (early1_robid_i == s0_robid[gw])));
+    assign s1_earlyhit[gw] = !s1_ready[gw] && !s1_wbhit[gw] &&
+                             ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
+                              (early1_valid_i && (early1_robid_i == s1_robid[gw])));
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :
@@ -179,8 +181,7 @@ for (gw = 0; gw < `RS_ALU_SIZE; gw = gw + 1) begin : g_wake
 end
 endgenerate
 
-// push 口的唤醒命中/旁路（参数是端口信号，非数组变址；同样内联以彻底去除 function）
-// push 同理带 !push_srcX_ready 门控（见 rs_mem 同款注释）。
+// push 口：WB 优先于 early；已带 ready 的源不再匹配 tag
 wire        push_s0_wbhit = !push_src0_ready_i &&
                            ((wb0_valid_i && (wb0_robid_i == push_src0_robid_i)) ||
                             (wb1_valid_i && (wb1_robid_i == push_src0_robid_i)) ||
@@ -191,6 +192,12 @@ wire        push_s1_wbhit = !push_src1_ready_i &&
                             (wb1_valid_i && (wb1_robid_i == push_src1_robid_i)) ||
                             (wb2_valid_i && (wb2_robid_i == push_src1_robid_i)) ||
                             (wb3_valid_i && (wb3_robid_i == push_src1_robid_i)));
+wire        push_s0_early = !push_src0_ready_i && !push_s0_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push_src0_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push_src0_robid_i)));
+wire        push_s1_early = !push_src1_ready_i && !push_s1_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push_src1_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push_src1_robid_i)));
 wire [31:0] push_s0_wbdat = (wb0_valid_i && (wb0_robid_i == push_src0_robid_i)) ? wb0_data_i :
                             (wb1_valid_i && (wb1_robid_i == push_src0_robid_i)) ? wb1_data_i :
                             (wb2_valid_i && (wb2_robid_i == push_src0_robid_i)) ? wb2_data_i :
@@ -200,33 +207,39 @@ wire [31:0] push_s1_wbdat = (wb0_valid_i && (wb0_robid_i == push_src1_robid_i)) 
                             (wb2_valid_i && (wb2_robid_i == push_src1_robid_i)) ? wb2_data_i :
                             (wb3_valid_i && (wb3_robid_i == push_src1_robid_i)) ? wb3_data_i : 32'b0;
 
-assign occupancy_o = {2'b0, valid[0]} + {2'b0, valid[1]} +
-                     {2'b0, valid[2]} + {2'b0, valid[3]};
-assign can_accept_o = (occupancy_o != `RS_ALU_SIZE);
-wire [2:0] push_prior_next = occupancy_o - {2'b0, issue_sel_valid};
-
+// occupancy：按项累加，深度随 RS_ALU_SIZE 变化
+reg [`RS_ALU_OCC_W-1:0] occ_cnt;
 always @(*) begin
-    free_idx = 2'd0;
-    if (!valid[0]) begin
-        free_idx = 2'd0;
-    end else if (!valid[1]) begin
-        free_idx = 2'd1;
-    end else if (!valid[2]) begin
-        free_idx = 2'd2;
-    end else begin
-        free_idx = 2'd3;
+    occ_cnt = {`RS_ALU_OCC_W{1'b0}};
+    for (i = 0; i < `RS_ALU_SIZE; i = i + 1)
+        occ_cnt = occ_cnt + {{(`RS_ALU_OCC_W-1){1'b0}}, valid[i]};
+end
+assign occupancy_o = occ_cnt;
+assign can_accept_o = (occupancy_o != `RS_ALU_SIZE);
+wire [`RS_ALU_OCC_W-1:0] push_prior_next = occupancy_o
+                                         - {{(`RS_ALU_OCC_W-1){1'b0}}, issue_sel_valid};
+
+always @(*) begin : find_free
+    integer fi;
+    free_idx = {`RS_ALU_IDX_W{1'b0}};
+    for (fi = 0; fi < `RS_ALU_SIZE; fi = fi + 1) begin
+        if (!valid[fi]) begin
+            free_idx = fi[`RS_ALU_IDX_W-1:0];
+            disable find_free;
+        end
     end
 end
 
 always @(*) begin
-    issue_idx = 2'd0;
+    issue_idx = {`RS_ALU_IDX_W{1'b0}};
     issue_sel_valid = 1'b0;
     for (i = 0; i < `RS_ALU_SIZE; i = i + 1) begin
+        // 可发：已有真值，或本拍 WB 旁路可补。仅 early 的 ready 不够（无数据）。
         if (valid[i] &&
-            (s0_ready[i] || s0_wbhit[i]) &&
-            (s1_ready[i] || s1_wbhit[i]) &&
+            ((s0_ready[i] && s0_val_valid[i]) || s0_wbhit[i]) &&
+            ((s1_ready[i] && s1_val_valid[i]) || s1_wbhit[i]) &&
             (!issue_sel_valid || (prior[i] < prior[issue_idx]))) begin
-            issue_idx = i[1:0];
+            issue_idx = i[`RS_ALU_IDX_W-1:0];
             issue_sel_valid = 1'b1;
         end
     end
@@ -237,9 +250,9 @@ assign issue_robid_o = robid[issue_idx];
 assign issue_pc_o = pc[issue_idx];
 assign issue_alu_op_o = alu_op[issue_idx];
 assign issue_br_op_o = br_op[issue_idx];
-// ready 的操作数已捕获最终值；仅对未 ready 项做 issue 级 wb 旁路（防 n41 陈旧 tag 误旁路）
-wire s0_issue_wb = !s0_ready[issue_idx] && s0_wbhit[issue_idx];
-wire s1_issue_wb = !s1_ready[issue_idx] && s1_wbhit[issue_idx];
+// 真值已捕获 → 用 s_val；仅 early 唤醒（val_valid=0）→ 本拍 WB 旁路补数
+wire s0_issue_wb = s0_wbhit[issue_idx];
+wire s1_issue_wb = s1_wbhit[issue_idx];
 assign issue_src0_o = s0_issue_wb ? s0_wbdat[issue_idx] : s0_val[issue_idx];
 assign issue_src1_o = s1_issue_wb ? s1_wbdat[issue_idx] : s1_val[issue_idx];
 assign issue_imm_o = imm[issue_idx];
@@ -250,27 +263,34 @@ always @(posedge clk) begin
     if (reset || flush_i) begin
         for (i = 0; i < `RS_ALU_SIZE; i = i + 1) begin
             valid[i] <= 1'b0;
-            prior[i] <= 2'b0;
+            prior[i] <= {`RS_ALU_IDX_W{1'b0}};
         end
     end else begin
         if (issue_sel_valid) begin
             valid[issue_idx] <= 1'b0;
             for (i = 0; i < `RS_ALU_SIZE; i = i + 1) begin
-                if (valid[i] && (i[1:0] != issue_idx) && (prior[i] > prior[issue_idx])) begin
-                    prior[i] <= prior[i] - 2'b01;
+                if (valid[i] && (i[`RS_ALU_IDX_W-1:0] != issue_idx) && (prior[i] > prior[issue_idx])) begin
+                    prior[i] <= prior[i] - {{(`RS_ALU_IDX_W-1){1'b0}}, 1'b1};
                 end
             end
         end
 
         for (i = 0; i < `RS_ALU_SIZE; i = i + 1) begin
-            if (valid[i] && !(issue_sel_valid && (i[1:0] == issue_idx))) begin
+            if (valid[i] && !(issue_sel_valid && (i[`RS_ALU_IDX_W-1:0] == issue_idx))) begin
+                // WB 优先：补齐数据；early 仅置 ready（下一拍再靠 WB 旁路）
                 if (s0_wbhit[i]) begin
-                    s0_ready[i] <= 1'b1;
-                    s0_val[i] <= s0_wbdat[i];
+                    s0_ready[i]     <= 1'b1;
+                    s0_val_valid[i] <= 1'b1;
+                    s0_val[i]       <= s0_wbdat[i];
+                end else if (s0_earlyhit[i]) begin
+                    s0_ready[i]     <= 1'b1;
                 end
                 if (s1_wbhit[i]) begin
-                    s1_ready[i] <= 1'b1;
-                    s1_val[i] <= s1_wbdat[i];
+                    s1_ready[i]     <= 1'b1;
+                    s1_val_valid[i] <= 1'b1;
+                    s1_val[i]       <= s1_wbdat[i];
+                end else if (s1_earlyhit[i]) begin
+                    s1_ready[i]     <= 1'b1;
                 end
             end
         end
@@ -281,19 +301,20 @@ always @(posedge clk) begin
             pc[free_idx] <= push_pc_i;
             alu_op[free_idx] <= push_alu_op_i;
             br_op[free_idx] <= push_br_op_i;
-            s0_ready[free_idx] <= push_src0_ready_i || push_s0_wbhit;
+            s0_ready[free_idx] <= push_src0_ready_i || push_s0_wbhit || push_s0_early;
+            s0_val_valid[free_idx] <= push_src0_ready_i || push_s0_wbhit;
             s0_val[free_idx] <= push_s0_wbhit ? push_s0_wbdat :
                                 push_src0_ready_i ? push_src0_val_i : 32'b0;
             s0_robid[free_idx] <= push_src0_robid_i;
-            s1_ready[free_idx] <= push_src1_ready_i || push_s1_wbhit;
+            s1_ready[free_idx] <= push_src1_ready_i || push_s1_wbhit || push_s1_early;
+            s1_val_valid[free_idx] <= push_src1_ready_i || push_s1_wbhit;
             s1_val[free_idx] <= push_s1_wbhit ? push_s1_wbdat :
                                 push_src1_ready_i ? push_src1_val_i : 32'b0;
             s1_robid[free_idx] <= push_src1_robid_i;
             imm[free_idx] <= push_imm_i;
             use_imm[free_idx] <= push_use_imm_i;
             br_offs[free_idx] <= push_br_offs_i;
-            // prior[free_idx] <= 2'd3;
-            prior[free_idx] <= push_prior_next[1:0];
+            prior[free_idx] <= push_prior_next[`RS_ALU_IDX_W-1:0];
         end
     end
 end

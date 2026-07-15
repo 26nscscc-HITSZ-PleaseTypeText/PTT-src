@@ -236,6 +236,8 @@ module commit(
 //      PRIV_TLB   ：tlb_op_cmt_o = cmt0_tlb_op_i（ROB 静态区已存，直通发一拍）；
 //                   invtlb_asid/vpn 从 result2 解包；FLUSH_REFETCH pc+4
 //      PRIV_CACOP ：cacop_code[2:0]==0 -> icacop_*；==1 -> dcacop_*（op=code[4:3]）
+//                   与 ibar 一样等 sb_empty（D$ 前端 cacop 优先于 SB 写，不排空
+//                   会把尚未写回 D$ 的 dirty 老数据刷出，n78 Hit-WB 会挂）；
 //                   FLUSH_REFETCH pc+4
 //      PRIV_LL    ：ll_set_o=1，lladdr_o=cmt0_paddr_i[31:4]；FLUSH_REFETCH pc+4
 //      PRIV_SC    ：sc_set_o=1（清 LLBIT）；若译码期定性为真 store 则照常入 SB；
@@ -254,8 +256,14 @@ module commit(
 //      flush_pc = br_taken ? br_target : pc+4；本拍只提交槽 0。
 //
 //TODO: 第六步——槽 1 的单提交限制（出现任一情况槽 1 留到下一拍）：
-//      槽1 有异常 / 槽1 priv_vec 非 0 / 槽1 是分支（避免双 FTQ 查询口，见设计
-//      说明）/ 槽0 发生冲刷（异常/特权/误预测）/ 两槽都是 store（SB 单写口）。
+//      槽1 有异常 / 槽1 priv / 槽1 CALL·RET·jirl 或误预测 /
+//      槽0 也是分支（同拍双分支仍禁，单训练口）/
+//      槽0 冲刷 / 两槽都是 store（SB 单写口）。
+//      槽1 为 COND 或直接 B、与槽0 同 ftq_id、且预测正确时，允许与非分支槽0 双提
+//      （复用现有单路 FTQ 查询口比对目标）。
+//      【jirl 为何单提，非 ISA 硬禁】见下方 cmt1_is_direct_b 注释；日后若要给
+//      jirl 双提，需独立类型/更严间接目标校验，勿再仅靠 BR_TYPE_UNCOND。
+//      未来改进：FTQ 加第二读口后，可放开「不同 ftq_id」的槽1 正确分支双提。
 //
 //TODO: 第七步——常规提交动作（can0/can1 各自独立做）：
 //      写 ARF：arf_we=rf_we && rd!=0，wdata=result；
@@ -308,6 +316,9 @@ wire int_take = !flush_pending_i && has_int_i && cmt0_valid_i && !uncached_ld_in
                 && !cmt0_true_idle;
 wire cmt0_ibar_block = cmt0_ready && cmt0_priv_vec_i[`PRIV_IBAR] && !sb_empty_i;
 wire cmt1_ibar_block = cmt1_ready && cmt1_priv_vec_i[`PRIV_IBAR] && !sb_empty_i;
+// D$/I$ cacop 提交前排空 SB：否则 store 还在 SB、cacop 已按旧脏行写回（n78）。
+wire cmt0_cacop_block = cmt0_ready && cmt0_priv_vec_i[`PRIV_CACOP] && !sb_empty_i;
+wire cmt1_cacop_block = cmt1_ready && cmt1_priv_vec_i[`PRIV_CACOP] && !sb_empty_i;
 wire cmt0_store_block = cmt0_ready && cmt0_is_store_i && sb_full_i && !cmt0_has_excp;
 wire cmt1_store_block = cmt1_ready && cmt1_is_store_i && sb_full_i && !cmt1_has_excp;
 
@@ -316,25 +327,47 @@ wire cmt0_mispred = cmt0_ready && !cmt0_has_excp && !cmt0_has_priv &&
                      (cmt0_br_taken_i && cmt0_pred_taken_i &&
                       (cmt0_br_target_i != ftq_blk_target_i)) ||
                      (!cmt0_is_branch_i && cmt0_pred_taken_i));
-wire cmt1_mispred_head = (!cmt0_valid_i) && cmt1_ready && !cmt1_has_excp && !cmt1_has_priv &&
-                         ((cmt1_br_taken_i != cmt1_pred_taken_i) ||
-                          (cmt1_br_taken_i && cmt1_pred_taken_i &&
-                           (cmt1_br_target_i != ftq_blk_target_i)) ||
-                          (!cmt1_is_branch_i && cmt1_pred_taken_i));
+// 槽1 mispred：头槽路径（query 落在槽1）与「同 ftq_id 双提」共用本路目标。
+// 不同 id 时不能信本路目标做双提放行——见下 cmt1_same_ftq。
+wire cmt1_mispred = cmt1_ready && !cmt1_has_excp && !cmt1_has_priv &&
+                    ((cmt1_br_taken_i != cmt1_pred_taken_i) ||
+                     (cmt1_br_taken_i && cmt1_pred_taken_i &&
+                      (cmt1_br_target_i != ftq_blk_target_i)) ||
+                     (!cmt1_is_branch_i && cmt1_pred_taken_i));
+wire cmt1_mispred_head = (!cmt0_valid_i) && cmt1_mispred;
+
+// 同块才复用单路 FTQ 目标；跨块槽1 分支/脏预测仍单提，留给下拍头槽。
+// 未来：FTQ 第二读口后可去掉 cmt1_same_ftq 门槛，支持不同 id 双提。
+wire cmt1_same_ftq = cmt0_valid_i && (cmt0_ftq_id_i == cmt1_ftq_id_i);
+
+// soft 双提：COND，或真正的直接 B（opc=010100）。jirl 必须单提（标记点）：
+//   1) decoder 把非 CALL/RET 的 jirl 也标成 BR_TYPE_UNCOND，与直接 B 共用类型；
+//      若只看 br_type 会把间接跳误放进 soft。
+//   2) jirl 目标 = rj+offs，依赖寄存器；现有「方向 + FTQ 目标相等」在同块单口
+//      比对下，间接跳更易“碰巧判对”而不冲刷，错路径可残留（曾卡在异常向量）。
+//   3) jirl 的 CALL/RET 变体还要动 RAS，本就约定单提；普通 jirl 与它们仅编码之差。
+//   4) IFU 对 B/cond 有块末截断不变式，jirl 不在同一套预译码截断路径里。
+// 以后若放开：ROB 独立 is_jirl / 间接目标专用校验，再允许 soft，勿仅靠 UNCOND。
+wire cmt1_is_direct_b = (cmt1_inst_i[31:26] == 6'b010100);
+wire cmt1_br_soft = cmt1_is_branch_i &&
+                    ((cmt1_br_type_i == `BR_TYPE_COND) ||
+                     ((cmt1_br_type_i == `BR_TYPE_UNCOND) && cmt1_is_direct_b));
+wire cmt1_br_ok   = cmt1_br_soft && cmt1_same_ftq && !cmt1_mispred;
+wire cmt1_br_hard = cmt1_is_branch_i && !cmt1_br_ok;
 
 wire cmt0_retire = int_take ||
                    (cmt0_ready && (cmt0_has_excp ||
-                    (!cmt0_store_block && !cmt0_ibar_block)));
+                    (!cmt0_store_block && !cmt0_ibar_block && !cmt0_cacop_block)));
 wire cmt0_effect = cmt0_ready && !int_take && !cmt0_has_excp &&
-                   !cmt0_store_block && !cmt0_ibar_block;
+                   !cmt0_store_block && !cmt0_ibar_block && !cmt0_cacop_block;
 wire cmt0_flush = int_take || (cmt0_ready && cmt0_has_excp) ||
                   (cmt0_effect && cmt0_has_priv) || cmt0_mispred;
 
 wire cmt1_head_retire = (!cmt0_valid_i) &&
                         (cmt1_ready && (cmt1_has_excp ||
-                         (!cmt1_store_block && !cmt1_ibar_block)));
+                         (!cmt1_store_block && !cmt1_ibar_block && !cmt1_cacop_block)));
 wire cmt1_head_effect = (!cmt0_valid_i) && cmt1_ready && !cmt1_has_excp &&
-                        !cmt1_store_block && !cmt1_ibar_block;
+                        !cmt1_store_block && !cmt1_ibar_block && !cmt1_cacop_block;
 wire cmt1_head_flush = (!cmt0_valid_i) &&
                        ((cmt1_ready && cmt1_has_excp) ||
                         (cmt1_head_effect && cmt1_has_priv) ||
@@ -342,15 +375,23 @@ wire cmt1_head_flush = (!cmt0_valid_i) &&
 
 wire cmt0_taken_br = cmt0_effect && cmt0_is_branch_i && cmt0_br_taken_i && !cmt0_is_last_i;
 
-wire cmt1_single_limit = cmt1_has_excp || cmt1_has_priv || cmt1_is_branch_i ||
+// cmt1_br_hard：CALL/RET、跨块分支、或误预测；cmt1_mispred：含脏预测（非分支 pred）
+// cmt0_is_branch：同拍双分支仍禁（单 FTQ 训练口）
+wire cmt1_single_limit = cmt1_has_excp || cmt1_has_priv || cmt1_br_hard || cmt1_mispred ||
+                         cmt0_is_branch_i ||
                          (cmt0_is_store_i && cmt1_is_store_i) || cmt0_taken_br;
 wire cmt1_dual_effect = cmt0_effect && !cmt0_flush && cmt1_ready &&
-                        !cmt1_single_limit && !cmt1_store_block;
+                        !cmt1_single_limit && !cmt1_store_block &&
+                        !cmt1_ibar_block && !cmt1_cacop_block;
 wire cmt1_retire = cmt0_valid_i ? cmt1_dual_effect : cmt1_head_retire;
 wire cmt1_effect = cmt0_valid_i ? cmt1_dual_effect : cmt1_head_effect;
 
 wire take_slot1_for_csr = !cmt0_retire && cmt1_head_retire;
-wire [31:0] sel_pc = take_slot1_for_csr ? cmt1_pc_i : cmt0_pc_i;
+// 训练选源：双提的槽1 分支，或头槽仅槽1（仅 FTQ/RAS/误预测路径用）
+wire br_sel_cmt1 = (cmt1_dual_effect && cmt1_is_branch_i) || take_slot1_for_csr;
+// CSR/异常 ERA 只用「头槽/中断附着」槽的 PC，不能跟 br_sel 绑到双提槽1 分支 PC
+wire [31:0] csr_sel_pc = take_slot1_for_csr ? cmt1_pc_i : cmt0_pc_i;
+wire [31:0] sel_pc = br_sel_cmt1 ? cmt1_pc_i : cmt0_pc_i;
 wire [31:0] sel_inst = take_slot1_for_csr ? cmt1_inst_i : cmt0_inst_i;
 wire [31:0] sel_result = take_slot1_for_csr ? cmt1_result_i : cmt0_result_i;
 wire [31:0] sel_result2 = take_slot1_for_csr ? cmt1_result2_i : cmt0_result2_i;
@@ -361,12 +402,12 @@ wire [13:0] sel_csr_num = take_slot1_for_csr ? cmt1_csr_num_i : cmt0_csr_num_i;
 wire [`TLB_OP_NUM-1:0] sel_tlb_op = take_slot1_for_csr ? cmt1_tlb_op_i : cmt0_tlb_op_i;
 wire [`PRIV_NUM-1:0] sel_priv = take_slot1_for_csr ? cmt1_priv_vec_i : cmt0_priv_vec_i;
 wire [`EXCP_NUM-1:0] sel_excp = take_slot1_for_csr ? cmt1_excp_i : cmt0_excp_i;
-wire sel_is_branch = take_slot1_for_csr ? cmt1_is_branch_i : cmt0_is_branch_i;
-wire sel_pred_taken = take_slot1_for_csr ? cmt1_pred_taken_i : cmt0_pred_taken_i;
-wire sel_br_taken = take_slot1_for_csr ? cmt1_br_taken_i : cmt0_br_taken_i;
-wire [31:0] sel_br_target = take_slot1_for_csr ? cmt1_br_target_i : cmt0_br_target_i;
-wire [`BR_TYPE_W-1:0] sel_br_type = take_slot1_for_csr ? cmt1_br_type_i : cmt0_br_type_i;
-wire [`FTQ_W-1:0] sel_ftq_id = take_slot1_for_csr ? cmt1_ftq_id_i : cmt0_ftq_id_i;
+wire sel_is_branch = br_sel_cmt1 ? cmt1_is_branch_i : cmt0_is_branch_i;
+wire sel_pred_taken = br_sel_cmt1 ? cmt1_pred_taken_i : cmt0_pred_taken_i;
+wire sel_br_taken = br_sel_cmt1 ? cmt1_br_taken_i : cmt0_br_taken_i;
+wire [31:0] sel_br_target = br_sel_cmt1 ? cmt1_br_target_i : cmt0_br_target_i;
+wire [`BR_TYPE_W-1:0] sel_br_type = br_sel_cmt1 ? cmt1_br_type_i : cmt0_br_type_i;
+wire [`FTQ_W-1:0] sel_ftq_id = br_sel_cmt1 ? cmt1_ftq_id_i : cmt0_ftq_id_i;
 wire sel_is_last = take_slot1_for_csr ? cmt1_is_last_i : cmt0_is_last_i;
 
 wire selected_effect = take_slot1_for_csr ? cmt1_head_effect : cmt0_effect;
@@ -418,14 +459,14 @@ assign sb_push_size_o = sb_push_from0 ? cmt0_size_i : cmt1_size_i;
 assign sb_push_uncached_o = sb_push_from0 ? cmt0_uncached_i : cmt1_uncached_i;
 
 assign csr_cmt_valid_o = cmt0_retire || cmt1_retire;
-assign csr_cmt_pc_o = sel_pc;
+assign csr_cmt_pc_o = csr_sel_pc;
 assign csr_cmt_ex_o = selected_excp_take;
 assign csr_cmt_ertn_o = selected_effect && sel_priv[`PRIV_ERTN];
-// BADV/ERA 的地址来源:访存类异常用 sel_vaddr(访存 vaddr);取指类(含取指侧 ADEF、TLB 重填)用 sel_pc。
-// 取指侧 ADEF(jirl 目标非对齐)的错误地址 == 出错取指指令自身 PC(=非对齐目标 0x227f9789),恰为 sel_pc;
+// BADV/ERA 的地址来源:访存类异常用 sel_vaddr(访存 vaddr);取指类(含取指侧 ADEF、TLB 重填)用 csr_sel_pc。
+// 取指侧 ADEF(jirl 目标非对齐)的错误地址 == 出错取指指令自身 PC(=非对齐目标 0x227f9789),恰为 csr_sel_pc;
 // ROB 对取指异常气泡的 vaddr 字段未写(=0),故不能用 sel_vaddr。csr handler 对 ADEF 用 wb_vaddr 记 ERA/BADV,
-// 而这里 ADEF 走 sel_pc 分支 → csr_cmt_vaddr_o=sel_pc=0x227f9789 → ERA/BADV 正确,adef_ex `bne r27,ERA` 通过。
-assign csr_cmt_vaddr_o = mem_excp ? sel_vaddr : sel_pc;
+// 而这里 ADEF 走 csr_sel_pc 分支 → csr_cmt_vaddr_o=fault PC → ERA/BADV 正确,adef_ex `bne r27,ERA` 通过。
+assign csr_cmt_vaddr_o = mem_excp ? sel_vaddr : csr_sel_pc;
 assign excp_int_o = int_take;
 assign excp_adef_o = sel_excp[`EXCP_ADEF];
 assign excp_adem_o = sel_excp[`EXCP_ADEM];
@@ -475,10 +516,14 @@ assign ftq_cmt_mispred_o = selected_mispred;
 assign ftq_cmt_target_o = sel_br_target;
 assign ftq_cmt_br_type_o = sel_br_type;
 assign ftq_cmt_pc_o = sel_pc;
-assign ftq_query_id_o = sel_ftq_id;
+// 有槽0 时 query 用槽0 id（与槽1 双提同 id 时目标一致）；仅槽1 头槽时用槽1 id
+assign ftq_query_id_o = cmt0_valid_i ? cmt0_ftq_id_i : cmt1_ftq_id_i;
 
-assign ras_cmt_call_o = selected_effect && sel_is_branch && (sel_br_type == `BR_TYPE_CALL);
-assign ras_cmt_ret_o = selected_effect && sel_is_branch && (sel_br_type == `BR_TYPE_RET);
+// RAS：仅在真正 effect 的分支上更新（双提槽1 正确 COND/UNCOND 时走 br_sel）
+wire br_retired = br_sel_cmt1 ? (cmt1_effect && cmt1_is_branch_i)
+                              : (cmt0_effect && cmt0_is_branch_i);
+assign ras_cmt_call_o = br_retired && (sel_br_type == `BR_TYPE_CALL);
+assign ras_cmt_ret_o  = br_retired && (sel_br_type == `BR_TYPE_RET);
 assign ras_cmt_retaddr_o = sel_pc + 32'd4;
 
 assign flush_req_o = selected_excp_take || selected_priv_flush || selected_mispred;
