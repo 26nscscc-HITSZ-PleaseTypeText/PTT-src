@@ -298,7 +298,8 @@ assign dis1_src1_addr_o = dis1_src1_addr_r;
 //      ib0_ready_o = can_go && ib0_valid_i;  ib1_ready_o = can_go && ib1_valid_i;
 //      rob_alloc_en_o = can_go;   // 恒成对分配（哪怕只有槽 0 有效，也占一对槽位）
 //      注：dispatch_ready_i 为 0 时整级停（IB 不弹出、ROB 不分配、流水寄存器保持）。
-//      分发级每拍最多 1 条 MEM/MDU，双发两条同类会永久挡住 dispatch_ready。
+//      ready 在“槽空”或“本拍 valid 槽均 fire”时为 1，允许同拍 vacated+装入。
+//      分发级每拍最多 1 条 MEM/MDU，双发两条同类会卡住直到能 vacated。
 //
 wire ib0_eff_v = ib0_valid_i && !ib0_is_nop_i;
 wire ib1_eff_v = ib1_valid_i && !ib1_is_nop_i;

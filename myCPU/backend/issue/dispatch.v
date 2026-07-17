@@ -21,7 +21,7 @@
 // - rob_raddr/rrdy/rdata ：ROB 4 个操作数读口
 // - rs_alu0/1、rs_mem、rs_mdu 的入站口（bundle 见各 RS 模块）
 // - rs_*_can_accept / occupancy ：各 RS 空位信息
-// - dispatch_ready_o ：分发级两槽均已空（rename 可接收新一对）
+// - dispatch_ready_o ：两槽已空，或本拍将全部 vacated（均 fire）——rename 可装新一对
 // - dis0/1_fire_o    ：本拍该槽已入站（rename 逐槽清 valid）
 // ============================================================
 `include "mycpu.h"
@@ -73,7 +73,7 @@ module dispatch(
     input  wire                       dis1_use_imm_i,
     input  wire [31:0]                dis1_br_offs_i,
 
-    output wire                       dispatch_ready_o,    // 两槽均已空（rename 可写新一对）
+    output wire                       dispatch_ready_o,    // 空或本拍全部 vacated（可写新一对）
     output wire                       dis0_fire_o,         // 本拍槽 0 入站
     output wire                       dis1_fire_o,         // 本拍槽 1 入站
 
@@ -326,7 +326,12 @@ assign dis1_can_dispatch = dis1_valid_i && dis1_rs_ok;
 assign dis0_fire_o = dis0_can_dispatch;
 // 禁止槽1越过未发出的槽0；允许与 dis0 同拍双发（如 dual_alu_ok → 两站各一条）
 assign dis1_fire_o = dis1_can_dispatch && (!dis0_valid_i || dis0_fire_o);
-assign dispatch_ready_o = !dis0_valid_i && !dis1_valid_i;
+// 槽已空，或本拍所有 valid 槽都会 fire：下沿 rename 可覆盖装入新一对。
+// RS push 仍使用覆盖前的当前锁存值，因此可以同拍完成 vacate + refill，
+// 消除 dispatch 对 rename 固有的隔拍阻塞。
+assign dispatch_ready_o =
+    (!dis0_valid_i || dis0_fire_o) &&
+    (!dis1_valid_i || dis1_fire_o);
 
 wire rs_alu0_from_slot1 = slot1_to_alu0 && dis1_fire_o;
 wire rs_alu1_from_slot1 = slot1_to_alu1 && dis1_fire_o;

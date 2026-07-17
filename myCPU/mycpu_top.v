@@ -2980,6 +2980,86 @@ reg [63:0] perf_cmt_any_cyc;      // 至少提交 1 条的拍数
 reg [63:0] perf_dis_dual_cyc;     // 同拍双分发
 reg [63:0] perf_dis_any_cyc;      // 至少分发 1 条
 reg [63:0] perf_dis_dual_alu_cyc; // 同拍双 ALU 入站（alu0+alu1 push）
+reg [63:0] perf_rn_alloc_cyc;      // rename 成功分配 ROB/装入 dispatch
+reg [63:0] perf_turnover_refill_cyc; // dispatch 有旧指令时同拍腾空并 refill
+reg [63:0] stall_dispatch_cyc;     // IB 有指令但 dispatch 无法整体腾空
+reg [63:0] stall_rename_rob_cyc;   // IB 有指令但 ROB 达到安全满阈值
+
+// ROB 有效项数不能只看 head/tail（每对可有 0/1/2 条有效指令），按分配与
+// 提交事件维护；flush 只清当前占用，不清整次仿真的累计统计。
+reg [5:0] probe_rob_entry_occ;
+wire [1:0] probe_rob_alloc_n = rn_rob_alloc_en
+                             ? ({1'b0, rn_a0_valid} + {1'b0, rn_a1_valid})
+                             : 2'd0;
+wire [1:0] probe_rob_clear_n = {1'b0, cmt_rob_clear0}
+                             + {1'b0, cmt_rob_clear1};
+
+always @(posedge clk) begin
+    if (reset || flush)
+        probe_rob_entry_occ <= 6'd0;
+    else
+        probe_rob_entry_occ <= probe_rob_entry_occ
+                             + {4'd0, probe_rob_alloc_n}
+                             - {4'd0, probe_rob_clear_n};
+end
+
+function automatic [5:0] perf_popcount32;
+    input [31:0] value;
+    integer pc_i;
+    begin
+        perf_popcount32 = 6'd0;
+        for (pc_i = 0; pc_i < 32; pc_i = pc_i + 1)
+            perf_popcount32 = perf_popcount32 + {5'd0, value[pc_i]};
+    end
+endfunction
+
+// 统一队列占用采样。所有数组和层次探针均处于 translate_off 区域，
+// 不参与综合，不消耗 FPGA LUT/FF/BRAM。
+localparam PERF_OCC_N = 14;
+reg [7:0]  perf_occ_now      [0:PERF_OCC_N-1];
+reg [7:0]  perf_occ_cap      [0:PERF_OCC_N-1];
+reg [7:0]  perf_occ_max      [0:PERF_OCC_N-1];
+reg [63:0] perf_occ_sum      [0:PERF_OCC_N-1];
+reg [63:0] perf_occ_high_cyc [0:PERF_OCC_N-1]; // >= 75% 有效容量
+reg [63:0] perf_occ_full_cyc [0:PERF_OCC_N-1];
+integer perf_occ_i;
+
+always @(*) begin
+    // ROB 物理 16 对，因 ROB_GUARD=5，实际最多允许 11 对/22 条在途。
+    perf_occ_now[0]  = {{(8-`ROB_PAIR_W){1'b0}},
+                        (u_rob.tail - u_rob.head)};
+    perf_occ_cap[0]  = (1 << `ROB_PAIR_W) - `ROB_GUARD;
+    perf_occ_now[1]  = {2'd0, probe_rob_entry_occ};
+    perf_occ_cap[1]  = 2 * ((1 << `ROB_PAIR_W) - `ROB_GUARD);
+    perf_occ_now[2]  = {7'd0, dis0_valid} + {7'd0, dis1_valid};
+    perf_occ_cap[2]  = 8'd2;
+    perf_occ_now[3]  = {{(8-`RS_ALU_OCC_W){1'b0}}, rsa0_occupancy};
+    perf_occ_cap[3]  = `RS_ALU_SIZE;
+    perf_occ_now[4]  = {{(8-`RS_ALU_OCC_W){1'b0}}, rsa1_occupancy};
+    perf_occ_cap[4]  = `RS_ALU_SIZE;
+    perf_occ_now[5]  = {{(8-`RS_MEM_OCC_W){1'b0}}, rsm_occupancy};
+    perf_occ_cap[5]  = `RS_MEM_SIZE;
+    perf_occ_now[6]  = {6'd0, rsd_occupancy};
+    perf_occ_cap[6]  = `RS_MDU_SIZE;
+    perf_occ_now[7]  = {{(7-`SB_W){1'b0}}, u_store_buffer.count};
+    perf_occ_cap[7]  = `SB_SIZE;
+    perf_occ_now[8]  = {{(7-`IB_W){1'b0}}, u_inst_buffer.count};
+    perf_occ_cap[8]  = `IB_SIZE;
+    perf_occ_now[9]  = {{(8-`FTQ_W){1'b0}},
+                        (u_ftq.bpu_ptr - u_ftq.cmt_ptr)};
+    // FTQ almost-full 在保留项达到 SIZE-2 时反压，故以 14 为有效容量。
+    perf_occ_cap[9]  = `FTQ_SIZE - 2;
+    perf_occ_now[10] = {{(8-`FTQ_W){1'b0}},
+                        (u_ftq.bpu_ptr - u_ftq.ifu_ptr)};
+    perf_occ_cap[10] = `FTQ_SIZE;
+    perf_occ_now[11] = {2'd0, perf_popcount32(u_rat.busy)};
+    perf_occ_cap[11] = 8'd31; // r0 永不 busy
+    perf_occ_now[12] = {{(7-`RAS_W){1'b0}}, u_bpu.u_ras.spec_cnt};
+    perf_occ_cap[12] = `RAS_DEPTH;
+    perf_occ_now[13] = {{(7-`RAS_W){1'b0}}, u_bpu.u_ras.cmt_cnt};
+    perf_occ_cap[13] = `RAS_DEPTH;
+end
+
 always @(posedge clk) begin
     if (reset) begin
         perf_cycle_count      <= 64'd0;
@@ -2991,6 +3071,16 @@ always @(posedge clk) begin
         perf_dis_dual_cyc     <= 64'd0;
         perf_dis_any_cyc      <= 64'd0;
         perf_dis_dual_alu_cyc <= 64'd0;
+        perf_rn_alloc_cyc      <= 64'd0;
+        perf_turnover_refill_cyc <= 64'd0;
+        stall_dispatch_cyc     <= 64'd0;
+        stall_rename_rob_cyc   <= 64'd0;
+        for (perf_occ_i = 0; perf_occ_i < PERF_OCC_N; perf_occ_i = perf_occ_i + 1) begin
+            perf_occ_max[perf_occ_i]      <= 8'd0;
+            perf_occ_sum[perf_occ_i]      <= 64'd0;
+            perf_occ_high_cyc[perf_occ_i] <= 64'd0;
+            perf_occ_full_cyc[perf_occ_i] <= 64'd0;
+        end
     end else begin
         perf_cycle_count  <= perf_cycle_count + 64'd1;
         perf_retire_count <= perf_retire_count
@@ -3010,6 +3100,24 @@ always @(posedge clk) begin
             perf_dis_any_cyc <= perf_dis_any_cyc + 64'd1;
         if (u_dispatch.rs_alu0_push_valid_o && u_dispatch.rs_alu1_push_valid_o)
             perf_dis_dual_alu_cyc <= perf_dis_dual_alu_cyc + 64'd1;
+        if (rn_rob_alloc_en)
+            perf_rn_alloc_cyc <= perf_rn_alloc_cyc + 64'd1;
+        if (rn_rob_alloc_en && (dis0_valid || dis1_valid))
+            perf_turnover_refill_cyc <= perf_turnover_refill_cyc + 64'd1;
+        if ((ib_pop0_valid || ib_pop1_valid) && !dispatch_ready && !rob_full)
+            stall_dispatch_cyc <= stall_dispatch_cyc + 64'd1;
+        if ((ib_pop0_valid || ib_pop1_valid) && rob_full)
+            stall_rename_rob_cyc <= stall_rename_rob_cyc + 64'd1;
+        for (perf_occ_i = 0; perf_occ_i < PERF_OCC_N; perf_occ_i = perf_occ_i + 1) begin
+            perf_occ_sum[perf_occ_i] <= perf_occ_sum[perf_occ_i]
+                                      + {56'd0, perf_occ_now[perf_occ_i]};
+            if (perf_occ_now[perf_occ_i] > perf_occ_max[perf_occ_i])
+                perf_occ_max[perf_occ_i] <= perf_occ_now[perf_occ_i];
+            if ((perf_occ_now[perf_occ_i] * 4) >= (perf_occ_cap[perf_occ_i] * 3))
+                perf_occ_high_cyc[perf_occ_i] <= perf_occ_high_cyc[perf_occ_i] + 64'd1;
+            if (perf_occ_now[perf_occ_i] >= perf_occ_cap[perf_occ_i])
+                perf_occ_full_cyc[perf_occ_i] <= perf_occ_full_cyc[perf_occ_i] + 64'd1;
+        end
     end
 end
 
@@ -3021,6 +3129,17 @@ function automatic real perf_rate;
             perf_rate = 0.0;
         else
             perf_rate = 100.0 * num / den;
+    end
+endfunction
+
+function automatic real perf_avg_occ;
+    input [63:0] sum;
+    input [63:0] cycles;
+    begin
+        if (cycles == 64'd0)
+            perf_avg_occ = 0.0;
+        else
+            perf_avg_occ = 1.0 * sum / cycles;
     end
 endfunction
 
@@ -3051,6 +3170,9 @@ final begin
              perf_dis_dual_cyc, perf_dis_any_cyc,
              perf_rate(perf_dis_dual_cyc, perf_dis_any_cyc),
              perf_dis_dual_alu_cyc);
+    $display("Rename/dispatch:    alloc_cyc=%0d  turnover_refill=%0d  dispatch_stall=%0d  rob_stall=%0d",
+             perf_rn_alloc_cyc, perf_turnover_refill_cyc,
+             stall_dispatch_cyc, stall_rename_rob_cyc);
     $display("BPU all-branch:     total=%0d  mispred=%0d  accuracy=%.2f%%",
              u_bpu.commit_all_branch_count,
              u_bpu.commit_all_mispred_count,
@@ -3104,6 +3226,56 @@ final begin
              u_rs_mem.rsm_lsu_stall_cyc, perf_rate(u_rs_mem.rsm_lsu_stall_cyc, perf_cycle_count));
     $display("RS_MEM full stall:  %0d  (%.2f%%)",
              u_rs_mem.rsm_full_stall_cyc, perf_rate(u_rs_mem.rsm_full_stall_cyc, perf_cycle_count));
+    $display("---- queue occupancy: avg / max / effective-cap / >=75%% cycles / full cycles ----");
+    $display("ROB pairs:          %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[0], perf_cycle_count), perf_occ_max[0], perf_occ_cap[0],
+             perf_occ_high_cyc[0], perf_occ_full_cyc[0]);
+    $display("ROB valid entries:  %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[1], perf_cycle_count), perf_occ_max[1], perf_occ_cap[1],
+             perf_occ_high_cyc[1], perf_occ_full_cyc[1]);
+    $display("Dispatch slots:     %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[2], perf_cycle_count), perf_occ_max[2], perf_occ_cap[2],
+             perf_occ_high_cyc[2], perf_occ_full_cyc[2]);
+    $display("RS ALU0:            %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[3], perf_cycle_count), perf_occ_max[3], perf_occ_cap[3],
+             perf_occ_high_cyc[3], perf_occ_full_cyc[3]);
+    $display("RS ALU1:            %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[4], perf_cycle_count), perf_occ_max[4], perf_occ_cap[4],
+             perf_occ_high_cyc[4], perf_occ_full_cyc[4]);
+    $display("RS MEM:             %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[5], perf_cycle_count), perf_occ_max[5], perf_occ_cap[5],
+             perf_occ_high_cyc[5], perf_occ_full_cyc[5]);
+    $display("RS MDU:             %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[6], perf_cycle_count), perf_occ_max[6], perf_occ_cap[6],
+             perf_occ_high_cyc[6], perf_occ_full_cyc[6]);
+    $display("Store buffer:       %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[7], perf_cycle_count), perf_occ_max[7], perf_occ_cap[7],
+             perf_occ_high_cyc[7], perf_occ_full_cyc[7]);
+    $display("Instruction buffer: %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[8], perf_cycle_count), perf_occ_max[8], perf_occ_cap[8],
+             perf_occ_high_cyc[8], perf_occ_full_cyc[8]);
+    $display("FTQ retained:       %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[9], perf_cycle_count), perf_occ_max[9], perf_occ_cap[9],
+             perf_occ_high_cyc[9], perf_occ_full_cyc[9]);
+    $display("FTQ to IFU pending: %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[10], perf_cycle_count), perf_occ_max[10], perf_occ_cap[10],
+             perf_occ_high_cyc[10], perf_occ_full_cyc[10]);
+    $display("RAT busy mappings:  %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[11], perf_cycle_count), perf_occ_max[11], perf_occ_cap[11],
+             perf_occ_high_cyc[11], perf_occ_full_cyc[11]);
+    $display("RAS speculative:    %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[12], perf_cycle_count), perf_occ_max[12], perf_occ_cap[12],
+             perf_occ_high_cyc[12], perf_occ_full_cyc[12]);
+    $display("RAS committed:      %.3f / %0d / %0d / %0d / %0d",
+             perf_avg_occ(perf_occ_sum[13], perf_cycle_count), perf_occ_max[13], perf_occ_cap[13],
+             perf_occ_high_cyc[13], perf_occ_full_cyc[13]);
+    $display("FTB update queue:   max=%0d/%0d  overflow=%0d",
+             u_bpu.u_ftb.ftb_update_queue_max_occupancy, `FTB_UPDATE_Q_DEPTH,
+             u_bpu.u_ftb.ftb_update_overflow_count);
+    $display("TAGE update queue:  max=%0d/%0d  overflow=%0d  pipe_max=%0d",
+             u_bpu.u_tage.tage_update_queue_max_occupancy, `TAGE_UPDATE_Q_DEPTH,
+             u_bpu.u_tage.tage_update_overflow_count,
+             u_bpu.u_tage.tage_update_pipeline_max_pending_count);
     $display("==========================================================");
     $display("");
 end
