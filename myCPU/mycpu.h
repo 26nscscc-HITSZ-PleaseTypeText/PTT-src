@@ -83,8 +83,8 @@
 `define FTB_NWAY          4           // FTB 路数
 `define FTB_NSET          1024        // FTB 每路组数（共 4096 项，BRAM 实现）
 `define FTB_INDEX_W       10          // $clog2(FTB_NSET)
-`define FTB_UPDATE_Q_DEPTH 8           // FTB 训练更新 FIFO 深度（2 的幂；查询优先不偷读口）
-`define TAGE_UPDATE_Q_DEPTH 16          // TAGE 训练更新 FIFO（COND 突发训练更密，需更深）
+`define FTB_UPDATE_Q_DEPTH 32          // FTB 训练更新 FIFO 深度（2 的幂；查询优先不偷读口）
+`define TAGE_UPDATE_Q_DEPTH 32          // TAGE 训练更新 FIFO（COND 突发训练更密，需更深）
 
 `define TAGE_BASE_DEPTH   8192        // TAGE 基础表项数（2bit 饱和计数器）
 `define TAGE_TAG_NUM      4           // TAGE 标记表个数

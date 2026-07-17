@@ -11,8 +11,9 @@
 //   （异步读），valid 用触发器（一拍判定与失效）。
 //
 // 行为：
-// - 整行输出：命中 2 拍出“整行”（IDLE 接受 -> LOOKUP 比对+出行），IFU 按块
-//   偏移自行切指令；
+// - 整行输出：首个命中 2 拍出“整行”（IDLE 接受 -> LOOKUP 比对+出行）；
+//   稳态命中时 LOOKUP 返回旧请求的同拍可接受下一请求，达到 1 请求/拍；
+//   IFU 按块偏移自行切指令；
 // - miss：整行读 L2（2 拍 128b，ret_last 末拍），重填后 RESP 拍出行；
 // - 前端 IFU 用"在途请求配对 + drop 标志"自行
 //   丢弃过期返回（见 ifu.v），本模块的返回与请求严格一一配对，
@@ -146,15 +147,19 @@ wire [1:0] pick_way = way_invalid[0] ? 2'd0 :
 wire [IDXW-1:0] cac_set = req_paddr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
 wire [1:0]      cac_way = req_paddr[1:0];
 
-// ---------------- 接受仲裁 ----------------
-wire cacop_take = (state == S_IDLE) && cacop_pend;
-wire req_take   = (state == S_IDLE) && !cacop_pend && ifu_req_i;
-assign ifu_addr_ok_o = req_take;
-
 // ---------------- 响应 ----------------
 wire lookup_hit = (state == S_LOOKUP) && !req_is_cacop && !req_uncached && hit_any;
 assign ifu_data_ok_o = lookup_hit | (state == S_RESP);
 assign ifu_rline_o   = lookup_hit ? data_out[hit_way] : resp_line;
+
+// ---------------- 接受仲裁 ----------------
+// BRAM 同步读允许在本拍消费旧 data_out 的同时，于时钟沿装入下一组 index。
+// 因此 LOOKUP hit 和 RESP 都可作为“返回旧请求 + 接受新请求”的替换窗口。
+// cacop 已排队时停止连续取指，先让当前响应结束，再回到 IDLE 服务 cacop。
+wire cacop_take = (state == S_IDLE) && cacop_pend;
+wire req_window = (state == S_IDLE) || lookup_hit || (state == S_RESP);
+wire req_take   = req_window && !cacop_pend && ifu_req_i;
+assign ifu_addr_ok_o = req_take;
 
 // ---------------- L2 接口 ----------------
 assign axi_rd_req  = (state == S_RREQ) || (state == S_UC_RREQ);
@@ -240,7 +245,16 @@ always @(posedge clk) begin
                     uc_line <= {LINEW{1'b0}};
                     state   <= S_UC_RREQ;
                 end else if (hit_any) begin
-                    state <= S_IDLE;          // 本拍 data_ok + 整行输出
+                    // 本拍 data_ok 输出旧行；若 IFU 同拍送来下一请求，则
+                    // req_take 已启动下一次 BRAM 读并更新请求锁存，保持 LOOKUP。
+                    if (req_take) begin
+                        req_is_cacop <= 1'b0;
+                        req_paddr    <= ifu_paddr_i;
+                        req_uncached <= ifu_uncached_i;
+                        state        <= S_LOOKUP;
+                    end else begin
+                        state <= S_IDLE;
+                    end
                 end else begin
                     victim_way      <= pick_way;
                     rr_ptr[req_set] <= rr_ptr[req_set] + 2'd1;
@@ -261,7 +275,17 @@ always @(posedge clk) begin
                     end
                 end
             end
-            S_RESP: state <= S_IDLE;
+            S_RESP: begin
+                // refill/uncached 响应同样可在空闲 RAM 口启动下一次查找。
+                if (req_take) begin
+                    req_is_cacop <= 1'b0;
+                    req_paddr    <= ifu_paddr_i;
+                    req_uncached <= ifu_uncached_i;
+                    state        <= S_LOOKUP;
+                end else begin
+                    state <= S_IDLE;
+                end
+            end
 
             // uncached：从块起始字逐字读到行末，拼部分有效行
             S_UC_RREQ: if (axi_rd_rdy) state <= S_UC_RDATA;

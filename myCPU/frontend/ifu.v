@@ -3,11 +3,14 @@
 // ------------------------------------------------------------
 // 参考实现说明：
 // - 2 段流水：PRE（收 FTQ 块 + MMU 翻译 + 发 ICache）/ IF（等返回 + 切割 + 入 IB）；
-//   最多 2 块在途；I$ 严格单请求在途（ic_outstanding），过期应答自然丢弃，
+//   最多 2 块在途；I$ 保持一个逻辑请求在途，但允许 data_ok 返回旧请求与
+//   addr_ok 接受新请求同拍发生；FTQ 新块在进入 PRE 的同拍可直发 I$，
 //   数据在 PRE 滞留期间返回被弃时由 if_replay_req 重发兜底；
 // - 取指异常整块占位（inst=0，不打 ICache）；
 // - 预译码仅识别 B/BL 直接跳转，漏预测时截断块并全量 predec_redirect；
 // - ic_cancel_o 恒 0（I$ 忽略 cancel，本模块自行丢弃）。
+// - pred_taken：保留 slot_pred_taken（仅块末真实 cond/B/BL），禁止块末 ALU
+//   被标 taken（Linux makecontext 静默跳过指令回归防护）。
 // ============================================================
 `include "mycpu.h"
 
@@ -115,10 +118,13 @@ reg        pre_uncached;
 reg        pre_excp;
 reg [`EXCP_NUM-1:0] pre_excp_vec;
 reg        pre_ic_sent;
+reg        pre_line_valid;
+reg [`CACHE_LINE_BITS-1:0] pre_rline;
 
 initial begin
     pre_v       = 1'b0;
     pre_ic_sent = 1'b0;
+    pre_line_valid = 1'b0;
 end
 
 // ---------------- IF 级 ----------------
@@ -140,23 +146,33 @@ initial begin
 end
 
 reg ic_outstanding;
+reg [31:5] ic_rsp_line;
 
 initial begin
     ic_outstanding = 1'b0;
+    ic_rsp_line    = 27'b0;
 end
 
-// I$ 严格单请求在途：addr_ok 置位、data_ok 清零。
+// I$ 单逻辑请求在途：addr_ok 置位、data_ok 清零；若旧响应和新接受同拍，
+// 新请求替换旧请求，标志必须保持为 1。
 // flush/predec 丢弃 PRE/IF 块时【不】清该标志：在途应答返回前禁止发新请求，
 // 旧应答返回时无人处于等待态（新请求尚未发出），自然被丢弃——
 // 从机制上杜绝“旧应答喂错新块”，也无需 drop_rsp 标记。
 always @(posedge clk) begin
     if (reset) begin
         ic_outstanding <= 1'b0;
+        ic_rsp_line    <= 27'b0;
     end else begin
+        case ({(ic_req_o && (ic_addr_ok_i === 1'b1)), (ic_data_ok_i === 1'b1)})
+            2'b10: ic_outstanding <= 1'b1;
+            2'b01: ic_outstanding <= 1'b0;
+            2'b11: ic_outstanding <= 1'b1; // 同拍完成旧请求并接受新请求
+            default: ic_outstanding <= ic_outstanding;
+        endcase
+        // 同拍 data_ok + addr_ok 时，data_ok 属于旧 ic_rsp_line；时钟沿后
+        // tracker 被新请求替换，供下一拍响应配对。
         if (ic_req_o && (ic_addr_ok_i === 1'b1))
-            ic_outstanding <= 1'b1;
-        if (ic_data_ok_i === 1'b1)
-            ic_outstanding <= 1'b0;
+            ic_rsp_line <= ic_vaddr_o[31:5];
     end
 end
 
@@ -173,11 +189,13 @@ function [`BLK_LEN_W-1:0] safe_blk_len;
     end
 endfunction
 
-wire [`BLK_LEN_W-1:0] if_len_eff = safe_blk_len(if_len);
+wire [`BLK_LEN_W-1:0] ftq_len_eff = safe_blk_len(ftq_length_i);
+wire [`BLK_LEN_W-1:0] if_len_eff  = safe_blk_len(if_len);
 wire ib_can_push = (ib_can_push_i === 1'b1);
-// if_wait_data=1 时唯一在途请求必属本块（PRE 被 !ic_outstanding/!if_replay_req
-// 挡住，发不出新请求），data_ok 可直接消费
-wire if_ic_hit   = (if_wait_data === 1'b1) && (ic_data_ok_i === 1'b1);
+wire if_rsp_match  = (ic_rsp_line == if_pc[31:5]);
+wire pre_rsp_match = (ic_rsp_line == pre_pc[31:5]);
+wire if_ic_hit   = (if_wait_data === 1'b1) && (ic_data_ok_i === 1'b1)
+                && if_rsp_match;
 wire if_line_ready = (if_excp === 1'b1)
                   || if_ic_hit
                   || ((if_wait_data !== 1'b1) && (if_v === 1'b1) && (|if_rline));
@@ -213,20 +231,36 @@ assign mmu_i_vaddr_o = (ftq_valid_i === 1'b1) ? ftq_pc_i : pre_pc;
 wire if_replay_req = (if_v === 1'b1) && (if_wait_data === 1'b1) && (ic_outstanding !== 1'b1)
                    && (if_excp !== 1'b1) && (flush_i !== 1'b1);
 
-// PRE 发请求的前提：I$ 无在途请求、IF 不在重放、本块非错误路径
+// data_ok 本拍返回时，旧请求将在时钟沿完成，可同拍用 addr_ok 替换为新请求。
+wire ic_slot_free = (ic_outstanding !== 1'b1) || (ic_data_ok_i === 1'b1);
+
+// PRE 发请求的前提：I$ 有空槽、IF 不在重放、本块非错误路径
 wire pre_ic_req = (pre_v === 1'b1) && !pre_excp && (pre_ic_sent !== 1'b1)
-               && (ic_outstanding !== 1'b1) && !if_replay_req
+               && ic_slot_free && !if_replay_req
                && !predec_kill && (flush_i !== 1'b1);
 
-assign ic_req_o      = pre_ic_req || if_replay_req;
-assign ic_vaddr_o    = if_replay_req ? if_pc : pre_pc;
-assign ic_paddr_o    = if_replay_req ? if_paddr : pre_paddr;
-assign ic_uncached_o = if_replay_req ? if_uncached : pre_uncached;
+// PRE 正在前进（或为空）时，ftq_accept_o 接收的新块可直接发 I$，避免
+// “先写 PRE、下一拍再发请求”的固定气泡。若 cache 当前不能接受，块仍正常
+// 锁存进 PRE，pre_ic_sent=0，之后由 pre_ic_req 保持重试。
+wire ftq_direct_req = (ftq_accept_o === 1'b1) && !pre_excp_now
+                   && ic_slot_free && !if_replay_req
+                   && (flush_i !== 1'b1);
+wire ftq_direct_fire = ftq_direct_req && (ic_addr_ok_i === 1'b1);
+
+assign ic_req_o      = if_replay_req || pre_ic_req || ftq_direct_req;
+assign ic_vaddr_o    = if_replay_req ? if_pc
+                     : pre_ic_req    ? pre_pc    : ftq_pc_i;
+assign ic_paddr_o    = if_replay_req ? if_paddr
+                     : pre_ic_req    ? pre_paddr : mmu_i_paddr_i;
+assign ic_uncached_o = if_replay_req ? if_uncached
+                     : pre_ic_req    ? pre_uncached : (mmu_i_mat_i != 2'd1);
 
 always @(posedge clk) begin
     if (reset || flush_i) begin
         pre_v        <= 1'b0;
         pre_ic_sent  <= 1'b0;
+        pre_line_valid <= 1'b0;
+        pre_rline      <= {`CACHE_LINE_BITS{1'b0}};
         if_v         <= 1'b0;
         if_wait_data <= 1'b0;
         if_rline     <= {`CACHE_LINE_BITS{1'b0}};
@@ -237,7 +271,7 @@ always @(posedge clk) begin
         if (ftq_accept_o) begin
             pre_v        <= 1'b1;
             pre_pc       <= ftq_pc_i;
-            pre_len      <= safe_blk_len(ftq_length_i);
+            pre_len      <= ftq_len_eff;
             pre_taken    <= ftq_taken_i;
             pre_target   <= ftq_target_i;
             pre_id       <= ftq_ftq_id_i;
@@ -245,12 +279,21 @@ always @(posedge clk) begin
             pre_uncached <= (mmu_i_mat_i != 2'd1);
             pre_excp     <= pre_excp_now;
             pre_excp_vec <= pre_excp_vec_now;
-            pre_ic_sent  <= 1'b0;
+            pre_ic_sent  <= ftq_direct_fire;
+            pre_line_valid <= 1'b0;
         end else if (pre_to_if || predec_kill) begin
             pre_v       <= 1'b0;
             pre_ic_sent <= 1'b0;
-        end else if (pre_ic_req && (ic_addr_ok_i === 1'b1)) begin
-            pre_ic_sent <= 1'b1;
+            pre_line_valid <= 1'b0;
+        end else begin
+            if (pre_ic_req && (ic_addr_ok_i === 1'b1))
+                pre_ic_sent <= 1'b1;
+            // The I$ may return while IF/IB backpressure keeps PRE occupied.
+            // Retain that line instead of discarding it and replaying later.
+            if (pre_v && pre_ic_sent && (ic_data_ok_i === 1'b1) && pre_rsp_match) begin
+                pre_rline      <= ic_rline_i;
+                pre_line_valid <= 1'b1;
+            end
         end
 
         // ---- IF 级：装载 > 弹出 > 等数据 ----
@@ -267,8 +310,12 @@ always @(posedge clk) begin
             if_uncached  <= pre_uncached;
             if (pre_excp) begin
                 if_wait_data <= 1'b0;
-            end else if (ic_data_ok_i === 1'b1) begin
-                // 过渡拍返回的 data_ok 必属本块（唯一在途请求）
+            end else if (pre_line_valid) begin
+                if_rline     <= pre_rline;
+                if_wait_data <= 1'b0;
+            end else if ((ic_data_ok_i === 1'b1) && pre_rsp_match) begin
+                // 只消费与 PRE 同一 cache line 的响应；旧路径应答即使与
+                // 新请求同拍返回，也不会被错误配给新块。
                 if_rline     <= ic_rline_i;
                 if_wait_data <= 1'b0;
             end else begin
@@ -277,7 +324,8 @@ always @(posedge clk) begin
         end else if (if_ready_go === 1'b1) begin
             if_v         <= 1'b0;
             if_wait_data <= 1'b0;
-        end else if (if_v && if_wait_data && (ic_data_ok_i === 1'b1)) begin
+        end else if (if_v && if_wait_data && (ic_data_ok_i === 1'b1)
+                     && if_rsp_match) begin
             if_rline     <= ic_rline_i;
             if_wait_data <= 1'b0;
         end
@@ -286,7 +334,8 @@ end
 
 // ---------------- 指令切割 ----------------
 wire [`CACHE_LINE_W-1:0] line_off = if_pc[`CACHE_LINE_W-1:2];
-wire [`CACHE_LINE_BITS-1:0] if_rline_eff = (if_v && if_wait_data && ic_data_ok_i)
+wire [`CACHE_LINE_BITS-1:0] if_rline_eff = (if_v && if_wait_data && ic_data_ok_i
+                                            && if_rsp_match)
                                            ? ic_rline_i : if_rline;
 
 wire [31:0] cut_inst [0:3];
@@ -383,7 +432,7 @@ wire push_en = if_ready_go;
 // 走 fall-through，若实际 taken 由提交级 br_taken!=pred_taken 冲刷，
 // 不依赖目标比对，避免目标撞车漏检）；未截断块末仅真实 cond 分支用 FTQ taken。
 // 禁止对块末 ALU 标 pred_taken：否则 taken 脏 FTB 会令 BPU 跳到 target，而 IFU
- // 仍推送块内 ALU；双提交又不检槽1 的 (!branch&&pred_taken) → 静默跳过后续指令
+// 仍推送块内 ALU；双提交又不检槽1 的 (!branch&&pred_taken) → 静默跳过后续指令
 // （Linux makecontext: 2e68/2e6c 后跳到 2ea8）。
 function slot_pred_taken;
     input [1:0] idx;
