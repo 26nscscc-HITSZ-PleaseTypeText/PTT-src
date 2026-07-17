@@ -10,9 +10,8 @@
 // 3) 提交接口语义不变：原"WB 级提交"的全部输入（wb_valid/wb_pc/wb_ex/
 //    各异常 valid/wb_tlb_op/ll_set/sc_set/csr_we...）现在由 commit.v 驱动，
 //    信号含义一一对应（commit 的 csr_cmt_* 端口注释里写明了映射）
-// 4) 输出 flush_pipeline/csr_next_pc/csr_redirect：新架构下不再直接接 npc，
-//    而是供 commit 选择冲刷目标（FLUSH_EXCP 用 csr_next_pc=EENTRY/TLBRENTRY，
-//    FLUSH_ERTN 用 csr_next_pc=ERA），由 ctrl 统一广播
+// 4) 输出 csr_next_pc/csr_redirect：供 commit 选择冲刷目标
+//    （FLUSH_EXCP 用 csr_next_pc=EENTRY/TLBRENTRY，FLUSH_ERTN 用 ERA），由 ctrl 统一广播
 // 5) csr_rnum/csr_rvalue 读口：新架构由 fu_mdu 的 CSR 读口驱动（执行级读旧值）
 //
 // 新架构对接确认结论（原 TODO 四项，均已逐条核实，逻辑保持不动）：
@@ -21,8 +20,7 @@
 //    到本模块时 csr_wvalue=最终值、csr_wmask=全 1，按普通掩码写正确。
 // 2. has_int：输出给 commit 做"中断附着"（附着在下一条将提交的指令上，
 //    不再附着 ID 级）——ESTAT.IS 与 ECFG.LIE 逐位与后再看 CRMD.IE。
-// 3. flush_pipeline：新架构真正的冲刷由 commit -> ctrl 统一广播，本输出
-//    仅作参考/断言对比用，顶层已接 lint 吸收（csr_flush_pipeline_unused）。
+// 3. 冲刷由 commit -> ctrl 统一广播（本模块不再输出 flush_pipeline）。
 // 4. IPE/ADEM 写入路径：decoder 检测 IPE、tlb_manager/mmu 检测 ADEM，
 //    commit 打包驱动 IPE_valid/ADEM_valid 到本模块——exception_Decoder
 //    的链式优先级含两者，ESTAT.Ecode/Esubcode 与 BADV（wb_ex_addr_err
@@ -82,11 +80,10 @@ module csr_exception_commit_handler (
     input  wire        sc_set_in,         // 在 WB 提交 sc.w 时为 1（无论成败均清 LLBIT）
     input  wire [27:0] lladdr_in,         // ll.w 的物理地址高 28 位
 
-    // ---------------- 输出：冲刷、pc重定向、ID中断、csr读返回与域输出 ----------------
-    output wire        flush_pipeline,  // 异常或 ERTN 提交时冲刷
+    // ---------------- 输出：冲刷目标、中断、csr读返回与域输出 ----------------
     output wire [31:0] csr_next_pc,     // 异常的EENTRY 或 ERTN的返回地址，判断是这两个的哪个，看csr_redirect
-    output wire [1:0]  csr_redirect,    // 区分csr_next_pc类型的标志位信号，给npc仲裁，类型有`CSR_REDIRECT_EX、`CSR_REDIRECT_ERTN、`CSR_REDIRECT_NONE，具体看宏定义
-    output wire        has_int,         // 送往ID的中断有效信号，将中断附着在ID指令上
+    output wire [1:0]  csr_redirect,    // 区分csr_next_pc类型的标志位信号，类型有`CSR_REDIRECT_EX、`CSR_REDIRECT_ERTN、`CSR_REDIRECT_NONE
+    output wire        has_int,         // 送往 commit 的中断有效信号
     output wire [31:0] csr_rvalue,      // CSR寄存器读返回值
     output wire [31:0] csr_tid_out,     // csr的tid值，用于RDCNTID指令读取计时器ID号
     output wire        csr_crmd_da_out,
@@ -283,15 +280,29 @@ module csr_exception_commit_handler (
     end
 
 
-    // ESTAT 的 IS 域（timer_cnt 在本块使用，声明需前置）
+    // ESTAT 的 IS 域（timer_cnt / timer_en 在本块使用，声明需前置）
+    // 定时器对齐 open-la500（csr.v）：
+    //   - 独立 timer_en：oneshot 减到 0 时 timer_en<=0；periodic 保持 1
+    //   - TI：timer_en && TVAL==0 时置位（与 open-la500 一致）
+    //   - TVAL==0 当拍重装 InitVal（periodic）或 0xFFFFFFFF（oneshot）
+    // 额外：TI 挂起期间暂停倒计时（TICLR 后从已重装值再走完下一周期）。
+    // open-la500 五级流水 handler 极快，周期内不会再次到期；本核 OoO+CSR
+    // 冲刷使 n49 handler 长于 InitVal，若不冻结会在 ertn 前再次置 TI → 230C 级联。
     reg [12:0] csr_estat_is;
     reg [31:0] timer_cnt;
+    reg        timer_en;
     reg [63:0] timer_64;
+    wire timer_ti_set = timer_en && (timer_cnt == 32'b0);
+    // csrwr TICLR：commit 在 PRIV_CSR_WR 提交拍拉 csr_we 一拍
+    wire ticlr_we = csr_we && (csr_num == `CSR_TICLR)
+                 && csr_wmask[`CSR_TICLR_CLR] && csr_wvalue[`CSR_TICLR_CLR];
+    wire tcfg_we  = csr_we && (csr_num == `CSR_TCFG);
     always @(posedge clk) begin
         if (reset) begin
             // 必须整域复位，否则 IS[11] 等在首拍为 X → has_int 为 X → ID 译码条件失效、写回数据 X
             csr_estat_is <= 13'b0;
-            timer_64 <= 64'b0;
+            timer_64     <= 64'b0;
+            timer_en     <= 1'b0;
         end else begin
             timer_64 <= timer_64 + 64'd1;
             if (csr_we && csr_num == `CSR_ESTAT) begin
@@ -300,11 +311,15 @@ module csr_exception_commit_handler (
             end
             csr_estat_is[9:2] <= hw_int_in[7:0];
             csr_estat_is[10] <= 1'b0;
-            if (csr_we && csr_num == `CSR_TICLR && csr_wmask[`CSR_TICLR_CLR] 
-                     && csr_wvalue[`CSR_TICLR_CLR]) begin
+            if (ticlr_we) begin
                 csr_estat_is[11] <= 1'b0;
-            end else if (csr_tcfg_en && (timer_cnt[31:0] == 32'b0)) begin
+            end else if (tcfg_we) begin
+                // 与 open-la500：写 TCFG 时刷新 timer_en（写入后的 En）
+                timer_en <= csr_wmask[`CSR_TCFG_EN] & csr_wvalue[`CSR_TCFG_EN]
+                         | ~csr_wmask[`CSR_TCFG_EN] & csr_tcfg_en;
+            end else if (timer_ti_set) begin
                 csr_estat_is[11] <= 1'b1;
+                timer_en         <= csr_tcfg_periodic;
             end
             csr_estat_is[12] <= ipi_int_in;
         end
@@ -519,7 +534,7 @@ module csr_exception_commit_handler (
     end
 
 
-    // TVAL 的 TimerVal 域
+    // TVAL 的 TimerVal 域（对齐 open-la500；TI 挂起时冻结倒计时）
     wire [31:0] tcfg_next_value;
     wire [31:0] csr_tval;
 
@@ -530,15 +545,16 @@ module csr_exception_commit_handler (
         if (reset) begin
             timer_cnt <= 32'hffffffff;
         end
-        else if (csr_we && csr_num == `CSR_TCFG && tcfg_next_value[`CSR_TCFG_EN]) begin
+        else if (tcfg_we) begin
+            // open-la500：任意 TCFG 写入都装载 InitVal<<2
             timer_cnt <= {tcfg_next_value[`CSR_TCFG_INITVAL], 2'b0};
         end
-        else if (csr_tcfg_en && timer_cnt != 32'hffffffff) begin
-            if (timer_cnt[31:0] == 32'b0 && csr_tcfg_periodic) begin
-                timer_cnt <= {csr_tcfg_initval, 2'b0};
-            end
-            else begin
+        else if (timer_en && !csr_estat_is[11]) begin
+            if (timer_cnt != 32'b0) begin
                 timer_cnt <= timer_cnt - 1'b1;
+            end else begin
+                // 到期当拍：periodic 重装；oneshot 停在 -1（同时 timer_en 在上块清 0）
+                timer_cnt <= csr_tcfg_periodic ? {csr_tcfg_initval, 2'b0} : 32'hffffffff;
             end
         end
     end
@@ -676,9 +692,6 @@ module csr_exception_commit_handler (
 
     // has_int
     assign has_int = (((csr_estat_is[12:0] & csr_ecfg_lie[12:0]) != 13'b0) === 1'b1) && (csr_crmd_ie === 1'b1);
-
-    // flush_pipeline
-    assign flush_pipeline = csr_take_ex || csr_take_ertn;
 
     // csr_redirect
     assign csr_redirect = csr_take_ex   ? `CSR_REDIRECT_EX

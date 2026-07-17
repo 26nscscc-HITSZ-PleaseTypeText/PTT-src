@@ -308,6 +308,13 @@ wire cmt1_has_excp = |cmt1_excp_i;
 wire cmt0_has_priv = |cmt0_priv_vec_i;
 wire cmt1_has_priv = |cmt1_priv_vec_i;
 
+// L0 CSR 写免 FLUSH_REFETCH（Phase A1/A2）。rename 侧已对 L0 串行排空，
+// 保证提交时 ROB 中无更年轻指令，故不会有在途 csrrd 读到旧 CSR。
+wire cmt0_csr_nofush = cmt0_priv_vec_i[`PRIV_CSR_WR]
+                    && `CSR_NUM_IS_L0_NOFLUSH(cmt0_csr_num_i[11:0]);
+wire cmt1_csr_nofush = cmt1_priv_vec_i[`PRIV_CSR_WR]
+                    && `CSR_NUM_IS_L0_NOFLUSH(cmt1_csr_num_i[11:0]);
+
 // 真 idle（非套件 `b 0`/0x50000000）：即使已有 has_int 也先退休完成，
 // FLUSH 到 pc+4；中断挂到后继 nop。这样 ERA/s4/NEMU 一致为 idle+4。
 // 若在 idle 上 int_take，NEMU（尤其 tcfg InitVal=0）会把 ERA 记成 idle 自身。
@@ -361,7 +368,7 @@ wire cmt0_retire = int_take ||
 wire cmt0_effect = cmt0_ready && !int_take && !cmt0_has_excp &&
                    !cmt0_store_block && !cmt0_ibar_block && !cmt0_cacop_block;
 wire cmt0_flush = int_take || (cmt0_ready && cmt0_has_excp) ||
-                  (cmt0_effect && cmt0_has_priv) || cmt0_mispred;
+                  (cmt0_effect && cmt0_has_priv && !cmt0_csr_nofush) || cmt0_mispred;
 
 wire cmt1_head_retire = (!cmt0_valid_i) &&
                         (cmt1_ready && (cmt1_has_excp ||
@@ -370,7 +377,7 @@ wire cmt1_head_effect = (!cmt0_valid_i) && cmt1_ready && !cmt1_has_excp &&
                         !cmt1_store_block && !cmt1_ibar_block && !cmt1_cacop_block;
 wire cmt1_head_flush = (!cmt0_valid_i) &&
                        ((cmt1_ready && cmt1_has_excp) ||
-                        (cmt1_head_effect && cmt1_has_priv) ||
+                        (cmt1_head_effect && cmt1_has_priv && !cmt1_csr_nofush) ||
                         cmt1_mispred_head);
 
 wire cmt0_taken_br = cmt0_effect && cmt0_is_branch_i && cmt0_br_taken_i && !cmt0_is_last_i;
@@ -413,7 +420,8 @@ wire sel_is_last = take_slot1_for_csr ? cmt1_is_last_i : cmt0_is_last_i;
 wire selected_effect = take_slot1_for_csr ? cmt1_head_effect : cmt0_effect;
 wire selected_excp_take = int_take || (take_slot1_for_csr ? (cmt1_ready && cmt1_has_excp)
                                                           : (cmt0_ready && cmt0_has_excp));
-wire selected_priv_flush = selected_effect && (|sel_priv);
+wire selected_csr_nofush = take_slot1_for_csr ? cmt1_csr_nofush : cmt0_csr_nofush;
+wire selected_priv_flush = selected_effect && (|sel_priv) && !selected_csr_nofush;
 wire selected_mispred = take_slot1_for_csr ? cmt1_mispred_head : cmt0_mispred;
 
 wire mem_excp = sel_excp[`EXCP_ADEM] | sel_excp[`EXCP_ALE] |

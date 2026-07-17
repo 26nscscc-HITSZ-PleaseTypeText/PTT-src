@@ -358,6 +358,10 @@
 `define CSR_TCFG        12'h041
 `define CSR_TVAL        12'h042
 `define CSR_TICLR       12'h044
+// L0 CSR 写白名单：提交可免 FLUSH_REFETCH（须配合 rename 串行排空，防在途 csrrd 读旧值）
+`define CSR_NUM_IS_L0_NOFLUSH(n) ( \
+    ((n) == `CSR_TICLR) || ((n) == `CSR_SAVE0) || ((n) == `CSR_SAVE1) || \
+    ((n) == `CSR_SAVE2) || ((n) == `CSR_SAVE3) || ((n) == `CSR_TID))
 `define CSR_LLBCTL      12'h060
 `define CSR_TLBRENTRY   12'h088
 `define CSR_CTAG        12'h098

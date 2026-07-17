@@ -730,6 +730,7 @@ module core_top #(
         .clk               (clk),
         .reset             (reset),
         .flush_i           (flush),
+        .l0_csr_commit_i   (cmt_csr_we && `CSR_NUM_IS_L0_NOFLUSH(cmt_csr_wnum[11:0])),
         // 槽 0
         .ib0_valid_i       (ib_pop0_valid),
         .ib0_pc_i          (ib_pop0_pc),
@@ -2197,7 +2198,6 @@ module core_top #(
 //--------------------------------------------------
 // CSR：寄存器组与异常提交处理
 //--------------------------------------------------
-    wire        csr_flush_pipeline_unused; // 新架构冲刷由 commit->ctrl 统一发起，此口仅供对照
     wire [31:0] csr_crmd_live_unused;
     wire [27:0] csr_lladdr_unused;
 
@@ -2247,7 +2247,6 @@ module core_top #(
         .ll_set_in      (cmt_ll_set),
         .sc_set_in      (cmt_sc_set),
         .lladdr_in      (cmt_lladdr),
-        .flush_pipeline (csr_flush_pipeline_unused),
         .csr_next_pc    (csr_next_pc),
         .csr_redirect   (csr_redirect),
         .has_int        (csr_has_int),
@@ -2573,7 +2572,6 @@ module core_top #(
     // Spyglass/lint：吸收暂未使用的观测信号
     wire mycpu_lint_sink;
     assign mycpu_lint_sink = break_point | infor_flag
-                           | csr_flush_pipeline_unused
                            | (|csr_crmd_live_unused) | (|csr_lladdr_unused)
                            | (|rsm_occupancy) | (|rsd_occupancy)
 `ifndef CPU_2CMT

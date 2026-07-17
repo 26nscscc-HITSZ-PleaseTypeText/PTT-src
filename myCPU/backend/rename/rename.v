@@ -32,6 +32,8 @@ module rename(
     input  wire                       clk,
     input  wire                       reset,
     input  wire                       flush_i,
+    // L0 CSR 写已提交（免 flush）：解除 rename 排空闸门
+    input  wire                       l0_csr_commit_i,
 
     // =============== 槽 0 输入（IB pop0 + decoder0，组合送入） ===============
     input  wire                       ib0_valid_i,
@@ -303,15 +305,34 @@ assign dis1_src1_addr_o = dis1_src1_addr_r;
 //
 wire ib0_eff_v = ib0_valid_i && !ib0_is_nop_i;
 wire ib1_eff_v = ib1_valid_i && !ib1_is_nop_i;
+// L0 CSR 写：单独成对进入 ROB，并闸住后续 rename，直至提交（免 flush 时防在途 csrrd）
+wire ib0_l0_csr_wr = ib0_eff_v && ib0_priv_vec_i[`PRIV_CSR_WR]
+                  && `CSR_NUM_IS_L0_NOFLUSH(ib0_csr_num_i[11:0]);
+wire ib1_l0_csr_wr = ib1_eff_v && ib1_priv_vec_i[`PRIV_CSR_WR]
+                  && `CSR_NUM_IS_L0_NOFLUSH(ib1_csr_num_i[11:0]);
+reg l0_csr_drain_r;
 wire dual_issue_ok = !((ib0_eff_v && ib1_eff_v && ib0_futype_i[`FU_MEM] && ib1_futype_i[`FU_MEM]) ||
-                       (ib0_eff_v && ib1_eff_v && ib0_futype_i[`FU_MDU] && ib1_futype_i[`FU_MDU]));
+                       (ib0_eff_v && ib1_eff_v && ib0_futype_i[`FU_MDU] && ib1_futype_i[`FU_MDU]) ||
+                       (ib0_l0_csr_wr && ib1_eff_v) ||
+                       (ib1_l0_csr_wr && ib0_eff_v));
 
-assign can_go = (ib0_valid_i | ib1_valid_i) && !rob_full_i && dispatch_ready_i && !flush_i;
+assign can_go = (ib0_valid_i | ib1_valid_i) && !rob_full_i && dispatch_ready_i
+             && !flush_i && !l0_csr_drain_r;
 assign ib0_ready_o = can_go && ib0_valid_i;
 // 同拍 RAW（ib1 源 == ib0 目的）不再阻塞 ib1：
 // 强制走 ROB 唤醒路径（src ready=0，tag=robid0，见下方第三步旁路），不信 ARF ready
 assign ib1_ready_o = can_go && ib1_valid_i && dual_issue_ok;
 assign rob_alloc_en_o = can_go;
+
+wire l0_csr_alloc = can_go && (ib0_l0_csr_wr || (ib1_l0_csr_wr && dual_issue_ok));
+always @(posedge clk) begin
+    if (reset || flush_i)
+        l0_csr_drain_r <= 1'b0;
+    else if (l0_csr_commit_i)
+        l0_csr_drain_r <= 1'b0;
+    else if (l0_csr_alloc)
+        l0_csr_drain_r <= 1'b1;
+end
 
 wire ib0_null_bubble = ib0_valid_i && (ib0_inst_i == 32'b0) && !(|ib0_excp_i);
 wire ib1_null_bubble = ib1_valid_i && (ib1_inst_i == 32'b0) && !(|ib1_excp_i);
