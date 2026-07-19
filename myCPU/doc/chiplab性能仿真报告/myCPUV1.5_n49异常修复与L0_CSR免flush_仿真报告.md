@@ -1,7 +1,7 @@
-# myCPU：n49 异常修复 + L0 CSR 免 flush — 仿真报告
+# myCPUV1.5：n49 异常修复 + L0 CSR 免 flush — 仿真报告
 
 > 日期：2026-07-18  
-> 基线：`myCPU_frontend_ICacheIFU合并_仿真报告.md`（I$/IFU 流水线 + update Q=32，seed `5570815`）  
+> 基线：`myCPUV1.4_frontend_ICacheIFU合并_仿真报告.md`（I$/IFU 流水线 + update Q=32，seed `5570815`）  
 > 来源：`IP/修功能测试n49_Bug的异常处理改动/` + `异常特权路径性能优化报告.md` Phase A1/A2  
 > 负载：`func_lab19` digftest；Linux → `/ #`
 

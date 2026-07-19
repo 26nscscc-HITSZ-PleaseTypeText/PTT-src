@@ -1,7 +1,7 @@
-# myCPU：I$/IFU 流水线 + 训练 FIFO 加深 — 仿真报告
+# myCPUV1.4：I$/IFU 流水线 + 训练 FIFO 加深 — 仿真报告
 
 > 日期：2026-07-17  
-> 基线：`myCPU_v1.7_dispatch解锁_仿真与占用报告.md`（seed `5570815`）  
+> 基线：`myCPUV1.3_dispatch解锁_仿真与占用报告.md`（seed `5570815`）  
 > 本轮改动：cherry-pick `frontend_2.0(1.2+1.3)` 的 I$/IFU 吞吐；`FTB/TAGE_UPDATE_Q` 8/16 → **32/32**  
 > 负载：`func_lab19` digftest；Linux → `/ #`
 

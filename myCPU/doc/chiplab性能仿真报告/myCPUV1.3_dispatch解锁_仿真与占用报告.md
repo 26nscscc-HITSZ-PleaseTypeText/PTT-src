@@ -1,4 +1,4 @@
-# myCPU：dispatch 解锁 rename 阻塞 — 仿真与队列占用报告
+# myCPUV1.3：dispatch 解锁 rename 阻塞 — 仿真与队列占用报告
 
 > 日期：2026-07-17  
 > RTL：`IP/myCPU`（已并入 `backend_v1.7_解锁dispatch对rename的阻塞`）  
