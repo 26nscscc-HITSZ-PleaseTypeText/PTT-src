@@ -1,4 +1,4 @@
-# myCPU：LSU / DCache 合入报告
+# myCPUV2.2_LSU_DCache_合入报告
 
 > 日期：2026-07-18（文档更新：2026-07-19）  
 > **基线 CPU/报告**：[`chiplab性能仿真报告/myCPUV1.4_frontend_ICacheIFU合并_仿真报告.md`](chiplab性能仿真报告/myCPUV1.4_frontend_ICacheIFU合并_仿真报告.md)（Linux IPC **0.586**）→ 再叠 P1b 软门曾 **0.607**（无 park）→ 现树 digftest/软门 **~0.570**（UC park 代价）  
