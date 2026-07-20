@@ -114,15 +114,15 @@ module commit(
     output wire [4:0]                 rat_cmt_addr1_o,
     output wire [`ROB_W-1:0]          rat_cmt_num1_o,
 
-    // =============== store buffer 入队 ===============
+    // =============== store buffer：提交入队（单写口） ===============
     output wire                       sb_push_valid_o,
     output wire [31:0]                sb_push_paddr_o,
     output wire [31:0]                sb_push_data_o,
     output wire [3:0]                 sb_push_wstrb_o,
     output wire [2:0]                 sb_push_size_o,
     output wire                       sb_push_uncached_o,
-    input  wire                       sb_full_i,           // 满则 store 不能提交
-    input  wire                       sb_empty_i,          // ibar/idle 等屏障等待
+    input  wire                       sb_full_i,
+    input  wire                       sb_empty_i,          // 已提交写排空（ibar/cacop）
 
     // =============== CSR / 异常提交（对接 csr_exception_commit_handler） ===============
     output wire                       csr_cmt_valid_o,     // 本拍有指令提交（接 wb_valid）
@@ -326,8 +326,11 @@ wire cmt1_ibar_block = cmt1_ready && cmt1_priv_vec_i[`PRIV_IBAR] && !sb_empty_i;
 // D$/I$ cacop 提交前排空 SB：否则 store 还在 SB、cacop 已按旧脏行写回（n78）。
 wire cmt0_cacop_block = cmt0_ready && cmt0_priv_vec_i[`PRIV_CACOP] && !sb_empty_i;
 wire cmt1_cacop_block = cmt1_ready && cmt1_priv_vec_i[`PRIV_CACOP] && !sb_empty_i;
-wire cmt0_store_block = cmt0_ready && cmt0_is_store_i && sb_full_i && !cmt0_has_excp;
-wire cmt1_store_block = cmt1_ready && cmt1_is_store_i && sb_full_i && !cmt1_has_excp;
+// store 提交入 SB：SB 满时该 store 槽不能提交；单写口时槽1 与槽0 双 store 串行
+wire cmt0_store_push = cmt0_ready && cmt0_is_store_i && !cmt0_has_excp;
+wire cmt1_store_push = cmt1_ready && cmt1_is_store_i && !cmt1_has_excp;
+wire cmt0_store_block = cmt0_store_push && sb_full_i;
+wire cmt1_store_block = cmt1_store_push && (sb_full_i || (cmt0_effect && cmt0_is_store_i));
 
 wire cmt0_mispred = cmt0_ready && !cmt0_has_excp && !cmt0_has_priv &&
                     ((cmt0_br_taken_i != cmt0_pred_taken_i) ||
@@ -384,9 +387,9 @@ wire cmt0_taken_br = cmt0_effect && cmt0_is_branch_i && cmt0_br_taken_i && !cmt0
 
 // cmt1_br_hard：CALL/RET、跨块分支、或误预测；cmt1_mispred：含脏预测（非分支 pred）
 // cmt0_is_branch：同拍双分支仍禁（单 FTQ 训练口）
+// 双 store：SB 单写口，槽1 经 cmt1_store_block 串行
 wire cmt1_single_limit = cmt1_has_excp || cmt1_has_priv || cmt1_br_hard || cmt1_mispred ||
-                         cmt0_is_branch_i ||
-                         (cmt0_is_store_i && cmt1_is_store_i) || cmt0_taken_br;
+                         cmt0_is_branch_i || cmt0_taken_br;
 wire cmt1_dual_effect = cmt0_effect && !cmt0_flush && cmt1_ready &&
                         !cmt1_single_limit && !cmt1_store_block &&
                         !cmt1_ibar_block && !cmt1_cacop_block;
@@ -453,18 +456,15 @@ assign rat_cmt_en1_o = arf_we1_o;
 assign rat_cmt_addr1_o = cmt1_rd_i;
 assign rat_cmt_num1_o = cmt1_robid;
 
-// 单 SB 入队口：优先槽0 store；槽1 store 在「本拍槽0 不是 store」时入队。
-// 旧式 `!cmt0_effect && cmt1_effect && store` 会丢掉双提交里的 (非store, store)：
-// 槽1 已退休却未入 SB，后续 load 读到旧值 0（func_lab19 n14_ld_w）。
-// 双 store 仍由 cmt1_single_limit 串行化，避免同拍丢槽1。
-wire sb_push_from0 = cmt0_effect && cmt0_is_store_i;
-wire sb_push_from1 = cmt1_effect && cmt1_is_store_i && !sb_push_from0;
-assign sb_push_valid_o = sb_push_from0 || sb_push_from1;
-assign sb_push_paddr_o = sb_push_from0 ? cmt0_paddr_i : cmt1_paddr_i;
-assign sb_push_data_o = sb_push_from0 ? cmt0_result_i : cmt1_result_i;
-assign sb_push_wstrb_o = sb_push_from0 ? cmt0_wstrb_i : cmt1_wstrb_i;
-assign sb_push_size_o = sb_push_from0 ? cmt0_size_i : cmt1_size_i;
-assign sb_push_uncached_o = sb_push_from0 ? cmt0_uncached_i : cmt1_uncached_i;
+// SB：提交 store 入队（单写口；槽0 优先）
+wire cmt0_sb_push = cmt0_effect && cmt0_is_store_i;
+wire cmt1_sb_push = cmt1_effect && cmt1_is_store_i && !cmt0_sb_push;
+assign sb_push_valid_o    = cmt0_sb_push || cmt1_sb_push;
+assign sb_push_paddr_o    = cmt0_sb_push ? cmt0_paddr_i    : cmt1_paddr_i;
+assign sb_push_data_o     = cmt0_sb_push ? cmt0_result_i   : cmt1_result_i;
+assign sb_push_wstrb_o    = cmt0_sb_push ? cmt0_wstrb_i    : cmt1_wstrb_i;
+assign sb_push_size_o     = cmt0_sb_push ? cmt0_size_i     : cmt1_size_i;
+assign sb_push_uncached_o = cmt0_sb_push ? cmt0_uncached_i : cmt1_uncached_i;
 
 assign csr_cmt_valid_o = cmt0_retire || cmt1_retire;
 assign csr_cmt_pc_o = csr_sel_pc;

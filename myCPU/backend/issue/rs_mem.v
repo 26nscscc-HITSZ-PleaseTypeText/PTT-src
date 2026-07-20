@@ -134,7 +134,7 @@ wire            s1_earlyhit [0:`RS_MEM_SIZE-1];
 wire [31:0]     s0_wbdat [0:`RS_MEM_SIZE-1];
 wire [31:0]     s1_wbdat [0:`RS_MEM_SIZE-1];
 wire            entry_ready [0:`RS_MEM_SIZE-1];
-wire            is_ord_barrier [0:`RS_MEM_SIZE-1];
+wire            is_ord_barrier [0:`RS_MEM_SIZE-1]; // store/ll/sc/cacop：不可被越过
 genvar gw;
 generate
 for (gw = 0; gw < `RS_MEM_SIZE; gw = gw + 1) begin : g_wake
@@ -324,7 +324,7 @@ always @(posedge clk) begin
     end
 end
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 reg [63:0] rsm_full_stall_cyc;
 reg [63:0] rsm_src_stall_cyc;

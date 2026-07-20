@@ -14,17 +14,21 @@
 // - 前端 FSM：一次锁存一个请求（store(SB) > load(LSU) > cacop 暂存），
 //   IDLE 接受拍发 BRAM 读，LOOKUP 拍比对出结果——命中 load 两拍返回、
 //   命中 store 两拍完成（合并写回阵列）；
-// - 后台 MSHR（1 项，原 TODO 第四步·二期非阻塞 miss）：
+// - 后台 MSHR（`DC_MSHR_DEPTH` 项，原 TODO 第四步·二期非阻塞 miss）：
 //   * cached miss（load/store 皆可）分配进 MSHR 后【前端立即空闲】，
 //     后续命中请求不受 miss 阻塞（hit-under-miss；配合 LSU 的 miss 槽）；
 //   * load miss：LOOKUP 拍以 ld_miss_o 通知 LSU 移入 miss 槽，refill 数据
-//     经 ld_mshr_data_ok_o/ld_mshr_rdata_o 独立通道返回一次；
+//     经 ld_mshr_data_ok_o/ld_mshr_rdata_o/ld_mshr_robid_o 独立通道返回；
 //   * store miss：分配拍即回 st_done（posted，写效果由 MSHR 合并进重填行
 //     保证落地），SB 立即排空下一条——隐藏 store miss 延迟；
-//   * MSHR 在飞期间【同 index 的新请求】或第二 miss：优先挂到 1 项 pending
-//     缓冲并立刻回 IDLE，从而继续 hit-under-miss；pending 在 MSHR/写回空闲
+//   * 同行 store 撞在飞 MSHR（同 paddr[31:5]）：合入该槽 byte enable，posted
+//     st_done，不占 pend——消除 mem_stream 类 ld→st 同行走 set_conf；
+//   * MSHR 在飞期间【同 index 不同行】或 MSHR 已满：优先挂到 1 项 pending
+//     缓冲并立刻回 IDLE，从而继续 hit-under-miss；pending 在有空槽/写回空闲
 //     后经 RELOOK 完成（同组冲突在重填落地后常变命中）。pending 已占用且再
 //     撞冲突才退回 S_MWAIT（少见）；
+//   * load/store miss 均可占满 N_MSHR；LSU 用 robid 配对多 miss 槽返回；
+//   * AXI 读通道单 outstanding：owner 轮转服务各 MSHR 的 RREQ/RDATA；
 // - 写回缓冲（1 项，原 TODO 第三步·写回与重填并行）：
 //   脏 victim 在分配 MSHR 的同拍搬进写回缓冲，refill 读【立即发起】，
 //   写回走独立写通道后台排空——dirty miss 不再串行"先写回后重填"；
@@ -44,14 +48,15 @@
 //   L2 写穿直达内存）再无效；
 // - op2(HIT_WB/Hit 写回无效)：按物理地址查命中，脏则写回再无效。
 //
-// 响应契约（取消语义，与 LSU 的 drop 机制配套）：
-// - 每个被接受（addr_ok）的 load 都【必定恰好产生一次响应】：
-//   命中/uncached -> ld_data_ok_o；miss -> ld_miss_o（其后恰好一次
-//   ld_mshr_data_ok_o）。本模块忽略 ld_cancel_i（一拍脉冲难与多状态
-//   在飞请求安全对齐），冲刷后的过期响应由 LSU 用 drop 标志配对丢弃
-//   ——契约无静默丢包，LSU 侧不会出现"等一个永不到来的响应"死锁；
-// - 被冲刷 load 的 miss 照常重填（行进 cache 大概率仍有用，无副作用；
-//   uncached load 由 LSU 保证只在 ROB 头发出，绝不会被冲刷）；
+// 响应契约（取消 / 冲刷）：
+// - 每个被接受（addr_ok）的 load 都【必定恰好产生一次前端响应】：
+//   命中/uncached -> ld_data_ok_o；miss -> ld_miss_o。冲刷后过期的前端
+//   响仍由 LSU d_drop 配对丢弃（契约无静默丢包，避免 d_drop 死锁）；
+// - ld_cancel_i（= LSU flush）：对在飞 load 源 MSHR 置 mshr_killed（记账）；
+//   **保留** mshr_ld_resp_pend 并仍发 ld_mshr_data_ok_o，由 LSU miss 槽
+//   m_drop 静默收槽（与「立即清槽 + 抑制 data_ok」解耦，消 orphan/错配）。
+//   冲刷后才分配的 load：sticky req_ld_killed → pend=0（LSU d_drop 不占槽）；
+// - uncached load 由 LSU 保证只在 ROB 头发出，正常不会被冲刷；
 // - store/cacop 已提交，本就不可取消。
 //
 // 端口：
@@ -70,14 +75,16 @@ module dcache (
     input  wire [31:0] ld_paddr_i,       // 物理地址（tag 比对）
     input  wire [2:0]  ld_size_i,        // 0=B 1=H 2=W（uncached 精确宽度）
     input  wire        ld_uncached_i,
+    input  wire [`ROB_W-1:0] ld_robid_i, // 随 ld_req：miss 时锁入 MSHR，返回配对
     output wire        ld_addr_ok_o,
     output wire        ld_data_ok_o,     // 命中/uncached 完成（快速通道）
     output wire [31:0] ld_rdata_o,
-    input  wire        ld_cancel_i,      // 冲刷取消在途 load（uncached 例外）
+    input  wire        ld_cancel_i,      // 冲刷：杀在飞 load MSHR / 抑制 mshr_data_ok
     // ---- 非阻塞 miss 扩展（配合 LSU miss 槽）----
     output wire        ld_miss_o,        // 本 load 已移入 MSHR（LOOKUP 拍一拍脉冲）
     output wire        ld_mshr_data_ok_o,// MSHR load 数据返回（一拍脉冲）
     output wire [31:0] ld_mshr_rdata_o,
+    output wire [`ROB_W-1:0] ld_mshr_robid_o, // 与 data_ok 同拍，供 LSU 配对
 
     // ---------------- store_buffer 写出口 ----------------
     input  wire        st_req_i,         // store 写请求（保持至 addr_ok）
@@ -131,27 +138,83 @@ localparam S_CAC_WB1  = 4'd9;
 
 reg [3:0] state;
 
-// ---------------- MSHR（后台 refill 引擎）----------------
+// ---------------- MSHR（后台 refill 引擎，参数化数组）----------------
+localparam N_MSHR  = `DC_MSHR_DEPTH;
+localparam MSHR_W  = (N_MSHR <= 1) ? 1 : $clog2(N_MSHR);
+
 localparam M_IDLE    = 2'd0;
 localparam M_RREQ    = 2'd1;
 localparam M_RDATA   = 2'd2;
 localparam M_INSTALL = 2'd3;
 
-reg [1:0]   mshr_state;
-reg         mshr_is_st;
-reg         mshr_ld_resp_pend;   // load 响应待发（CWF：发过即清）
-reg [31:0]  mshr_paddr;          // 含目标字偏移
-reg [1:0]   mshr_way;
-reg [31:0]  mshr_wdata;          // store miss 合并数据
-reg [3:0]   mshr_wstrb;
-reg [127:0] mshr_b0;
-reg [LINEW-1:0] mshr_line;       // 已合并 store 的完整行
+reg [1:0]       mshr_state        [0:N_MSHR-1];
+reg             mshr_is_st        [0:N_MSHR-1];
+reg             mshr_ld_resp_pend [0:N_MSHR-1]; // load 响应待发（CWF：发过即清）
+reg             mshr_killed       [0:N_MSHR-1]; // 冲刷记账；仍回 ld_mshr_data_ok（LSU m_drop）
+reg             mshr_from_ld      [0:N_MSHR-1]; // 曾为 load miss（merge 成 store 后仍粘住）
+reg [31:0]      mshr_paddr        [0:N_MSHR-1]; // 含目标字偏移
+reg [`ROB_W-1:0] mshr_robid       [0:N_MSHR-1]; // load miss 配对（store 可忽略）
+reg [1:0]       mshr_way          [0:N_MSHR-1];
+reg [31:0]      mshr_stb_line     [0:N_MSHR-1]; // 行内 byte enable（同行多字 store 合并）
+reg [127:0]     mshr_b0           [0:N_MSHR-1]; // AXI 首拍半行
+// 精简：原 dat_line + line 合并为一份——
+//   RREQ/RDATA 前半：存 store 叠层；beat1 后：存待安装整行
+reg [LINEW-1:0] mshr_line         [0:N_MSHR-1];
 
-wire mshr_busy = (mshr_state != M_IDLE);
-wire [IDXW-1:0] mshr_set = mshr_paddr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
-wire [TAGW-1:0] mshr_tag = mshr_paddr[31:IDXW+`CACHE_LINE_W];
-wire [2:0]      mshr_word = mshr_paddr[4:2];
+// 最低编号优先编码（N=1 时恒为 0）
+function automatic [MSHR_W-1:0] dc_mshr_prio_low;
+    input [N_MSHR-1:0] mask;
+    integer k;
+    reg found;
+    begin
+        dc_mshr_prio_low = {MSHR_W{1'b0}};
+        found = 1'b0;
+        for (k = 0; k < N_MSHR; k = k + 1) begin
+            if (mask[k] && !found) begin
+                dc_mshr_prio_low = k[MSHR_W-1:0];
+                found = 1'b1;
+            end
+        end
+    end
+endfunction
 
+wire [N_MSHR-1:0] mshr_busy_oh;
+wire [N_MSHR-1:0] mshr_rreq_oh;
+wire [N_MSHR-1:0] mshr_rdata_oh;
+wire [N_MSHR-1:0] mshr_install_oh;
+wire [N_MSHR-1:0] mshr_is_ld_oh;   // busy 且 load miss（!store）
+
+genvar gm;
+generate
+for (gm = 0; gm < N_MSHR; gm = gm + 1) begin : gen_mshr_status
+    assign mshr_busy_oh[gm]     = (mshr_state[gm] != M_IDLE);
+    assign mshr_rreq_oh[gm]     = (mshr_state[gm] == M_RREQ);
+    assign mshr_rdata_oh[gm]    = (mshr_state[gm] == M_RDATA);
+    assign mshr_install_oh[gm]  = (mshr_state[gm] == M_INSTALL);
+    assign mshr_is_ld_oh[gm]    = mshr_busy_oh[gm] && !mshr_is_st[gm];
+end
+endgenerate
+
+wire              mshr_any_busy     = |mshr_busy_oh;
+wire              mshr_has_free     = ~(&mshr_busy_oh);
+wire              mshr_any_install  = |mshr_install_oh;
+wire              mshr_any_load     = |mshr_is_ld_oh;  // 在飞 load miss 数（perf/调试）
+wire              mshr_rreq_vld      = |mshr_rreq_oh;
+wire              mshr_rdata_vld     = |mshr_rdata_oh;
+wire [MSHR_W-1:0] mshr_free_idx     = dc_mshr_prio_low(~mshr_busy_oh);
+wire [MSHR_W-1:0] mshr_rreq_idx     = dc_mshr_prio_low(mshr_rreq_oh);
+wire [MSHR_W-1:0] mshr_rdata_idx    = dc_mshr_prio_low(mshr_rdata_oh);
+wire [MSHR_W-1:0] mshr_install_idx  = dc_mshr_prio_low(mshr_install_oh);
+
+// 兼容旧单 MSHR 探针/统计
+wire mshr_busy = mshr_any_busy;
+
+// AXI 读通道 owner：同时只服务一个 MSHR（RREQ 受理 → RDATA 收完）
+reg                axi_mshr_hold;
+reg [MSHR_W-1:0]   axi_mshr_id;
+wire               axi_mshr_grant_vld = axi_mshr_hold || mshr_rreq_vld;
+wire [MSHR_W-1:0]  axi_mshr_grant     = axi_mshr_hold ? axi_mshr_id : mshr_rreq_idx;
+wire [31:0]        mshr_axi_paddr     = mshr_paddr[axi_mshr_grant];
 // ---------------- 写回缓冲（victim writeback，1 项）----------------
 localparam W_IDLE = 2'd0;
 localparam W_B0   = 2'd1;
@@ -184,10 +247,12 @@ reg        req_is_ld;
 reg        req_is_cacop;
 reg [1:0]  req_cacop_op;
 reg [31:0] req_paddr;
+reg [`ROB_W-1:0] req_robid;       // load：随请求锁存，miss 写入 MSHR
 reg [31:0] req_wdata;
 reg [3:0]  req_wstrb;
 reg [2:0]  req_size;
 reg        req_uncached;
+reg        req_ld_killed;         // 本前端 load 已被冲刷（sticky→MSHR.killed）
 
 // cacop 暂存（commit 一拍脉冲，FSM 忙时排队；commit 串行发起，深度 1 足够）
 reg        cacop_pend;
@@ -198,7 +263,9 @@ reg [31:0] cacop_pend_addr;
 reg        pend_valid;
 reg        pend_is_st;
 reg        pend_is_ld;
+reg        pend_ld_killed;        // pend 中的 load 已被冲刷
 reg [31:0] pend_paddr;
+reg [`ROB_W-1:0] pend_robid;
 reg [31:0] pend_wdata;
 reg [3:0]  pend_wstrb;
 reg [2:0]  pend_size;
@@ -246,10 +313,22 @@ wire [1:0]      cac_way = req_paddr[1:0];
 // MSHR 安装拍需要独占 RAM 口：安装等待期间暂停接受新请求（一拍气泡）
 // pending 可 drain 时优先恢复挂起请求（不接受新请求），否则在 pend 占用时仍可
 // 接受新请求以维持 hit-under-miss（再 miss/撞组才落 S_MWAIT）
-wire mshr_res_idle = !mshr_busy && wb_all_idle;
-wire pend_drain = (state == S_IDLE) && pend_valid && mshr_res_idle
-               && (mshr_state != M_INSTALL);
-wire accept_ok = (state == S_IDLE) && (mshr_state != M_INSTALL) && !pend_drain;
+wire mshr_res_idle = !mshr_any_busy && wb_all_idle;
+// pend 恢复：必须「有空槽」且「重查后大概率能前进」——
+// 同 set 仍冲突 / load 已占满 时禁止 drain，否则会 LOOKUP→pend 死循环（perf 上
+// pend_push 爆炸、IPC 变差）。
+wire [IDXW-1:0] pend_set = pend_paddr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
+wire [N_MSHR-1:0] pend_set_match;
+generate
+for (gm = 0; gm < N_MSHR; gm = gm + 1) begin : gen_pend_set_match
+    assign pend_set_match[gm] = mshr_busy_oh[gm]
+                             && (pend_set == mshr_paddr[gm][IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]);
+end
+endgenerate
+wire pend_can_progress = !(|pend_set_match) && mshr_has_free;
+wire pend_drain = (state == S_IDLE) && pend_valid && mshr_has_free && wb_all_idle
+               && !mshr_any_install && pend_can_progress;
+wire accept_ok = (state == S_IDLE) && !mshr_any_install && !pend_drain;
 wire cacop_take = accept_ok && cacop_pend;
 wire st_take    = accept_ok && !cacop_pend && st_req_i;
 wire ld_take    = accept_ok && !cacop_pend && !st_req_i && ld_req_i;
@@ -258,12 +337,32 @@ assign st_addr_ok_o = st_take;
 assign ld_addr_ok_o = ld_take;
 
 // ---------------- LOOKUP 拍分类 ----------------
-// 同 index 与在飞 MSHR 冲突：等待（防 victim 路互踩 / 丢失 store 更新；
-// 等待后重查多半直接命中刚安装的行）
+// 同 index 与任一在飞 MSHR 冲突：默认等待（防 victim 路互踩）
+// 例外：同行 store 可合并进该 MSHR（降 pend），见 lk_st_merge
+wire [N_MSHR-1:0] mshr_set_match;
+wire [N_MSHR-1:0] mshr_line_match;
+wire [N_MSHR-1:0] mshr_mergeable; // RREQ/RDATA/INSTALL 可合 store
+generate
+for (gm = 0; gm < N_MSHR; gm = gm + 1) begin : gen_mshr_set_match
+    assign mshr_set_match[gm] = mshr_busy_oh[gm]
+                              && (req_set == mshr_paddr[gm][IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]);
+    assign mshr_line_match[gm] = mshr_busy_oh[gm]
+                              && (req_paddr[31:`CACHE_LINE_W] == mshr_paddr[gm][31:`CACHE_LINE_W]);
+    assign mshr_mergeable[gm] = mshr_line_match[gm]
+                             && ((mshr_state[gm] == M_RREQ)
+                              || (mshr_state[gm] == M_RDATA)
+                              || (mshr_state[gm] == M_INSTALL));
+end
+endgenerate
+wire        lk_st_merge = (state == S_LOOKUP) && req_is_st && !req_is_cacop && !req_uncached
+                       && (|mshr_mergeable);
+wire [MSHR_W-1:0] mshr_merge_idx = dc_mshr_prio_low(mshr_mergeable);
+wire [31:0] req_stb_line = {{28{1'b0}}, req_wstrb} << (req_word * 4);
+
 wire lk_set_conf  = (state == S_LOOKUP) && !req_is_cacop && !req_uncached
-                 && mshr_busy && (req_set == mshr_set);
+                 && (|mshr_set_match) && !lk_st_merge;
 // cacop 需引擎全静默（MSHR 安装未落地前 tag 状态不完整，写回通道也要独占）
-wire lk_cacop_wait = (state == S_LOOKUP) && req_is_cacop && (mshr_busy || !wb_all_idle);
+wire lk_cacop_wait = (state == S_LOOKUP) && req_is_cacop && (mshr_any_busy || !wb_all_idle);
 
 wire lk_cached_ld = (state == S_LOOKUP) && req_is_ld && !req_is_cacop && !req_uncached;
 wire lk_cached_st = (state == S_LOOKUP) && req_is_st && !req_is_cacop && !req_uncached;
@@ -272,21 +371,24 @@ wire lk_uc_st     = (state == S_LOOKUP) && req_is_st && !req_is_cacop && req_unc
 wire lk_cacop     = (state == S_LOOKUP) && req_is_cacop && !lk_cacop_wait;
 
 wire lk_ld_hit  = lk_cached_ld && !lk_set_conf && hit_any;
-wire lk_st_hit  = lk_cached_st && !lk_set_conf && hit_any;
+wire lk_st_hit  = lk_cached_st && !lk_set_conf && !lk_st_merge && hit_any;
 wire lk_ld_miss = lk_cached_ld && !lk_set_conf && !hit_any;
-wire lk_st_miss = lk_cached_st && !lk_set_conf && !hit_any;
+wire lk_st_miss = lk_cached_st && !lk_set_conf && !lk_st_merge && !hit_any;
 
-// miss 分配条件：MSHR 空闲 +（脏 victim 需写回缓冲全空）
+// miss 分配：有空槽 +（脏 victim 需 WB 空）；load/store 均可占满 N_MSHR
+// （LSU miss 槽深度 = LSU_MISS_DEPTH = DC_MSHR_DEPTH，返回靠 robid 配对）
 wire miss_need_wb = pick_valid && pick_dirty;
-wire mshr_alloc_ok = !mshr_busy && (!miss_need_wb || wb_all_idle);
-wire lk_ld_alloc = lk_ld_miss && mshr_alloc_ok;
-wire lk_st_alloc = lk_st_miss && mshr_alloc_ok;
+wire mshr_alloc_base = mshr_has_free && (!miss_need_wb || wb_all_idle);
+wire mshr_alloc_ok = mshr_alloc_base;
+wire lk_ld_alloc = lk_ld_miss && mshr_alloc_base;
+wire lk_st_alloc = lk_st_miss && mshr_alloc_base;
 
 // uncached 进入条件：独占读/写通道（MSHR 与写回缓冲全空，保守串行——
 // uncached 本身就是强序访问，性能无关紧要）
-wire lk_uc_ok = !mshr_busy && wb_all_idle;
+wire lk_uc_ok = !mshr_any_busy && wb_all_idle;
 
 // cached 资源冲突：可挂 pending（释放前端）；pend 已占用则被迫 MWAIT
+// 同行 store 合并不进 block
 wire lk_cache_block = lk_set_conf
                    || ((lk_ld_miss || lk_st_miss) && !mshr_alloc_ok);
 wire lk_to_pend = lk_cache_block && !pend_valid;
@@ -307,58 +409,98 @@ always @(*) begin
         (data_out[hit_way][32*req_word +: 32] & ~st_word_strb) | (req_wdata & st_word_strb);
 end
 
-// ---------------- MSHR 重填数据通路 ----------------
-wire [LINEW-1:0] refill_line_raw = {axi_ret_data, mshr_b0};
-wire [31:0] mshr_strb32 = { {8{mshr_wstrb[3]}}, {8{mshr_wstrb[2]}},
-                            {8{mshr_wstrb[1]}}, {8{mshr_wstrb[0]}} };
+// ---------------- MSHR 重填数据通路（归属 AXI owner）----------------
+wire [127:0] mshr_rf_b0    = mshr_b0[axi_mshr_grant];
+wire [2:0]   mshr_rf_word  = mshr_paddr[axi_mshr_grant][4:2];
+wire         mshr_rf_ld_resp = mshr_ld_resp_pend[axi_mshr_grant];
+wire         mshr_owner_rdata = axi_mshr_grant_vld
+                             && (mshr_state[axi_mshr_grant] == M_RDATA);
+
+wire [LINEW-1:0] refill_line_raw = {axi_ret_data, mshr_rf_b0};
+// 行级 store 叠层：含同拍 lk_st_merge→本 MSHR（避免 NBA 晚一拍丢合并）
+wire        refill_merge_now = lk_st_merge && (mshr_merge_idx == axi_mshr_grant);
+wire [31:0] refill_stb_eff   = mshr_stb_line[axi_mshr_grant]
+                             | (refill_merge_now ? req_stb_line : 32'b0);
+reg [LINEW-1:0] refill_dat_eff;
+reg [LINEW-1:0] refill_stb_exp;
 reg [LINEW-1:0] refill_line_merged;
+integer rb;
 always @(*) begin
-    refill_line_merged = refill_line_raw;
-    if (mshr_is_st)
-        refill_line_merged[32*mshr_word +: 32] =
-            (refill_line_raw[32*mshr_word +: 32] & ~mshr_strb32) | (mshr_wdata & mshr_strb32);
+    // beat1 前 mshr_line 即 store 叠层（原 dat_line）
+    refill_dat_eff = mshr_line[axi_mshr_grant];
+    if (refill_merge_now) begin
+        refill_dat_eff[32*req_word +: 32] =
+            (refill_dat_eff[32*req_word +: 32] & ~st_word_strb) | (req_wdata & st_word_strb);
+    end
+    for (rb = 0; rb < 32; rb = rb + 1)
+        refill_stb_exp[8*rb +: 8] = {8{refill_stb_eff[rb]}};
+    refill_line_merged = (refill_line_raw & ~refill_stb_exp) | (refill_dat_eff & refill_stb_exp);
 end
 
-// MSHR 数据接收（读通道归属：M_RDATA 期间返回都属 MSHR）
-wire mshr_beat  = (mshr_state == M_RDATA) && axi_ret_valid;
+// MSHR 数据接收：仅 AXI owner 处于 M_RDATA 时吃返回
+wire mshr_beat  = mshr_owner_rdata && axi_ret_valid;
 wire mshr_beat0 = mshr_beat && !axi_ret_last;
 wire mshr_beat1 = mshr_beat &&  axi_ret_last;
 
-// CWF-lite：目标字所在半行一到即回数（load）
-wire [31:0] beat_word = axi_ret_data[32*mshr_word[1:0] +: 32];
-assign ld_mshr_data_ok_o = mshr_ld_resp_pend
-                        && ((mshr_beat0 && !mshr_word[2])    // 低半行（word0~3）
-                         || (mshr_beat1 &&  mshr_word[2]));  // 高半行（word4~7）
+// CWF-lite：目标字半行一到即回数。killed/cancel **不**抑制 data_ok：
+// LSU 用 miss 槽 m_drop 丢弃冲刷后的返回，保证槽可回收。
+wire [31:0] beat_word = axi_ret_data[32*mshr_rf_word[1:0] +: 32];
+wire        mshr_rf_killed = mshr_killed[axi_mshr_grant];
+assign ld_mshr_data_ok_o = mshr_rf_ld_resp
+                        && ((mshr_beat0 && !mshr_rf_word[2])
+                         || (mshr_beat1 &&  mshr_rf_word[2]));
 assign ld_mshr_rdata_o   = beat_word;
+assign ld_mshr_robid_o   = mshr_robid[axi_mshr_grant];
 
-// MSHR 安装拍：需要 RAM 口空闲（接受已被 accept_ok 拦下；LOOKUP 拍的
-// store 命中写 / RELOOK 拍的重发读占用时顺延一拍）
+// MSHR 安装拍：同一拍最多装 1 项（单口 BRAM）
 wire front_ram_busy = (st_take | ld_take | cacop_take)
                    || (state == S_RELOOK)
                    || lk_st_hit;
-wire mshr_install_fire = (mshr_state == M_INSTALL) && !front_ram_busy;
-
+wire [N_MSHR-1:0] mshr_install_fire_oh;
+generate
+for (gm = 0; gm < N_MSHR; gm = gm + 1) begin : gen_mshr_install_fire
+    assign mshr_install_fire_oh[gm] =
+        mshr_install_oh[gm] && !front_ram_busy
+     && (mshr_install_idx == gm[MSHR_W-1:0]);
+end
+endgenerate
+wire mshr_install_fire = |mshr_install_fire_oh;
+wire [1:0]      mshr_inst_way = mshr_way[mshr_install_idx];
+wire [IDXW-1:0] mshr_inst_set = mshr_paddr[mshr_install_idx][IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
+wire [TAGW-1:0] mshr_inst_tag = mshr_paddr[mshr_install_idx][31:IDXW+`CACHE_LINE_W];
+// 安装同拍合入 store：组合叠层，避免 NBA 晚一拍丢写
+wire            install_merge_now = lk_st_merge
+                                 && (mshr_merge_idx == mshr_install_idx)
+                                 && mshr_install_oh[mshr_install_idx];
+wire            mshr_inst_is_st = mshr_is_st[mshr_install_idx] | install_merge_now;
+reg [LINEW-1:0] mshr_inst_line;
+always @(*) begin
+    mshr_inst_line = mshr_line[mshr_install_idx];
+    if (install_merge_now)
+        mshr_inst_line[32*req_word +: 32] =
+            (mshr_inst_line[32*req_word +: 32] & ~st_word_strb) | (req_wdata & st_word_strb);
+end
 // ---------------- 响应输出 ----------------
 assign ld_data_ok_o = lk_ld_hit | (state == S_UC_RESP);
 assign ld_rdata_o   = (state == S_UC_RESP) ? uc_rdata : hit_word;
 assign ld_miss_o    = lk_ld_alloc;
 
-// store：命中两拍完成；miss 分配拍 posted 完成；uncached 等下层
-assign st_done_o    = lk_st_hit | lk_st_alloc
+// store：命中 / miss 分配 posted / 同行合入在飞 MSHR posted；uncached 等下层
+assign st_done_o    = lk_st_hit | lk_st_alloc | lk_st_merge
                     | ((state == S_UC_WREQ) && axi_wr_rdy);
 
-// ---------------- 下层读通道（MSHR 与 uncached 互斥使用）----------------
-// 同行写读序保护：写回缓冲还压着与 refill 同一行的写（此前该行被换出、
-// 现在又立刻 miss 回来）时，refill 读必须等它先被 L2 收下——否则读会
-// 越过在途写拿到内存里的陈旧行。不同行的写回照常与 refill 并行（本优化
-// 的收益主体）。
-wire mshr_rd_same_line_blk = (wb_valid || (wb_state != W_IDLE))
-                          && (wb_addr[31:`CACHE_LINE_W] == mshr_paddr[31:`CACHE_LINE_W]);
-assign axi_rd_req  = ((mshr_state == M_RREQ) && !mshr_rd_same_line_blk)
+// ---------------- 下层读通道（MSHR owner 与 uncached 互斥）----------------
+// 同行写读序保护：写回缓冲还压着与 refill 同一行的写时，refill 读必须等待。
+wire mshr_owner_rreq = axi_mshr_grant_vld
+                    && (mshr_state[axi_mshr_grant] == M_RREQ);
+wire mshr_rd_same_line_blk = mshr_owner_rreq
+                          && (wb_valid || (wb_state != W_IDLE))
+                          && (wb_addr[31:`CACHE_LINE_W] == mshr_axi_paddr[31:`CACHE_LINE_W]);
+assign axi_rd_req  = (mshr_owner_rreq && !mshr_rd_same_line_blk)
                    || (state == S_UC_RREQ);
-assign axi_rd_type = (mshr_state == M_RREQ) ? 3'b100 : req_size;
-assign axi_rd_addr = (mshr_state == M_RREQ) ? {mshr_paddr[31:`CACHE_LINE_W], {`CACHE_LINE_W{1'b0}}}
-                                            : req_paddr;
+assign axi_rd_type = mshr_owner_rreq ? 3'b100 : req_size;
+assign axi_rd_addr = mshr_owner_rreq ? {mshr_axi_paddr[31:`CACHE_LINE_W], {`CACHE_LINE_W{1'b0}}}
+                                     : req_paddr;
 
 // ---------------- 下层写通道（写回缓冲 / cacop 写回 / uncached 写 互斥）----------------
 assign axi_wr_req  = (wb_state == W_B0) || (wb_state == W_B1)
@@ -394,9 +536,9 @@ always @(*) begin
         ram_addr        = req_set;
         ram_wline       = st_merge_line;
     end else if (mshr_install_fire) begin
-        ram_we[mshr_way] = 1'b1;
-        ram_addr         = mshr_set;
-        ram_wline        = mshr_line;
+        ram_we[mshr_inst_way] = 1'b1;
+        ram_addr              = mshr_inst_set;
+        ram_wline             = mshr_inst_line;
     end else if (state == S_RELOOK) begin
         ram_re   = 1'b1;
         ram_addr = req_set;
@@ -424,9 +566,11 @@ endgenerate
 integer s;
 always @(posedge clk) begin
     if (!resetn) begin
-        state      <= S_IDLE;
-        cacop_pend <= 1'b0;
-        pend_valid <= 1'b0;
+        state          <= S_IDLE;
+        cacop_pend     <= 1'b0;
+        pend_valid     <= 1'b0;
+        pend_ld_killed <= 1'b0;
+        req_ld_killed  <= 1'b0;
         for (s = 0; s < NWAY; s = s + 1) begin
             valid_arr[s] <= {NSET{1'b0}};
             dirty_arr[s] <= {NSET{1'b0}};
@@ -439,54 +583,69 @@ always @(posedge clk) begin
             cacop_pend_addr <= cacop_addr_i;
         end
 
+        // 冲刷：sticky 标记在飞 / pend load（MSHR.killed 在 MSHR 块内同步）
+        if (ld_cancel_i) begin
+            if (req_is_ld && (state != S_IDLE))
+                req_ld_killed <= 1'b1;
+            if (pend_valid && pend_is_ld)
+                pend_ld_killed <= 1'b1;
+        end
+
         // MSHR 安装：更新 tag/valid/dirty（数据 RAM 写在组合块）
         if (mshr_install_fire) begin
-            tag_arr[mshr_way][mshr_set]   <= mshr_tag;
-            valid_arr[mshr_way][mshr_set] <= 1'b1;
-            dirty_arr[mshr_way][mshr_set] <= mshr_is_st;
+            tag_arr[mshr_inst_way][mshr_inst_set]   <= mshr_inst_tag;
+            valid_arr[mshr_inst_way][mshr_inst_set] <= 1'b1;
+            dirty_arr[mshr_inst_way][mshr_inst_set] <= mshr_inst_is_st;
         end
 
         case (state)
             S_IDLE: begin
                 if (pend_drain) begin
                     // 恢复挂起请求，重查（可能已因 refill 变命中）
-                    req_is_cacop <= 1'b0;
-                    req_is_st    <= pend_is_st;
-                    req_is_ld    <= pend_is_ld;
-                    req_paddr    <= pend_paddr;
-                    req_wdata    <= pend_wdata;
-                    req_wstrb    <= pend_wstrb;
-                    req_size     <= pend_size;
-                    req_uncached <= pend_uncached;
-                    pend_valid   <= 1'b0;
-                    state        <= S_RELOOK;
+                    req_is_cacop  <= 1'b0;
+                    req_is_st     <= pend_is_st;
+                    req_is_ld     <= pend_is_ld;
+                    req_ld_killed <= pend_ld_killed;
+                    req_paddr     <= pend_paddr;
+                    req_robid     <= pend_robid;
+                    req_wdata     <= pend_wdata;
+                    req_wstrb     <= pend_wstrb;
+                    req_size      <= pend_size;
+                    req_uncached  <= pend_uncached;
+                    pend_valid    <= 1'b0;
+                    pend_ld_killed<= 1'b0;
+                    state         <= S_RELOOK;
                 end else if (cacop_take) begin
-                    req_is_cacop <= 1'b1;
-                    req_is_st    <= 1'b0;
-                    req_is_ld    <= 1'b0;
-                    req_uncached <= 1'b0;
-                    req_cacop_op <= cacop_pend_op;
-                    req_paddr    <= cacop_pend_addr;
-                    cacop_pend   <= 1'b0;
-                    state        <= S_LOOKUP;
+                    req_is_cacop  <= 1'b1;
+                    req_is_st     <= 1'b0;
+                    req_is_ld     <= 1'b0;
+                    req_ld_killed <= 1'b0;
+                    req_uncached  <= 1'b0;
+                    req_cacop_op  <= cacop_pend_op;
+                    req_paddr     <= cacop_pend_addr;
+                    cacop_pend    <= 1'b0;
+                    state         <= S_LOOKUP;
                 end else if (st_take) begin
-                    req_is_cacop <= 1'b0;
-                    req_is_st    <= 1'b1;
-                    req_is_ld    <= 1'b0;
-                    req_paddr    <= st_paddr_i;
-                    req_wdata    <= st_data_i;
-                    req_wstrb    <= st_strb_i;
-                    req_size     <= st_size_i;
-                    req_uncached <= st_uncached_i;
-                    state        <= S_LOOKUP;
+                    req_is_cacop  <= 1'b0;
+                    req_is_st     <= 1'b1;
+                    req_is_ld     <= 1'b0;
+                    req_ld_killed <= 1'b0;
+                    req_paddr     <= st_paddr_i;
+                    req_wdata     <= st_data_i;
+                    req_wstrb     <= st_strb_i;
+                    req_size      <= st_size_i;
+                    req_uncached  <= st_uncached_i;
+                    state         <= S_LOOKUP;
                 end else if (ld_take) begin
-                    req_is_cacop <= 1'b0;
-                    req_is_st    <= 1'b0;
-                    req_is_ld    <= 1'b1;
-                    req_paddr    <= ld_paddr_i;
-                    req_size     <= ld_size_i;
-                    req_uncached <= ld_uncached_i;
-                    state        <= S_LOOKUP;
+                    req_is_cacop  <= 1'b0;
+                    req_is_st     <= 1'b0;
+                    req_is_ld     <= 1'b1;
+                    req_ld_killed <= ld_cancel_i; // 同拍冲刷：直接 killed
+                    req_paddr     <= ld_paddr_i;
+                    req_robid     <= ld_robid_i;
+                    req_size      <= ld_size_i;
+                    req_uncached  <= ld_uncached_i;
+                    state         <= S_LOOKUP;
                 end
             end
 
@@ -494,15 +653,18 @@ always @(posedge clk) begin
                 if (lk_cacop_wait) begin
                     state <= S_MWAIT;
                 end else if (lk_to_pend) begin
-                    pend_valid    <= 1'b1;
-                    pend_is_st    <= req_is_st;
-                    pend_is_ld    <= req_is_ld;
-                    pend_paddr    <= req_paddr;
-                    pend_wdata    <= req_wdata;
-                    pend_wstrb    <= req_wstrb;
-                    pend_size     <= req_size;
-                    pend_uncached <= req_uncached;
-                    state         <= S_IDLE;
+                    pend_valid     <= 1'b1;
+                    pend_is_st     <= req_is_st;
+                    pend_is_ld     <= req_is_ld;
+                    pend_ld_killed <= req_is_ld && (req_ld_killed || ld_cancel_i);
+                    pend_paddr     <= req_paddr;
+                    pend_robid     <= req_robid;
+                    pend_wdata     <= req_wdata;
+                    pend_wstrb     <= req_wstrb;
+                    pend_size      <= req_size;
+                    pend_uncached  <= req_uncached;
+                    req_ld_killed  <= 1'b0;
+                    state          <= S_IDLE;
                 end else if (lk_to_mwait_cache) begin
                     state <= S_MWAIT;
                 end else if (lk_cacop) begin
@@ -550,14 +712,20 @@ always @(posedge clk) begin
                     state <= lk_uc_ok ? S_UC_RREQ : S_MWAIT;
                 end else if (lk_uc_st) begin
                     state <= lk_uc_ok ? S_UC_WREQ : S_MWAIT;
+                end else if (lk_st_merge) begin
+                    // 同行 store 合入在飞 MSHR：posted st_done，前端回 IDLE
+                    req_ld_killed <= 1'b0;
+                    state <= S_IDLE;
                 end else if (hit_any) begin
                     // 命中：load 出数 / store 合并写（组合块），本拍完成
                     if (req_is_st) dirty_arr[hit_way][req_set] <= 1'b1;
+                    req_ld_killed <= 1'b0;
                     state <= S_IDLE;
                 end else if (mshr_alloc_ok) begin
                     // miss：分配 MSHR（脏 victim 同拍进写回缓冲，见排空引擎块），
                     // 前端即空闲；ld_miss_o / st_done_o(posted) 在本拍组合给出
                     rr_ptr[req_set] <= rr_ptr[req_set] + 2'd1;
+                    req_ld_killed <= 1'b0;
                     state <= S_IDLE;
                 end else begin
                     // 兜底（理论上 lk_* 已覆盖 cached block）
@@ -567,7 +735,7 @@ always @(posedge clk) begin
 
             S_MWAIT: begin
                 // uncached / 双重 pending / cacop：等资源后重查
-                if (!mshr_busy && wb_all_idle) begin
+                if (!mshr_any_busy && wb_all_idle) begin
                     state <= S_RELOOK;
                 end
             end
@@ -582,7 +750,10 @@ always @(posedge clk) begin
                     state    <= S_UC_RESP;
                 end
             end
-            S_UC_RESP: state <= S_IDLE;
+            S_UC_RESP: begin
+                req_ld_killed <= 1'b0;
+                state <= S_IDLE;
+            end
 
             S_UC_WREQ: if (axi_wr_rdy) state <= S_IDLE;
 
@@ -594,47 +765,119 @@ always @(posedge clk) begin
     end
 end
 
-// ---------------- MSHR 引擎 ----------------
+// ---------------- MSHR 引擎 + AXI owner ----------------
 wire mshr_alloc = lk_ld_alloc | lk_st_alloc;
 
+integer mi;
 always @(posedge clk) begin
     if (!resetn) begin
-        mshr_state        <= M_IDLE;
-        mshr_ld_resp_pend <= 1'b0;
-        mshr_is_st        <= 1'b0;
-        mshr_paddr        <= 32'b0;
-        mshr_way          <= 2'b0;
-        mshr_wdata        <= 32'b0;
-        mshr_wstrb        <= 4'b0;
+        axi_mshr_hold <= 1'b0;
+        axi_mshr_id   <= {MSHR_W{1'b0}};
+        for (mi = 0; mi < N_MSHR; mi = mi + 1) begin
+            mshr_state[mi]        <= M_IDLE;
+            mshr_ld_resp_pend[mi] <= 1'b0;
+            mshr_killed[mi]       <= 1'b0;
+            mshr_from_ld[mi]      <= 1'b0;
+            mshr_is_st[mi]        <= 1'b0;
+            mshr_paddr[mi]        <= 32'b0;
+            mshr_robid[mi]        <= {`ROB_W{1'b0}};
+            mshr_way[mi]          <= 2'b0;
+            mshr_stb_line[mi]     <= 32'b0;
+            mshr_line[mi]         <= {LINEW{1'b0}};
+        end
     end else begin
-        case (mshr_state)
-            M_IDLE: begin
-                if (mshr_alloc) begin
-                    mshr_is_st        <= req_is_st;
-                    mshr_ld_resp_pend <= req_is_ld;   // load 需回一次数据
-                    mshr_paddr        <= req_paddr;
-                    mshr_way          <= pick_way;
-                    mshr_wdata        <= req_wdata;
-                    mshr_wstrb        <= req_wstrb;
-                    mshr_state        <= M_RREQ;
+        // 冲刷：标记 killed；保留 ld_resp_pend，仍回 data_ok 供 LSU drop 收槽
+        if (ld_cancel_i) begin
+            for (mi = 0; mi < N_MSHR; mi = mi + 1) begin
+                if (mshr_busy_oh[mi] && (mshr_from_ld[mi] || !mshr_is_st[mi] || mshr_ld_resp_pend[mi])) begin
+                    mshr_killed[mi] <= 1'b1;
                 end
             end
-            M_RREQ: if (axi_rd_rdy) mshr_state <= M_RDATA;
-            M_RDATA: begin
-                if (ld_mshr_data_ok_o) mshr_ld_resp_pend <= 1'b0;
-                if (mshr_beat0) begin
-                    mshr_b0 <= axi_ret_data;
+        end
+
+        // AXI owner：受理 RREQ 时锁定，RDATA 末拍释放
+        if (axi_mshr_hold) begin
+            if ((mshr_state[axi_mshr_id] == M_RDATA) && mshr_beat1)
+                axi_mshr_hold <= 1'b0;
+            else if (mshr_state[axi_mshr_id] == M_IDLE)
+                axi_mshr_hold <= 1'b0;
+        end else if (mshr_owner_rreq && axi_rd_rdy && !mshr_rd_same_line_blk) begin
+            axi_mshr_hold <= 1'b1;
+            axi_mshr_id   <= axi_mshr_grant;
+        end
+
+        for (mi = 0; mi < N_MSHR; mi = mi + 1) begin
+            case (mshr_state[mi])
+                M_IDLE: begin
+                    if (mshr_alloc && (mshr_free_idx == mi[MSHR_W-1:0])) begin
+                        mshr_is_st[mi]        <= req_is_st;
+                        mshr_from_ld[mi]      <= req_is_ld;
+                        mshr_killed[mi]       <= req_is_ld && (req_ld_killed || ld_cancel_i);
+                        mshr_ld_resp_pend[mi] <= req_is_ld && !(req_ld_killed || ld_cancel_i);
+                        mshr_paddr[mi]        <= req_paddr;
+                        mshr_robid[mi]        <= req_robid;
+                        mshr_way[mi]          <= pick_way;
+                        if (req_is_st) begin
+                            mshr_stb_line[mi] <= req_stb_line;
+                            // beat1 前 line 作 store 叠层
+                            mshr_line[mi]     <= {{(LINEW-32){1'b0}}, req_wdata} << (req_word * 32);
+                        end else begin
+                            mshr_stb_line[mi] <= 32'b0;
+                            mshr_line[mi]     <= {LINEW{1'b0}};
+                        end
+                        mshr_state[mi]        <= M_RREQ;
+                    end
                 end
-                if (mshr_beat1) begin
-                    mshr_line  <= refill_line_merged;
-                    mshr_state <= M_INSTALL;
+                M_RREQ: begin
+                    if (axi_rd_rdy && !mshr_rd_same_line_blk
+                     && axi_mshr_grant_vld
+                     && (axi_mshr_grant == mi[MSHR_W-1:0]))
+                        mshr_state[mi] <= M_RDATA;
+                    if (lk_st_merge && (mshr_merge_idx == mi[MSHR_W-1:0])) begin
+                        mshr_is_st[mi]    <= 1'b1;
+                        mshr_stb_line[mi] <= mshr_stb_line[mi] | req_stb_line;
+                        mshr_line[mi][32*req_word +: 32] <=
+                            (mshr_line[mi][32*req_word +: 32] & ~st_word_strb)
+                          | (req_wdata & st_word_strb);
+                    end
                 end
-            end
-            M_INSTALL: begin
-                if (mshr_install_fire) mshr_state <= M_IDLE;
-            end
-            default: mshr_state <= M_IDLE;
-        endcase
+                M_RDATA: begin
+                    if (ld_mshr_data_ok_o && (axi_mshr_grant == mi[MSHR_W-1:0]))
+                        mshr_ld_resp_pend[mi] <= 1'b0;
+                    if (mshr_beat0 && (axi_mshr_grant == mi[MSHR_W-1:0]))
+                        mshr_b0[mi] <= axi_ret_data;
+                    if (lk_st_merge && (mshr_merge_idx == mi[MSHR_W-1:0])) begin
+                        mshr_is_st[mi]    <= 1'b1;
+                        mshr_stb_line[mi] <= mshr_stb_line[mi] | req_stb_line;
+                        // beat1 同拍叠层已在 refill_line_merged；勿再写 overlay 覆盖整行
+                        if (!(mshr_beat1 && (axi_mshr_grant == mi[MSHR_W-1:0]))) begin
+                            mshr_line[mi][32*req_word +: 32] <=
+                                (mshr_line[mi][32*req_word +: 32] & ~st_word_strb)
+                              | (req_wdata & st_word_strb);
+                        end
+                    end
+                    if (mshr_beat1 && (axi_mshr_grant == mi[MSHR_W-1:0])) begin
+                        mshr_line[mi]  <= refill_line_merged;
+                        mshr_state[mi] <= M_INSTALL;
+                    end
+                end
+                M_INSTALL: begin
+                    if (lk_st_merge && (mshr_merge_idx == mi[MSHR_W-1:0])) begin
+                        mshr_is_st[mi]    <= 1'b1;
+                        mshr_stb_line[mi] <= mshr_stb_line[mi] | req_stb_line;
+                        mshr_line[mi][32*req_word +: 32] <=
+                            (mshr_line[mi][32*req_word +: 32] & ~st_word_strb)
+                          | (req_wdata & st_word_strb);
+                    end
+                    if (mshr_install_fire_oh[mi]) begin
+                        mshr_state[mi]   <= M_IDLE;
+                        mshr_killed[mi]  <= 1'b0;
+                        mshr_from_ld[mi] <= 1'b0;
+                    end
+                end
+                default: mshr_state[mi] <= M_IDLE;
+            endcase
+        end
     end
 end
 
@@ -677,9 +920,9 @@ initial begin
 end
 
 // lint 吸收（cancel 端口按契约忽略：响应由 LSU 配对丢弃；见头注）
-wire dcache_lint = (|ld_vaddr_i[4:0]) | (|ld_size_i) | ld_cancel_i;
+wire dcache_lint = (|ld_vaddr_i[4:0]) | (|ld_size_i) | ld_cancel_i | mshr_rf_killed;
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 // 仿真性能统计：cached LOOKUP（load+store）；set 冲突不算命中也不算访问完成
 reg [63:0] dc_access_total;

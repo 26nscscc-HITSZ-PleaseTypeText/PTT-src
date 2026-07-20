@@ -1,6 +1,13 @@
 `ifndef MYCPU_H
 `define MYCPU_H
 
+// chiplab 仿真 (-DSIMU) 打开 SYNTHESIS 探针/PERF；FPGA 综合工程勿定义 SYNTHESIS
+`ifdef SIMU
+`ifndef SYNTHESIS
+`define SYNTHESIS
+`endif
+`endif
+
 `timescale 1ns / 1ps
 
 /* ============================================================
@@ -66,7 +73,10 @@
 `define CACHE_LINE_WORDS  8           // 每行 32bit 字数
 
 `define L1_NWAY           4           // L1 I/D cache 路数
-`define L1_NMSHR          1           // L1 D$ MSHR 项数（与当前单槽 dcache/lsu 一致）
+`define L1_NMSHR          2           // L1 D$ MSHR 项数（Phase1b 起参数化）
+`define DC_MSHR_DEPTH     `L1_NMSHR   // dcache 后台 MSHR 深度
+`define LSU_MISS_DEPTH    `DC_MSHR_DEPTH // LSU miss 槽深度（与 D$ MSHR 对齐）
+`define STQ_DEPTH         8           // 软门 STQ4 IPC 同 0.570，但 digftest 在 account_user_time 错载；默认 8
 `define L1_NSET           128         // L1 每路组数（16KB/4路/32B）
 `define L1_INDEX_W        7           // $clog2(L1_NSET)
 `define L1_TAG_W          20          // 32 - 7 - 5
@@ -224,6 +234,44 @@
 `define MEM_OP_LD_HU    7
 `define MEM_OP_LL_W     8
 `define MEM_OP_SC_W     9
+
+/* =====================================================
+ * 访存字节掩码 / overlap（STQ 与 SB 共用；原 mem_byte_util.vh）
+ * ===================================================== */
+// load 按 mem_op + 字内偏移 → 访问字节掩码（与 store wstrb 对齐比较）
+function automatic [3:0] mem_load_byte_mask;
+    input [`MEM_OP_NUM-1:0] op;
+    input [1:0]             off;
+    begin
+        if (op[`MEM_OP_LD_B] || op[`MEM_OP_LD_BU])
+            mem_load_byte_mask = 4'b0001 << off;
+        else if (op[`MEM_OP_LD_H] || op[`MEM_OP_LD_HU])
+            mem_load_byte_mask = off[1] ? 4'b1100 : 4'b0011;
+        else
+            mem_load_byte_mask = 4'b1111; // word / default
+    end
+endfunction
+
+// 同字地址上 store.strb 与 load 字节掩码是否重叠
+function automatic mem_st_ld_overlap;
+    input [31:0] st_paddr;
+    input [3:0]  st_strb;
+    input [31:0] ld_paddr;
+    input [3:0]  ld_mask;
+    begin
+        mem_st_ld_overlap = (st_paddr[31:2] == ld_paddr[31:2])
+                         && |(st_strb & ld_mask);
+    end
+endfunction
+
+// SB 前递：项与查询是否同字
+function automatic mem_same_word;
+    input [31:0] a;
+    input [31:0] b;
+    begin
+        mem_same_word = (a[31:2] == b[31:2]);
+    end
+endfunction
 
 /* =====================================================
  * CSR 指令操作码 (csr_op)

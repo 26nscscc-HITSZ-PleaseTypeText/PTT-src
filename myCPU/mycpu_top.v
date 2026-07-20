@@ -1580,6 +1580,7 @@ module core_top #(
     wire [31:0] lsu_dc_paddr;
     wire [2:0]  lsu_dc_size;
     wire        lsu_dc_uncached;
+    wire [`ROB_W-1:0] lsu_dc_robid;
     wire        dc_lsu_addr_ok;
     wire        dc_lsu_data_ok;
     wire [31:0] dc_lsu_rdata;
@@ -1587,12 +1588,14 @@ module core_top #(
     wire        dc_lsu_miss;         // load 移入 MSHR（hit-under-miss）
     wire        dc_lsu_mshr_ok;      // MSHR 重填数据返回（CWF-lite 提前回）
     wire [31:0] dc_lsu_mshr_rdata;
+    wire [`ROB_W-1:0] dc_lsu_mshr_robid;
     // LSU <-> store buffer 前递查询
     wire [31:0] lsu_sb_qpaddr;
     wire        lsu_sb_quncached;    // 查询来自 uncached load（设备写序保证）
     wire        sb_q_hit;
     wire [31:0] sb_q_data;
     wire        sb_q_partial;
+    wire        sb_full, sb_empty;
     // ROB 队头（uncached load 许可 / store 序）
     // LSU 约定 head_robid 编码：MSB=槽0 是否仍未提交，低位=head 对指针。
     // rob.head_robid0_o 本身是真 robid ({0,head})，供 commit/RAT 用，不能改；
@@ -1628,6 +1631,7 @@ module core_top #(
         .dc_paddr_o       (lsu_dc_paddr),
         .dc_size_o        (lsu_dc_size),
         .dc_uncached_o    (lsu_dc_uncached),
+        .dc_robid_o       (lsu_dc_robid),
         .dc_addr_ok_i     (dc_lsu_addr_ok),
         .dc_data_ok_i     (dc_lsu_data_ok),
         .dc_rdata_i       (dc_lsu_rdata),
@@ -1635,6 +1639,7 @@ module core_top #(
         .dc_miss_i        (dc_lsu_miss),
         .dc_mshr_data_ok_i(dc_lsu_mshr_ok),
         .dc_mshr_rdata_i  (dc_lsu_mshr_rdata),
+        .dc_mshr_robid_i  (dc_lsu_mshr_robid),
         .sb_query_paddr_o (lsu_sb_qpaddr),
         .sb_query_uncached_o(lsu_sb_quncached),
         .sb_query_hit_i   (sb_q_hit),
@@ -1657,16 +1662,14 @@ module core_top #(
     );
 
 //--------------------------------------------------
-// store_buffer：提交后写缓冲（冲刷不清空！里面全是已提交 store）
+// store_buffer：提交后写缓冲 / 按序写出
 //--------------------------------------------------
-    // commit -> SB 入队
     wire        cmt_sb_push_valid;
     wire [31:0] cmt_sb_push_paddr;
     wire [31:0] cmt_sb_push_data;
     wire [3:0]  cmt_sb_push_wstrb;
     wire [2:0]  cmt_sb_push_size;
     wire        cmt_sb_push_uncached;
-    wire        sb_full, sb_empty;
     // SB -> DCache store 写出
     wire        sb_dc_wr_req;
     wire [31:0] sb_dc_wr_paddr;
@@ -2372,6 +2375,7 @@ module core_top #(
         .ld_paddr_i     (lsu_dc_paddr),
         .ld_size_i      (lsu_dc_size),
         .ld_uncached_i  (lsu_dc_uncached),
+        .ld_robid_i     (lsu_dc_robid),
         .ld_addr_ok_o   (dc_lsu_addr_ok),
         .ld_data_ok_o   (dc_lsu_data_ok),
         .ld_rdata_o     (dc_lsu_rdata),
@@ -2379,6 +2383,7 @@ module core_top #(
         .ld_miss_o      (dc_lsu_miss),
         .ld_mshr_data_ok_o(dc_lsu_mshr_ok),
         .ld_mshr_rdata_o(dc_lsu_mshr_rdata),
+        .ld_mshr_robid_o(dc_lsu_mshr_robid),
         .st_req_i       (sb_dc_wr_req),
         .st_paddr_i     (sb_dc_wr_paddr),
         .st_data_i      (sb_dc_wr_data),
@@ -2405,7 +2410,6 @@ module core_top #(
         .axi_wr_cacop   (dc_l2_wr_cacop),
         .axi_wr_rdy     (l2_dc_wr_rdy)
     );
-
     l2cache u_l2cache(
         .clk           (clk),
         .resetn        (aresetn),
@@ -2966,7 +2970,7 @@ module core_top #(
     );
 `endif
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 // 性能仿真结束时打印前端/cache/IPC（无 digftest 时 testbench 的 inst_total 恒为 0）
 reg [63:0] perf_cycle_count;
@@ -2982,6 +2986,7 @@ reg [63:0] perf_rn_alloc_cyc;      // rename 成功分配 ROB/装入 dispatch
 reg [63:0] perf_turnover_refill_cyc; // dispatch 有旧指令时同拍腾空并 refill
 reg [63:0] stall_dispatch_cyc;     // IB 有指令但 dispatch 无法整体腾空
 reg [63:0] stall_rename_rob_cyc;   // IB 有指令但 ROB 达到安全满阈值
+reg [31:0] probe_cmt_idle_cyc;     // 连续无提交拍；过长则 $finish 打 PERF（抓 Linux 挂死）
 
 // ROB 有效项数不能只看 head/tail（每对可有 0/1/2 条有效指令），按分配与
 // 提交事件维护；flush 只清当前占用，不清整次仿真的累计统计。
@@ -3073,6 +3078,7 @@ always @(posedge clk) begin
         perf_turnover_refill_cyc <= 64'd0;
         stall_dispatch_cyc     <= 64'd0;
         stall_rename_rob_cyc   <= 64'd0;
+        probe_cmt_idle_cyc     <= 32'd0;
         for (perf_occ_i = 0; perf_occ_i < PERF_OCC_N; perf_occ_i = perf_occ_i + 1) begin
             perf_occ_max[perf_occ_i]      <= 8'd0;
             perf_occ_sum[perf_occ_i]      <= 64'd0;
@@ -3084,6 +3090,47 @@ always @(posedge clk) begin
         perf_retire_count <= perf_retire_count
                            + {63'd0, cmt_dbg0_valid}
                            + {63'd0, cmt_dbg1_valid};
+        if (cmt_dbg0_valid || cmt_dbg1_valid)
+            probe_cmt_idle_cyc <= 32'd0;
+        else if (probe_cmt_idle_cyc != 32'hffff_ffff)
+            probe_cmt_idle_cyc <= probe_cmt_idle_cyc + 32'd1;
+        // 已跑过一段后连续 200k 拍无提交 → 视为挂死，干净退出以 dump PERF/SB dbg
+        if ((perf_retire_count > 64'd100000) && (probe_cmt_idle_cyc == 32'd200000)) begin
+            $display("[myCPU] commit stall watchdog: idle=%0d cyc retire=%0d",
+                     probe_cmt_idle_cyc, perf_retire_count);
+            $display("[myCPU] ROB head0: v=%b c=%b ld=%b st=%b unc=%b pc=%h inst=%h robid=%h excp=%h priv=%h",
+                     rob_cmt0_valid, rob_cmt0_complete, rob_cmt0_is_load, rob_cmt0_is_store,
+                     rob_cmt0_uncached, rob_cmt0_pc, rob_cmt0_inst, rob_head_robid0,
+                     rob_cmt0_excp, rob_cmt0_priv_vec);
+            $display("[myCPU] ROB head1: v=%b c=%b ld=%b st=%b unc=%b pc=%h inst=%h",
+                     rob_cmt1_valid, rob_cmt1_complete, rob_cmt1_is_load, rob_cmt1_is_store,
+                     rob_cmt1_uncached, rob_cmt1_pc, rob_cmt1_inst);
+            $display("[myCPU] commit blk: flush_pend=%b sb_empty=%b unc_inflight=%b ibar0=%b cacop0=%b",
+                     flush, sb_empty, lsu_unc_inflight,
+                     rob_cmt0_valid && rob_cmt0_complete && rob_cmt0_priv_vec[`PRIV_IBAR] && !sb_empty,
+                     rob_cmt0_valid && rob_cmt0_complete && rob_cmt0_priv_vec[`PRIV_CACOP] && !sb_empty);
+            $display("[myCPU] LSU: a_v=%b d_v=%b d_ld=%b d_st=%b d_unc=%b d_req=%b d_drop=%b h_v=%b m_v=%b",
+                     u_lsu.a_valid, u_lsu.d_valid, u_lsu.d_is_load, u_lsu.d_is_store,
+                     u_lsu.d_uncached, u_lsu.d_req_sent, u_lsu.d_drop, u_lsu.h_valid,
+                     u_lsu.m_valid_oh);
+            $display("[myCPU] LSU d: robid=%h vaddr=%h paddr=%h ord_blk=%b sb_hit=%b sb_part=%b ld_gate=%b need_dc=%b",
+                     u_lsu.d_robid, u_lsu.d_vaddr, u_lsu.d_paddr,
+                     u_lsu.store_order_block, u_lsu.d_sb_hit, u_lsu.d_sb_partial,
+                     u_lsu.d_ld_gate, u_lsu.d_need_dc);
+            $display("[myCPU] LSU miss0: v=%b drop=%b robid=%h paddr=%h",
+                     u_lsu.m_valid[0], u_lsu.m_drop[0], u_lsu.m_robid[0], u_lsu.m_paddr[0]);
+            if (`LSU_MISS_DEPTH > 1)
+                $display("[myCPU] LSU miss1: v=%b drop=%b robid=%h paddr=%h",
+                         u_lsu.m_valid[1], u_lsu.m_drop[1], u_lsu.m_robid[1], u_lsu.m_paddr[1]);
+            $display("[myCPU] LSU a: robid=%h", u_lsu.a_robid);
+            $display("[myCPU] D$: state=%0d pend_v=%b pend_st=%b mshr_busy=%b wr_req=%b",
+                     u_dcache.state, u_dcache.pend_valid, u_dcache.pend_is_st,
+                     u_dcache.mshr_busy_oh, sb_dc_wr_req);
+            $display("[myCPU] SB: full=%b empty=%b count=%0d head=%0d tail=%0d inflight=%b valid=%b",
+                     sb_full, sb_empty, u_store_buffer.count, u_store_buffer.head,
+                     u_store_buffer.tail, u_store_buffer.inflight, u_store_buffer.valid);
+            $finish;
+        end
         if (rob_full)
             stall_rob_full_cyc <= stall_rob_full_cyc + 64'd1;
         if (sb_full)

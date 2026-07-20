@@ -250,7 +250,7 @@ assign train_meta_o         = train_meta_r;
 wire ftq_lint = (|blk_btype[0]);
 
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 reg [63:0] p1_meta_saved_count;
 reg [63:0] p1_correction_count;

@@ -86,7 +86,7 @@ wire [`FTB_INDEX_W-1:0] service_index = uq_pc[uq_rptr][2 +: `FTB_INDEX_W];
 wire [`FTB_INDEX_W-1:0] rd_index = service_update ? service_index : q_index;
 
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 initial begin
     if (FTB_UPDATE_Q_DEPTH < 2)
@@ -242,7 +242,7 @@ end
 // lint 吸收（alloc 标志当前未区分语义：命中即原地更新，未命中即分配）
 wire ftb_lint = u0_alloc;
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 reg [63:0] ftb_query_total;
 reg [63:0] ftb_query_suppressed_by_train;

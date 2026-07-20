@@ -184,7 +184,7 @@ wire                   uq_head_pvalid  = uq_head_meta[META_PROVIDER_VALID_BIT];
 wire [1:0]             uq_head_pid     = uq_head_meta[META_PROVIDER_ID_LSB +: 2];
 wire [TIDXW-1:0]       uq_head_pidx    = uq_head_meta[META_PROVIDER_IDX_LSB +: TIDXW];
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 initial begin
     if (TAGE_UPDATE_Q_DEPTH < 2)
@@ -454,7 +454,7 @@ end
 // lint 閸氬憡鏁?
 wire tage_lint = (|m_hits) | t0_mispred | (|t0_ptag);
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 reg tage_useful_clear_fire;
 integer stat_tk;

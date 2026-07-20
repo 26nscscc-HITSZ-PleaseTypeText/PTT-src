@@ -316,7 +316,7 @@ end
 // lint 吸收（cancel 端口按约定忽略：IFU 自行配对丢弃过期返回）
 wire icache_lint = ifu_cancel_i;
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 // 仿真性能统计：cached LOOKUP 访问 / 命中（不含 uncached/cacop）
 reg [63:0] ic_access_total;

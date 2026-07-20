@@ -184,7 +184,7 @@ module store_buffer(
                 if (uncached[q_idx]) begin
                     any_unc_r = 1'b1;
                 end
-                if (paddr[q_idx][31:2] == query_paddr_i[31:2]) begin
+                if (mem_same_word(paddr[q_idx], query_paddr_i)) begin
                     any_match_r = 1'b1;
                     for (b = 0; b < 4; b = b + 1) begin
                         if (!byte_found[b] && !byte_block[b] && strb[q_idx][b]) begin

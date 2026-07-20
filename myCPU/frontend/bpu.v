@@ -256,7 +256,7 @@ wire [31:0] p1_next = p1_taken_c ? p1_target_c : ftb_fall;
 assign ras_spec_push = p1_diff && (ftb_btype == `BR_TYPE_CALL);
 assign ras_spec_pop  = p1_diff && (ftb_btype == `BR_TYPE_RET) && !ras_empty;
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 reg [63:0] p1_result_valid_count;
 reg [63:0] p1_meta_saved_count;
@@ -477,7 +477,7 @@ always @(posedge clk) begin
         pc <= p0_next;
 end
 
-`ifndef SYNTHESIS
+`ifdef SYNTHESIS
 // synthesis translate_off
 // 临时调试：捕获 PC 离开 1c 代码段的时刻（调通后删除）
 always @(posedge clk) begin
