@@ -2,14 +2,14 @@
 // ftb 模块（Fetch Target Buffer，取指目标缓冲）
 // ------------------------------------------------------------
 // 参考实现说明：
-// - 4 路 × 1024 组，推断 BRAM（1R+1W 简单双口），查询 1 拍延迟；
-// - 条目 {valid, tag(20), br_type(2), len(3), target(32)}；
+// - 4 路 × 2048 组，推断 BRAM（1R+1W 简单双口），查询 1 拍延迟；
+// - 条目 {valid, tag(19), br_type(2), len(3), target(32)}；
 //   fall_through 不存全宽：由 len 重建（= 块PC + 4*len）；
 // - 更新走「训练 FIFO + 内部 2 级小流水」：训练请求先入小队列（深度
 //   `FTB_UPDATE_Q_DEPTH，满则丢弃计 overflow），查询优先占读口，U0 只在
 //   无查询的空闲拍出队借读口读出组内 4 路，U1 比较命中路原地更新 /
 //   victim 轮转分配（查询永不被作废）；
-// - 复位逐组清 valid（1024 拍）。
+// - 复位逐组清 valid（2048 拍）。
 // ============================================================
 `include "mycpu.h"
 
@@ -37,8 +37,8 @@ module ftb(
     input  wire                       update_alloc_i       // 1=新分配，0=仅更新
 );
 
-localparam TAGW    = 20;                          // pc[31:12]
-localparam ENTRY_W = 1 + TAGW + `BR_TYPE_W + `BLK_LEN_W + 32;  // 58
+localparam TAGW    = 32 - 2 - `FTB_INDEX_W;        // pc[31:(2+INDEX)]；2048 组时为 19
+localparam ENTRY_W = 1 + TAGW + `BR_TYPE_W + `BLK_LEN_W + 32;  // 57
 localparam FTB_UPDATE_Q_DEPTH = `FTB_UPDATE_Q_DEPTH;
 localparam FTB_UPDATE_Q_PTR_W =
     (FTB_UPDATE_Q_DEPTH <= 1) ? 1 : $clog2(FTB_UPDATE_Q_DEPTH);
@@ -130,7 +130,7 @@ always @(posedge clk) begin
     q_pc_r    <= query_pc_i;
 end
 
-wire [TAGW-1:0] q_tag_r = q_pc_r[31:12];
+wire [TAGW-1:0] q_tag_r = q_pc_r[31 -: TAGW];
 wire [`FTB_NWAY-1:0] q_hit;
 generate
 for (g = 0; g < `FTB_NWAY; g = g + 1) begin : gen_ftb_hit
@@ -159,7 +159,7 @@ assign br_type_o      = q_entry[32+`BLK_LEN_W +: `BR_TYPE_W];
 
 // ---------------- 更新流水 ----------------
 // U1 拍：U0 读出的 4 路与 u1 tag 比较
-wire [TAGW-1:0] u1_tag = u1_pc[31:12];
+wire [TAGW-1:0] u1_tag = u1_pc[31 -: TAGW];
 wire [`FTB_NWAY-1:0] u_hit;
 generate
 for (g = 0; g < `FTB_NWAY; g = g + 1) begin : gen_ftb_uhit
@@ -315,15 +315,17 @@ endmodule
 // ------------------------------------------------------------
 // ftb_way_ram：简单双口 RAM 模板（1R + 1W，推断 BRAM）
 // ------------------------------------------------------------
-module ftb_way_ram(
+module ftb_way_ram #(
+    parameter ENTRY_W = 1 + (32 - 2 - `FTB_INDEX_W) + `BR_TYPE_W + `BLK_LEN_W + 32
+)(
     input  wire                      clk,
     input  wire [`FTB_INDEX_W-1:0]   raddr,
-    output reg  [57:0]               rdata,
+    output reg  [ENTRY_W-1:0]        rdata,
     input  wire                      we,
     input  wire [`FTB_INDEX_W-1:0]   waddr,
-    input  wire [57:0]               wdata
+    input  wire [ENTRY_W-1:0]        wdata
 );
-reg [57:0] mem [0:`FTB_NSET-1];
+reg [ENTRY_W-1:0] mem [0:`FTB_NSET-1];
 always @(posedge clk) begin
     rdata <= mem[raddr];
     if (we) mem[waddr] <= wdata;

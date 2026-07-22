@@ -227,9 +227,13 @@ wire [31:0] p1_target_c = (ftb_btype == `BR_TYPE_RET && !ras_empty) ? ras_top :
 wire p1_result_valid = p0_wrote_r && !ftq_freeze_r && !flush_r && !flush_i &&
                        !predec_redirect_i && tage_resp_valid;
 
-assign p1_diff = p1_result_valid && ftb_resp_valid && ftb_hit &&
-                 ((p1_len_c != p0_length_r) || (p1_taken_c != p0_taken_r) ||
-                  (p1_target_c != p0_target_r));
+// V3.4：目标比较仅在双方都 taken 时进行，避免 NT 垃圾目标触发伪覆盖
+wire p1_path_comparable = p1_result_valid && ftb_resp_valid && ftb_hit;
+wire p1_direction_diff  = p1_path_comparable && (p1_taken_c != p0_taken_r);
+wire p1_target_diff     = p1_path_comparable && p1_taken_c && p0_taken_r &&
+                          (p1_target_c != p0_target_r);
+wire p1_block_len_diff  = p1_path_comparable && (p1_len_c != p0_length_r);
+assign p1_diff = p1_direction_diff || p1_target_diff || p1_block_len_diff;
 
 reg [`BPU_META_W-1:0] p1_meta_pack;
 always @(*) begin
@@ -241,7 +245,7 @@ always @(*) begin
 end
 
 assign p1_valid_o   = p1_diff;
-assign p1_meta_valid_o = p1_result_valid;
+assign p1_meta_valid_o = p1_result_valid; // 保持每次 P1 结果写 meta（训练覆盖优于收窄）
 assign p1_pc_o      = pc_r;
 assign p1_length_o  = p1_len_c;
 assign p1_taken_o   = p1_taken_c;

@@ -53,7 +53,7 @@
 `define RS_MEM_OCC_W    3   // $clog2(RS_MEM_SIZE+1)
 `define RS_MDU_SIZE     2   // 乘除保留站项数（FIFO 顺序发射）
 
-`define SB_SIZE         8   // store buffer 项数（提交后写缓冲）
+`define SB_SIZE         8   // store buffer 项数（提交后写缓冲；行聚合+同字旁路合并）
 `define SB_W            3   // $clog2(SB_SIZE)
 
 `define FTQ_SIZE        16  // 取指目标队列项数（需 > BPU 推测深度，避免 I$ 慢时 ftq_full 死锁）
@@ -80,23 +80,26 @@
                                       //   资源反增（行缓冲/比较器 ×2），故保持 2）
 `define DC_MSHR_DEPTH     `L1_NMSHR   // dcache 后台 MSHR 深度
 `define LSU_MISS_DEPTH    `DC_MSHR_DEPTH // LSU miss 槽深度（与 D$ MSHR 对齐）
+`define LSU_DC_HIT_BYPASS 1           // V3.4：D$ 命中当拍写回（跳 hold）；=0 恢复一律 hold
+// 注：60MHz 曾试 `LSU_DC_HIT_BYPASS 0` + early2 打拍——OOC 转正但 Linux digftest 错载，已回退；交付 55MHz。
+`define LSU_EARLY2_PIPE   0           // =1 时 early2 打拍；默认 0（与 hit-bypass 同拍早唤醒）
 `define STQ_DEPTH         8           // 软门 STQ4 IPC 同 0.570，但 difftest 在 account_user_time 错载；默认 8
 `define L1_NSET           128         // L1 每路组数（16KB/4路/32B）
 `define L1_INDEX_W        7           // $clog2(L1_NSET)
 `define L1_TAG_W          20          // 32 - 7 - 5
 
 `define L2_NWAY           2           // L2 路数
-`define L2_NSET           512         // L2 每路组数（32KB/2路/32B）
-`define L2_INDEX_W        9
-`define L2_TAG_W          18          // 32 - 9 - 5
+`define L2_NSET           2048        // L2 每路组数（V3.4：128KB/2路/32B；原 512=32KB）
+`define L2_INDEX_W        11          // $clog2(L2_NSET)
+`define L2_TAG_W          16          // 32 - 11 - 5
 
 /* =====================================================
  * 分支预测器（BPU）参数
  * ===================================================== */
 `define UBTB_SIZE         16          // uBTB 项数（全相联，当拍返回，回填小循环）
 `define FTB_NWAY          4           // FTB 路数
-`define FTB_NSET          1024        // FTB 每路组数（共 4096 项，BRAM 实现）
-`define FTB_INDEX_W       10          // $clog2(FTB_NSET)
+`define FTB_NSET          2048        // FTB 每路组数（共 8192 项，BRAM 实现）
+`define FTB_INDEX_W       11          // $clog2(FTB_NSET)
 `define FTB_UPDATE_Q_DEPTH 32          // FTB 训练更新 FIFO 深度（2 的幂；查询优先不偷读口；
                                        //   V2.3 A/B 过 32→64：overflow 31万→26万 但 BPU 准确率
                                        //   与 IPC 均持平——溢出集中在查询独占读口的突发段，

@@ -51,7 +51,7 @@ module rs_mdu(
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
 
-    // ---------------- 提前唤醒总线 ×3（early0/1 已接通，early2 预留）----------------
+    // ---------------- 提前唤醒总线 ×3（early0/1/2 均已接通；early2=LSU DC 命中）----------------
     input  wire                       early0_valid_i,
     input  wire [`ROB_W-1:0]          early0_robid_i,
     input  wire                       early1_valid_i,
@@ -127,10 +127,12 @@ for (gw = 0; gw < `RS_MDU_SIZE; gw = gw + 1) begin : g_wake
     assign s1_wbhit[gw] = !s1_val_valid[gw] && s1_wb_match[gw];
     assign s0_earlyhit[gw] = !s0_ready[gw] && !s0_wbhit[gw] &&
                              ((early0_valid_i && (early0_robid_i == s0_robid[gw])) ||
-                              (early1_valid_i && (early1_robid_i == s0_robid[gw])));
+                              (early1_valid_i && (early1_robid_i == s0_robid[gw])) ||
+                              (early2_valid_i && (early2_robid_i == s0_robid[gw])));
     assign s1_earlyhit[gw] = !s1_ready[gw] && !s1_wbhit[gw] &&
                              ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
-                              (early1_valid_i && (early1_robid_i == s1_robid[gw])));
+                              (early1_valid_i && (early1_robid_i == s1_robid[gw])) ||
+                              (early2_valid_i && (early2_robid_i == s1_robid[gw])));
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :

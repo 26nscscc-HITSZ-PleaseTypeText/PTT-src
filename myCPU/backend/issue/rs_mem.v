@@ -7,7 +7,7 @@
 // - store / ll / sc / cacop 仍为序屏障：前方有未发射的屏障项时不可越过。
 //   （无地址消歧时不能让 load 越过未知/未发 store。）
 // - 越过时在发射拍把选中项与队头交换，再按 head 出队，保持 FIFO 紧凑。
-// - 唤醒机制与 rs_alu 相同（4 路写回总线 + 预留提前唤醒）。
+// - 唤醒机制与 rs_alu 相同（4 路写回总线 + early0/1/2 提前唤醒）。
 //
 // 端口：与 rs_alu 同构，差异：
 // - bundle 为 mem_op/is_cacop/imm（无 br 相关）
@@ -51,7 +51,7 @@ module rs_mem(
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
 
-    // ---------------- 提前唤醒总线 ×3（二期）----------------
+    // ---------------- 提前唤醒总线 ×3（early0/1=ALU；early2=LSU DC 命中，V3.4）----------------
     input  wire                       early0_valid_i,
     input  wire [`ROB_W-1:0]          early0_robid_i,
     input  wire                       early1_valid_i,
@@ -93,8 +93,8 @@ module rs_mem(
 // 坑点提示：
 //      1. lsu_ready_i 为 0 时队头保持，不要丢发射（脉冲式发射 + not-ready 丢失
 //         是常见 bug，发射条件里与上 lsu_ready 即可避免）。
-//      2. 若做"load 提前唤醒"（lsu AGU 级 early2 总线，当前预留未接），唤醒的
-//         是依赖 load 结果的 ALU 指令，本站自身的唤醒逻辑不变。
+//      2. load 提前唤醒（V3.4：lsu DC 命中限定 early2）已接入；唤醒的是依赖
+//         load 结果的指令，本站自身的操作数捕获逻辑不变。
 //      3. 若想 load 越过前面的 store，必须加 store 地址比较（内存消歧）+
 //         违例恢复，工作量大，务必先评估收益。
 
@@ -151,10 +151,12 @@ for (gw = 0; gw < `RS_MEM_SIZE; gw = gw + 1) begin : g_wake
     assign s1_wbhit[gw] = !s1_val_valid[gw] && s1_wb_match[gw];
     assign s0_earlyhit[gw] = !s0_ready[gw] && !s0_wbhit[gw] &&
                              ((early0_valid_i && (early0_robid_i == s0_robid[gw])) ||
-                              (early1_valid_i && (early1_robid_i == s0_robid[gw])));
+                              (early1_valid_i && (early1_robid_i == s0_robid[gw])) ||
+                              (early2_valid_i && (early2_robid_i == s0_robid[gw])));
     assign s1_earlyhit[gw] = !s1_ready[gw] && !s1_wbhit[gw] &&
                              ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
-                              (early1_valid_i && (early1_robid_i == s1_robid[gw])));
+                              (early1_valid_i && (early1_robid_i == s1_robid[gw])) ||
+                              (early2_valid_i && (early2_robid_i == s1_robid[gw])));
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :

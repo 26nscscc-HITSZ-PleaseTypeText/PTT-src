@@ -85,7 +85,7 @@ module lsu(
     output wire                       wb_uncached_o,       // 非缓存访问
     output wire [`EXCP_NUM-1:0]       wb_excp_o,           // 动态异常（ALE/ADEM/TLBR_M/PIL/PIS/PPI_M/PME）
 
-    // ---------------- AGU 级投机唤醒（二期预留，暂恒 0）----------------
+    // ---------------- DC 级命中限定早唤醒（V3.4：early2；顶层可 `LSU_EARLY2_PIPE` 打拍）----------------
     output wire                       early_wakeup_valid_o,
     output wire [`ROB_W-1:0]          early_wakeup_robid_o
 );
@@ -391,10 +391,10 @@ wire wb_st_case    = dcst_ok && d_valid && !d_excp_any && (d_is_store || d_is_ca
 // 内容永远安全(与原 hold_cap_sb 依据同);SB 命中延后一拍写回只是延迟,无序问题
 // (store→load 顺序由 store_order_block 在 sb_ready 前已保证)。SB 命中少见,IPC 影响微小。
 wire sb_ready      = d_sb_hit && d_ld_gate && !store_order_block; // d_ld_gate 已含 !h_valid
-wire wb_ld_sb_case = 1'b0;                               // SB 命中不再直接写回
-wire wb_ld_dc_case = 1'b0;                               // Phase 3：DC 命中不再直接写回
-// Phase 3：DC 返回一律进 hold（切断 tag→RS 组合链）
-wire hold_cap_dc   = dc_return;
+wire wb_ld_sb_case = 1'b0;                               // SB 命中仍走 hold（SB→RS 曾为时序主凶）
+// V3.4：`LSU_DC_HIT_BYPASS` 时 D$ 命中同拍写回；MSHR 抢口时仍进 hold
+wire wb_ld_dc_case = (`LSU_DC_HIT_BYPASS != 0) && dcst_ok && dc_return;
+wire hold_cap_dc   = dc_return && ((`LSU_DC_HIT_BYPASS != 0) ? wb_mshr_case : 1'b1);
 // 所有就绪 SB 命中都进 hold(与 hold_cap_dc 互斥:同一 d 级 load 不会既 SB 命中又 DC 返回)
 wire hold_cap_sb   = sb_ready && !hold_cap_dc;
 
@@ -603,12 +603,13 @@ always @(posedge clk) begin
     end
 end
 
-// AGU 级 early2：写回 GPR 的访存（load/SC）在无异常时广播，只置 RS ready、不带数据
-wire a_excp_any = |a_excp;
-wire a_early_ok = a_valid && !a_is_cacop && !a_excp_any
-                && (a_is_load_op || a_mem_op[`MEM_OP_SC_W]);
-assign early_wakeup_valid_o = a_early_ok && !flush_i && !reset;
-assign early_wakeup_robid_o = a_robid;
+// DC 级 early2：仅在「本拍/下拍写回有保证」时唤醒——D$ 命中返回或 SB 命中进 hold。
+// 避免 AGU 级投机唤醒（miss 时依赖已发射会错）。MSHR 抢 WB 口时不早唤醒。
+wire d_early_ok = d_valid && d_is_load && !d_excp_any && !d_is_cacop
+                && !wb_mshr_case
+                && (dc_return || (sb_ready && !hold_cap_dc));
+assign early_wakeup_valid_o = d_early_ok && !flush_i && !reset;
+assign early_wakeup_robid_o = d_robid;
 
 // lint 吸收
 wire lsu_lint = (|issue_pc_i) | (|mmu_d_mat_i[1:1]);

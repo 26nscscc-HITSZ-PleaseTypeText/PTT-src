@@ -1057,9 +1057,11 @@ module core_top #(
     wire                      mem_wb_uncached;
     wire [`EXCP_NUM-1:0]      mem_wb_excp;
     wire [31:0]               mdu_wb_data2;
-    // 提前唤醒总线（3 路：alu0/alu1 发射拍 + lsu AGU 级；一期模块内恒 0）
-    wire                      alu0_early_valid, alu1_early_valid, lsu_early_valid;
-    wire [`ROB_W-1:0]         alu0_early_robid, alu1_early_robid, lsu_early_robid;
+    // 提前唤醒总线（3 路：alu0/alu1 发射拍 + lsu DC 命中限定 early2）
+    wire                      alu0_early_valid, alu1_early_valid;
+    wire                      lsu_early_valid_raw, lsu_early_valid;
+    wire [`ROB_W-1:0]         alu0_early_robid, alu1_early_robid;
+    wire [`ROB_W-1:0]         lsu_early_robid_raw, lsu_early_robid;
     // rs_alu0 入站/发射
     wire                      rsa0_can_accept;
     wire [`RS_ALU_OCC_W-1:0]  rsa0_occupancy;
@@ -1660,9 +1662,30 @@ module core_top #(
         .wb_size_o        (mem_wb_size),
         .wb_uncached_o    (mem_wb_uncached),
         .wb_excp_o        (mem_wb_excp),
-        .early_wakeup_valid_o(lsu_early_valid),
-        .early_wakeup_robid_o(lsu_early_robid)
+        .early_wakeup_valid_o(lsu_early_valid_raw),
+        .early_wakeup_robid_o(lsu_early_robid_raw)
     );
+
+    // V3.4：`LSU_EARLY2_PIPE` 时 early2 打一拍再进三 RS，切断 D$ hit→RS ready 组合链。
+    // 与 hold 写回同拍到达时 early2 退化为与 WB 同位（仍正确）；未打拍则保持同拍早唤醒。
+    generate if (`LSU_EARLY2_PIPE != 0) begin : g_early2_pipe
+        reg                      lsu_early_valid_r;
+        reg [`ROB_W-1:0]         lsu_early_robid_r;
+        always @(posedge clk) begin
+            if (reset || flush) begin
+                lsu_early_valid_r <= 1'b0;
+                lsu_early_robid_r <= {`ROB_W{1'b0}};
+            end else begin
+                lsu_early_valid_r <= lsu_early_valid_raw;
+                lsu_early_robid_r <= lsu_early_robid_raw;
+            end
+        end
+        assign lsu_early_valid = lsu_early_valid_r;
+        assign lsu_early_robid = lsu_early_robid_r;
+    end else begin : g_early2_comb
+        assign lsu_early_valid = lsu_early_valid_raw;
+        assign lsu_early_robid = lsu_early_robid_raw;
+    end endgenerate
 
 //--------------------------------------------------
 // store_buffer：提交后写缓冲 / 按序写出
@@ -1676,8 +1699,8 @@ module core_top #(
     // SB -> DCache store 写出
     wire        sb_dc_wr_req;
     wire [31:0] sb_dc_wr_paddr;
-    wire [31:0] sb_dc_wr_data;
-    wire [3:0]  sb_dc_wr_strb;
+    wire [`CACHE_LINE_BITS-1:0] sb_dc_wr_data;
+    wire [`CACHE_LINE_BYTES-1:0] sb_dc_wr_strb;
     wire [2:0]  sb_dc_wr_size;
     wire        sb_dc_wr_uncached;
     wire        dc_sb_addr_ok;
@@ -3178,6 +3201,19 @@ always @(posedge clk) begin
     end
 end
 
+// 64bit 无符号 → real 安全转换。Verilator(4.x) 对宽向量隐式转 real 走 32bit
+// 有符号 ITORD，计数 ≥2^31 时会得到负数（V2.3 报告中 FTQ/RAS 负均值即此因，
+// 探针计数本身无误）；按 16bit 分段转换绕开。
+function automatic real perf_u64_real;
+    input [63:0] v;
+    begin
+        perf_u64_real = (($itor(v[63:48]) * 65536.0
+                        + $itor(v[47:32])) * 65536.0
+                        + $itor(v[31:16])) * 65536.0
+                        + $itor(v[15:0]);
+    end
+endfunction
+
 function automatic real perf_rate;
     input [63:0] num;
     input [63:0] den;
@@ -3185,7 +3221,7 @@ function automatic real perf_rate;
         if (den == 64'd0)
             perf_rate = 0.0;
         else
-            perf_rate = 100.0 * num / den;
+            perf_rate = 100.0 * perf_u64_real(num) / perf_u64_real(den);
     end
 endfunction
 
@@ -3196,7 +3232,7 @@ function automatic real perf_avg_occ;
         if (cycles == 64'd0)
             perf_avg_occ = 0.0;
         else
-            perf_avg_occ = 1.0 * sum / cycles;
+            perf_avg_occ = perf_u64_real(sum) / perf_u64_real(cycles);
     end
 endfunction
 
@@ -3207,7 +3243,7 @@ function automatic real perf_ipc;
         if (cycles == 64'd0)
             perf_ipc = 0.0;
         else
-            perf_ipc = 1.0 * insts / cycles;
+            perf_ipc = perf_u64_real(insts) / perf_u64_real(cycles);
     end
 endfunction
 

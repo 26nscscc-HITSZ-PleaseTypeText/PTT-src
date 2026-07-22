@@ -4,7 +4,7 @@
 // l2cache 模块（L2 统一缓存：I$/D$ 共享的第二级缓存）
 // ------------------------------------------------------------
 // 几何与协议（原 TODO 1，按 32B 行全量重写）：
-// - `L2_NWAY(2) 路 × `L2_NSET(512) 组 × 32B 行 = 32KB，写回法 + 脏位；
+// - `L2_NWAY(2) 路 × `L2_NSET(2048) 组 × 32B 行 = 128KB（V3.4；原 512→32KB），写回法 + 脏位；
 // - 行协议（与 L1/axi_line_bridge 一致）：
 //   * 读 type=100：rd_rdy 接受后 2 拍 128b 返回（ret_last 末拍）；
 //   * 写 type=100：beat0 持 req 等 wr_rdy（接受拍 ack），beat1 次拍直推；
@@ -109,9 +109,9 @@ module l2cache (
 );
 
 localparam NWAY  = `L2_NWAY;     // 2
-localparam NSET  = `L2_NSET;     // 512
-localparam IDXW  = `L2_INDEX_W;  // 9
-localparam TAGW  = `L2_TAG_W;    // 18
+localparam NSET  = `L2_NSET;     // 2048（V3.4）
+localparam IDXW  = `L2_INDEX_W;
+localparam TAGW  = `L2_TAG_W;
 localparam LINEW = `CACHE_LINE_BITS;
 localparam VB_N  = 4;            // victim buffer 项数
 
@@ -154,7 +154,7 @@ wire [IDXW-1:0] im_set = im_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
 wire [TAGW-1:0] im_tag = im_addr[31:IDXW+`CACHE_LINE_W];
 
 // ---------------- 存储（推断 BRAM：每路 tag + data）----------------
-// tag 条目：{valid, dirty, tag[17:0]}
+// tag 条目：{valid, dirty, tag[TAGW-1:0]}
 wire [TAGW+1:0]  tag_out  [0:NWAY-1];
 wire [LINEW-1:0] data_out [0:NWAY-1];
 reg  [IDXW-1:0]  ram_addr;

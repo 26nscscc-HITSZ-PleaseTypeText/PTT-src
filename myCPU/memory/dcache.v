@@ -23,6 +23,8 @@
 //     保证落地），SB 立即排空下一条——隐藏 store miss 延迟；
 //   * 同行 store 撞在飞 MSHR（同 paddr[31:5]）：合入该槽 byte enable，posted
 //     st_done，不占 pend——消除 mem_stream 类 ld→st 同行走 set_conf；
+//     **只改 stb/dat，不改 is_st/killed**（load 源 MSHR 仍可被 cancel 杀掉）；
+//   * V3.4：SB→D$ 口升为整行（256b+32B strb），同行多字一次 RMW/单 MSHR；
 //   * MSHR 在飞期间【同 index 不同行】或 MSHR 已满：优先挂到 1 项 pending
 //     缓冲并立刻回 IDLE，从而继续 hit-under-miss；pending 在有空槽/写回空闲
 //     后经 RELOOK 完成（同组冲突在重填落地后常变命中）。pending 已占用且再
@@ -86,12 +88,13 @@ module dcache (
     output wire [31:0] ld_mshr_rdata_o,
     output wire [`ROB_W-1:0] ld_mshr_robid_o, // 与 data_ok 同拍，供 LSU 配对
 
-    // ---------------- store_buffer 写出口 ----------------
+    // ---------------- store_buffer 写出口（V3.4：行粒度 data/strb）----------------
+    // SB 泄流口一次可合并同行多字；uncached 仍单字（放在行内对应字槽）。
     input  wire        st_req_i,         // store 写请求（保持至 addr_ok）
     input  wire [31:0] st_paddr_i,
-    input  wire [31:0] st_data_i,
-    input  wire [3:0]  st_strb_i,
-    input  wire [2:0]  st_size_i,
+    input  wire [`CACHE_LINE_BITS-1:0] st_data_i,
+    input  wire [`CACHE_LINE_BYTES-1:0] st_strb_i, // 行内字节使能
+    input  wire [2:0]  st_size_i,        // 仅 uncached AXI 宽度用
     input  wire        st_uncached_i,
     output wire        st_addr_ok_o,
     output wire        st_done_o,        // 写完成（命中两拍；miss 分配拍 posted）
@@ -250,8 +253,8 @@ reg        req_is_cacop;
 reg [1:0]  req_cacop_op;
 reg [31:0] req_paddr;
 reg [`ROB_W-1:0] req_robid;       // load：随请求锁存，miss 写入 MSHR
-reg [31:0] req_wdata;
-reg [3:0]  req_wstrb;
+reg [LINEW-1:0] req_wdata;        // V3.4：行粒度（UC 时有效字在 req_word 槽）
+reg [31:0]  req_wstrb;            // 行内 32 字节使能
 reg [2:0]  req_size;
 reg        req_uncached;
 reg        req_ld_killed;         // 本前端 load 已被冲刷（sticky→MSHR.killed）
@@ -268,8 +271,8 @@ reg        pend_is_ld;
 reg        pend_ld_killed;        // pend 中的 load 已被冲刷
 reg [31:0] pend_paddr;
 reg [`ROB_W-1:0] pend_robid;
-reg [31:0] pend_wdata;
-reg [3:0]  pend_wstrb;
+reg [LINEW-1:0] pend_wdata;
+reg [31:0] pend_wstrb;
 reg [2:0]  pend_size;
 reg        pend_uncached;
 
@@ -375,7 +378,8 @@ endgenerate
 wire        lk_st_merge = (state == S_LOOKUP) && req_is_st && !req_is_cacop && !req_uncached
                        && (|mshr_mergeable);
 wire [MSHR_W-1:0] mshr_merge_idx = dc_mshr_prio_low(mshr_mergeable);
-wire [31:0] req_stb_line = {{28{1'b0}}, req_wstrb} << (req_word * 4);
+// V3.4：SB 已给行级 strb；不再按单字左移
+wire [31:0] req_stb_line = req_wstrb;
 
 wire lk_set_conf  = (state == S_LOOKUP) && !req_is_cacop && !req_uncached
                  && (|mshr_set_match) && !lk_st_merge;
@@ -416,15 +420,18 @@ wire lk_to_mwait_cache = lk_cache_block && pend_valid;
 wire [LINEW-1:0] hit_line = data_out[hit_way];
 wire [31:0] hit_word = hit_line[32*req_word +: 32];
 
-wire [31:0] st_word_strb = { {8{req_wstrb[3]}}, {8{req_wstrb[2]}},
-                             {8{req_wstrb[1]}}, {8{req_wstrb[0]}} };
+// 行级字节使能 → 位掩码（V3.4）
+reg [LINEW-1:0] st_line_be;
+integer sbi;
+always @(*) begin
+    for (sbi = 0; sbi < 32; sbi = sbi + 1)
+        st_line_be[8*sbi +: 8] = {8{req_wstrb[sbi]}};
+end
 
-// store 命中合并行（读改写：用 LOOKUP 拍已读出的整行）
+// store 命中合并行（读改写：整行字节使能）
 reg [LINEW-1:0] st_merge_line;
 always @(*) begin
-    st_merge_line = data_out[hit_way];
-    st_merge_line[32*req_word +: 32] =
-        (data_out[hit_way][32*req_word +: 32] & ~st_word_strb) | (req_wdata & st_word_strb);
+    st_merge_line = (data_out[hit_way] & ~st_line_be) | (req_wdata & st_line_be);
 end
 
 // ---------------- MSHR 重填数据通路（归属 AXI owner）----------------
@@ -444,12 +451,9 @@ reg [LINEW-1:0] refill_stb_exp;
 reg [LINEW-1:0] refill_line_merged;
 integer rb;
 always @(*) begin
-    // beat1 前 mshr_line 即 store 叠层（原 dat_line）
     refill_dat_eff = mshr_line[axi_mshr_grant];
-    if (refill_merge_now) begin
-        refill_dat_eff[32*req_word +: 32] =
-            (refill_dat_eff[32*req_word +: 32] & ~st_word_strb) | (req_wdata & st_word_strb);
-    end
+    if (refill_merge_now)
+        refill_dat_eff = (refill_dat_eff & ~st_line_be) | (req_wdata & st_line_be);
     for (rb = 0; rb < 32; rb = rb + 1)
         refill_stb_exp[8*rb +: 8] = {8{refill_stb_eff[rb]}};
     refill_line_merged = (refill_line_raw & ~refill_stb_exp) | (refill_dat_eff & refill_stb_exp);
@@ -486,17 +490,19 @@ wire mshr_install_fire = |mshr_install_fire_oh;
 wire [1:0]      mshr_inst_way = mshr_way[mshr_install_idx];
 wire [IDXW-1:0] mshr_inst_set = mshr_paddr[mshr_install_idx][IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
 wire [TAGW-1:0] mshr_inst_tag = mshr_paddr[mshr_install_idx][31:IDXW+`CACHE_LINE_W];
-// 安装同拍合入 store：组合叠层，避免 NBA 晚一拍丢写
+// 安装同拍合入 store：组合叠层，避免 NBA 晚一拍丢写；
+// dirty 用 is_st|merge|stb，不依赖 merge 改写 is_st（orphan 契约）
 wire            install_merge_now = lk_st_merge
                                  && (mshr_merge_idx == mshr_install_idx)
                                  && mshr_install_oh[mshr_install_idx];
-wire            mshr_inst_is_st = mshr_is_st[mshr_install_idx] | install_merge_now;
+wire            mshr_inst_is_st = mshr_is_st[mshr_install_idx]
+                                | install_merge_now
+                                | (|mshr_stb_line[mshr_install_idx]);
 reg [LINEW-1:0] mshr_inst_line;
 always @(*) begin
     mshr_inst_line = mshr_line[mshr_install_idx];
     if (install_merge_now)
-        mshr_inst_line[32*req_word +: 32] =
-            (mshr_inst_line[32*req_word +: 32] & ~st_word_strb) | (req_wdata & st_word_strb);
+        mshr_inst_line = (mshr_inst_line & ~st_line_be) | (req_wdata & st_line_be);
 end
 // ---------------- 响应输出 ----------------
 assign ld_data_ok_o = lk_ld_hit | (state == S_UC_RESP);
@@ -529,12 +535,15 @@ assign axi_wr_addr = (state == S_UC_WREQ) ? req_paddr
                    : ((state == S_CAC_WB0) || (state == S_CAC_WB1))
                        ? {cwb_tag, req_set, {`CACHE_LINE_W{1'b0}}}
                        : wb_addr;
-assign axi_wr_data = (state == S_UC_WREQ) ? {96'b0, req_wdata}
+// UC：从行内对应字槽抽单字（SB 已按 paddr[4:2] 放入）
+wire [31:0] uc_st_word = req_wdata[32*req_word +: 32];
+wire [3:0]  uc_st_strb = req_wstrb[4*req_word +: 4];
+assign axi_wr_data = (state == S_UC_WREQ) ? {96'b0, uc_st_word}
                    : (state == S_CAC_WB0) ? cwb_line[127:0]
                    : (state == S_CAC_WB1) ? cwb_line[255:128]
                    : (wb_state == W_B0)   ? wb_line[127:0]
                                           : wb_line[255:128];
-assign axi_wr_strb = (state == S_UC_WREQ) ? {12'b0, req_wstrb} : 16'hffff;
+assign axi_wr_strb = (state == S_UC_WREQ) ? {12'b0, uc_st_strb} : 16'hffff;
 assign axi_wr_cacop= (state == S_CAC_WB0) || (state == S_CAC_WB1);
 
 // ---------------- BRAM 读写控制 ----------------
@@ -836,8 +845,8 @@ always @(posedge clk) begin
                         mshr_way[mi]          <= pick_way;
                         if (req_is_st) begin
                             mshr_stb_line[mi] <= req_stb_line;
-                            // beat1 前 line 作 store 叠层
-                            mshr_line[mi]     <= {{(LINEW-32){1'b0}}, req_wdata} << (req_word * 32);
+                            // beat1 前 line 作 store 叠层（整行）
+                            mshr_line[mi]     <= req_wdata;
                         end else begin
                             mshr_stb_line[mi] <= 32'b0;
                             mshr_line[mi]     <= {LINEW{1'b0}};
@@ -850,12 +859,11 @@ always @(posedge clk) begin
                      && axi_mshr_grant_vld
                      && (axi_mshr_grant == mi[MSHR_W-1:0]))
                         mshr_state[mi] <= M_RDATA;
+                    // store merge：只合数据/strb，不改 is_st/killed（load 源仍可被 cancel）
                     if (lk_st_merge && (mshr_merge_idx == mi[MSHR_W-1:0])) begin
-                        mshr_is_st[mi]    <= 1'b1;
                         mshr_stb_line[mi] <= mshr_stb_line[mi] | req_stb_line;
-                        mshr_line[mi][32*req_word +: 32] <=
-                            (mshr_line[mi][32*req_word +: 32] & ~st_word_strb)
-                          | (req_wdata & st_word_strb);
+                        mshr_line[mi]     <= (mshr_line[mi] & ~st_line_be)
+                                           | (req_wdata & st_line_be);
                     end
                 end
                 M_RDATA: begin
@@ -864,13 +872,11 @@ always @(posedge clk) begin
                     if (mshr_beat0 && (axi_mshr_grant == mi[MSHR_W-1:0]))
                         mshr_b0[mi] <= axi_ret_data;
                     if (lk_st_merge && (mshr_merge_idx == mi[MSHR_W-1:0])) begin
-                        mshr_is_st[mi]    <= 1'b1;
                         mshr_stb_line[mi] <= mshr_stb_line[mi] | req_stb_line;
                         // beat1 同拍叠层已在 refill_line_merged；勿再写 overlay 覆盖整行
                         if (!(mshr_beat1 && (axi_mshr_grant == mi[MSHR_W-1:0]))) begin
-                            mshr_line[mi][32*req_word +: 32] <=
-                                (mshr_line[mi][32*req_word +: 32] & ~st_word_strb)
-                              | (req_wdata & st_word_strb);
+                            mshr_line[mi] <= (mshr_line[mi] & ~st_line_be)
+                                           | (req_wdata & st_line_be);
                         end
                     end
                     if (mshr_beat1 && (axi_mshr_grant == mi[MSHR_W-1:0])) begin
@@ -880,11 +886,9 @@ always @(posedge clk) begin
                 end
                 M_INSTALL: begin
                     if (lk_st_merge && (mshr_merge_idx == mi[MSHR_W-1:0])) begin
-                        mshr_is_st[mi]    <= 1'b1;
                         mshr_stb_line[mi] <= mshr_stb_line[mi] | req_stb_line;
-                        mshr_line[mi][32*req_word +: 32] <=
-                            (mshr_line[mi][32*req_word +: 32] & ~st_word_strb)
-                          | (req_wdata & st_word_strb);
+                        mshr_line[mi]     <= (mshr_line[mi] & ~st_line_be)
+                                           | (req_wdata & st_line_be);
                     end
                     if (mshr_install_fire_oh[mi]) begin
                         mshr_state[mi]   <= M_IDLE;

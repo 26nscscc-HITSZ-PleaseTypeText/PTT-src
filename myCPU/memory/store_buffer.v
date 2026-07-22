@@ -4,7 +4,7 @@
 // 功能：
 // - 乱序核 store 正确性的关键部件："store 在提交前绝不写内存"。
 //   store 指令提交时（已确定非投机），commit 把 {paddr,data,wstrb,size,uncached}
-//   推入本缓冲；本缓冲按程序序逐条写出到 DCache/外设，写出与流水线解耦
+//   推入本缓冲；本缓冲按程序序写出到 DCache/外设，写出与流水线解耦
 //   （提交不必等写完成，后续指令继续提交 —— 隐藏 store 延迟）。
 // - load 前递：在飞的 store 尚未写进 DCache 时，更年轻的 load 读同地址必须
 //   看到它的数据 —— LSU 在 AGU/DC 级查询本缓冲【逐字节】前递。
@@ -15,31 +15,20 @@
 //   * difftest 的 StoreEvent 在 commit 提交点报告（不等本缓冲排空），
 //     与 NEMU 的提交序一致；本缓冲只是写出延迟，软件不可见。
 //
-// 排空规则：
-// - head 项 valid 时持续发 dc_wr_req（保持到 addr_ok），dc_wr_done 后清项、
-//   head++。严格按程序序写出，绝不乱序（TSO 存储序 + 设备写序都靠它）；
-// - cached 与 uncached 走同一出口（dcache 内部按 uncached 旁路 AXI），
-//   uncached 写用 push_size_i 给出真实 AXI 宽度（外设按字节写的坑！）；
-// - sb_empty 判定严格："队列空 且 无在途未完成写"（inflight 计入），
-//   它是 commit 放行 ibar/cacop 的依据（uncached load 的序则由 LSU 侧
-//   query_partial 查询把关，不经 sb_empty）。
+// 排空规则（V3.4 行合并）：
+// - 项内仍保持字粒度（前递不变）；泄流口对 D$ 升为整行
+//   （`CACHE_LINE_BITS` 数据 + `CACHE_LINE_BYTES` 字节使能）。
+// - head 为 cached 时：自 head 向年轻方向连续聚合「同 cache 行、cached」项，
+//   一次发给 D$（年轻字节覆盖年老）；`st_done` 后一次弹出全部已聚合项。
+// - head 为 uncached 时：不合并，单字放在行内对应字槽，保留 size；一次只弹 1 项。
+// - 严格按程序序写出，绝不乱序（TSO + 设备写序）；
+// - sb_empty："队列空"（done 才清项，inflight 期间项仍 valid）。
 //
-// 前递查询（纯组合，二期完整版——逐字节合并）：
-// - 对查询字地址（paddr[31:2]），4 个字节道各自独立从最年轻项向老扫描，
-//   取第一个覆盖该字节的项做前递源——多条 store 部分写同一字（如两条
-//   st.h 拼一个字）也能整字前递，比一期"单项整字命中"覆盖面大得多；
-// - query_hit_o：4 字节全部可由缓冲提供（允许来自不同项）；
-// - query_partial_o：字地址有匹配但凑不齐 4 字节，或提供某字节的最年轻
-//   项是 uncached（设备数据必须真读）——load 等排空后重试；
-// - uncached load 序保证：query_uncached_i=1（本次查询来自 uncached load）
-//   时，只要缓冲中还有任何 uncached store 未写完即报 partial——保证
-//   "先写设备后读设备"的次序（不同寄存器地址也不允许越过）；
-// - 正在写出的 head 项（等 addr_ok/done 期间）仍参与前递：数据在项清除
-//   （done）前始终有效，且 done 意味着已对 dcache 可见，交接无空窗。
+// 前递查询（纯组合，逐字节合并）：同 V2.x —— 字地址匹配、年轻覆盖年老。
 //
 // 端口：
-// - push_*      ：commit 提交 store 入队（一拍最多 1 条，见 commit 单提交约定）
-// - dc_wr_*     ：排空写 DCache 口（含 uncached 直写外设通道）
+// - push_*      ：commit 提交 store 入队（一拍最多 1 条）
+// - dc_wr_*     ：排空写 DCache 口（行粒度 data/strb；uncached 仍带 size）
 // - query_*     ：LSU load 前递查询口（组合，物理地址）
 // - sb_full/empty
 // ============================================================
@@ -59,15 +48,15 @@ module store_buffer(
     output wire                sb_full_o,         // 满（commit 暂停提交 store）
     output wire                sb_empty_o,        // 空（屏障/uncached load 等待用）
 
-    // ---------------- 排空写出口（连 dcache 的 store 写口）----------------
-    output wire                dc_wr_req_o,       // 写请求（保持至 addr_ok，不能只保留一拍）
-    output wire [31:0]         dc_wr_paddr_o,
-    output wire [31:0]         dc_wr_data_o,
-    output wire [3:0]          dc_wr_strb_o,
+    // ---------------- 排空写出口（连 dcache 的 store 写口，行粒度）----------------
+    output wire                dc_wr_req_o,       // 写请求（保持至 addr_ok）
+    output wire [31:0]         dc_wr_paddr_o,     // 行对齐：低 `CACHE_LINE_W 位可为 0；UC 保留精确地址
+    output wire [`CACHE_LINE_BITS-1:0] dc_wr_data_o,
+    output wire [`CACHE_LINE_BYTES-1:0] dc_wr_strb_o,
     output wire [2:0]          dc_wr_size_o,
     output wire                dc_wr_uncached_o,
     input  wire                dc_wr_addr_ok_i,   // DCache 收下
-    input  wire                dc_wr_done_i,      // 写完成（cached 写命中可当拍/次拍完成）
+    input  wire                dc_wr_done_i,      // 写完成（与一次行写一一配对）
 
     // ---------------- load 前递查询口（LSU，组合）----------------
     input  wire [31:0]         query_paddr_i,
@@ -79,7 +68,6 @@ module store_buffer(
 
     // ------------------------------------------------------------
     // 存储：SB_SIZE 项环形 FIFO。head=最老（先写出），tail=入队位置。
-    // count 冗余计数便于满/空判断与同拍 push+pop 合并更新。
     // ------------------------------------------------------------
     reg [`SB_SIZE-1:0] valid;
     reg [31:0]         paddr    [0:`SB_SIZE-1];
@@ -90,22 +78,94 @@ module store_buffer(
     reg [`SB_W-1:0]    head;
     reg [`SB_W-1:0]    tail;
     reg [`SB_W:0]      count;
-    reg                inflight;    // head 项已被 dcache 收下、等 done
+    reg                inflight;    // 行写已被 dcache 收下、等 done
+    // addr_ok 时锁存本次弹出项数（防 done 拍组合聚合抖动）
+    reg [`SB_W:0]      inflight_n;
 
-    // 出队：done 一拍脉冲清 head 项（与 dcache 的 st_done 一一配对）
-    wire pop_fire = (count != {(`SB_W + 1){1'b0}}) && dc_wr_done_i;
-    // 入队：满时若同拍恰有 pop 也允许（净空间不变），提高满载吞吐
+    wire [`SB_W:0]     count_zero = {(`SB_W + 1){1'b0}};
+    wire pop_fire = (count != count_zero) && dc_wr_done_i;
     wire push_fire = push_valid_i && (!sb_full_o || pop_fire);
 
+    // ------------------------------------------------------------
+    // 泄流行聚合（组合）：自 head 连续同 cache 行、cached 项
+    // ------------------------------------------------------------
+    reg [`SB_SIZE-1:0]          merge_oh;
+    reg [`SB_W:0]               merge_n;
+    reg [`CACHE_LINE_BITS-1:0]  merge_data;
+    reg [`CACHE_LINE_BYTES-1:0] merge_strb;
+    reg [31:0]                  merge_paddr;
+    reg [2:0]                   merge_size;
+    reg                         merge_uncached;
+
+    integer mi, mb;
+    reg [`SB_W-1:0] m_idx;
+    reg [2:0]       m_word;
+    reg             m_cont;
+
+    always @(*) begin
+        merge_oh       = {`SB_SIZE{1'b0}};
+        merge_n        = count_zero;
+        merge_data     = {`CACHE_LINE_BITS{1'b0}};
+        merge_strb     = {`CACHE_LINE_BYTES{1'b0}};
+        merge_paddr    = 32'b0;
+        merge_size     = 3'b0;
+        merge_uncached = 1'b0;
+        m_idx          = {`SB_W{1'b0}};
+        m_word         = 3'b0;
+        m_cont         = 1'b0;
+
+        if ((count != count_zero) && valid[head]) begin
+            merge_uncached = uncached[head];
+            merge_size     = size[head];
+            // UC：保留精确地址；cached：行对齐（低位清零便于 D$ tag）
+            merge_paddr    = uncached[head] ? paddr[head]
+                                            : {paddr[head][31:`CACHE_LINE_W],
+                                               {`CACHE_LINE_W{1'b0}}};
+
+            if (uncached[head]) begin
+                // 单字：放在行内对应字槽，D$ UC 路径按 req_word 抽取
+                merge_oh[0] = 1'b1;
+                merge_n     = {{`SB_W{1'b0}}, 1'b1};
+                m_word      = paddr[head][4:2];
+                merge_strb[4*m_word +: 4] = strb[head];
+                merge_data[32*m_word +: 32] = data[head];
+            end else begin
+                // cached：自 head 向年轻连续同行走合并；年轻覆盖年老
+                m_cont = 1'b1;
+                for (mi = 0; mi < `SB_SIZE; mi = mi + 1) begin
+                    m_idx = head + mi[`SB_W-1:0];
+                    if (m_cont && valid[m_idx] && !uncached[m_idx]
+                     && (paddr[m_idx][31:`CACHE_LINE_W] == paddr[head][31:`CACHE_LINE_W])) begin
+                        merge_oh[mi] = 1'b1;
+                        merge_n      = merge_n + {{`SB_W{1'b0}}, 1'b1};
+                        m_word       = paddr[m_idx][4:2];
+                        for (mb = 0; mb < 4; mb = mb + 1) begin
+                            if (strb[m_idx][mb]) begin
+                                merge_strb[4*m_word + mb] = 1'b1;
+                                merge_data[8*(4*m_word + mb) +: 8] =
+                                    data[m_idx][8*mb +: 8];
+                            end
+                        end
+                    end else begin
+                        m_cont = 1'b0;
+                    end
+                end
+            end
+        end
+    end
+
     integer idx;
+    integer pi;
+    reg [`SB_W-1:0] pop_idx;
 
     always @(posedge clk) begin
         if (reset) begin
-            valid    <= {`SB_SIZE{1'b0}};
-            head     <= {`SB_W{1'b0}};
-            tail     <= {`SB_W{1'b0}};
-            count    <= {(`SB_W + 1){1'b0}};
-            inflight <= 1'b0;
+            valid       <= {`SB_SIZE{1'b0}};
+            head        <= {`SB_W{1'b0}};
+            tail        <= {`SB_W{1'b0}};
+            count       <= count_zero;
+            inflight    <= 1'b0;
+            inflight_n  <= count_zero;
             for (idx = 0; idx < `SB_SIZE; idx = idx + 1) begin
                 paddr[idx]    <= 32'b0;
                 data[idx]     <= 32'b0;
@@ -114,60 +174,66 @@ module store_buffer(
                 uncached[idx] <= 1'b0;
             end
         end else begin
-            // 注意 flush 不清任何状态：缓冲内都是已提交 store（体系结构状态）
+            // flush 不清：缓冲内都是已提交 store
             if (dc_wr_done_i) begin
-                inflight <= 1'b0;
+                inflight   <= 1'b0;
+                inflight_n <= count_zero;
             end else if (dc_wr_addr_ok_i) begin
-                inflight <= 1'b1;
+                inflight   <= 1'b1;
+                inflight_n <= merge_n;
             end
 
             if (pop_fire) begin
-                valid[head] <= 1'b0;
-                head <= head + `SB_W'd1;
+                for (pi = 0; pi < `SB_SIZE; pi = pi + 1) begin
+                    if (pi < inflight_n) begin
+                        pop_idx = head + pi[`SB_W-1:0];
+                        valid[pop_idx] <= 1'b0;
+                    end
+                end
+                head <= head + inflight_n[`SB_W-1:0];
             end
 
             if (push_fire) begin
-                paddr[tail] <= push_paddr_i;
-                data[tail] <= push_data_i;
-                strb[tail] <= push_wstrb_i;
-                size[tail] <= push_size_i;
+                paddr[tail]    <= push_paddr_i;
+                data[tail]     <= push_data_i;
+                strb[tail]     <= push_wstrb_i;
+                size[tail]     <= push_size_i;
                 uncached[tail] <= push_uncached_i;
-                valid[tail] <= 1'b1;
-                tail <= tail + `SB_W'd1;
+                valid[tail]    <= 1'b1;
+                tail           <= tail + `SB_W'd1;
             end
 
-            // 同拍 push+pop：count 不变（合并更新，防指针法丢计数）
             case ({push_fire, pop_fire})
                 2'b10: count <= count + {{`SB_W{1'b0}}, 1'b1};
-                2'b01: count <= count - {{`SB_W{1'b0}}, 1'b1};
-                default: count <= count;
+                2'b01: count <= count - inflight_n;
+                default: begin
+                    if (push_fire && pop_fire)
+                        count <= count + {{`SB_W{1'b0}}, 1'b1} - inflight_n;
+                    else
+                        count <= count;
+                end
             endcase
         end
     end
 
-    assign sb_full_o = (count == `SB_SIZE);
-    // 严格空：队列空即无在途写（done 才清项，项在 inflight 期间仍 valid）
-    assign sb_empty_o = (count == {(`SB_W + 1){1'b0}});
+    assign sb_full_o  = (count == `SB_SIZE);
+    assign sb_empty_o = (count == count_zero);
 
-    // 排空：head 项有效且未在途时持续请求（addr_ok 后撤 req 等 done）
-    assign dc_wr_req_o = !sb_empty_o && valid[head] && !inflight;
-    assign dc_wr_paddr_o = paddr[head];
-    assign dc_wr_data_o = data[head];
-    assign dc_wr_strb_o = strb[head];
-    assign dc_wr_size_o = size[head];
-    assign dc_wr_uncached_o = uncached[head];
+    assign dc_wr_req_o      = !sb_empty_o && valid[head] && !inflight;
+    assign dc_wr_paddr_o    = merge_paddr;
+    assign dc_wr_data_o     = merge_data;
+    assign dc_wr_strb_o     = merge_strb;
+    assign dc_wr_size_o     = merge_size;
+    assign dc_wr_uncached_o = merge_uncached;
 
     // ------------------------------------------------------------
-    // 前递查询（纯组合，逐字节合并）
-    // 每个字节道独立从最年轻（tail-1）向最老扫描：
-    // - 第一个覆盖该字节的 cached 项 -> 前递源（更老的项被它遮蔽）；
-    // - 第一个覆盖该字节的项若是 uncached -> 该字节受阻（设备数据必须真读）。
+    // 前递查询（纯组合，逐字节合并）—— 项内字粒度不变
     // ------------------------------------------------------------
-    reg [3:0]          byte_found;      // 各字节已找到 cached 前递源
-    reg [3:0]          byte_block;      // 各字节被 uncached 项挡住
+    reg [3:0]          byte_found;
+    reg [3:0]          byte_block;
     reg [31:0]         merge_data_r;
-    reg                any_match_r;     // 任意项字地址匹配
-    reg                any_unc_r;       // 缓冲中存在 uncached 项（含在途）
+    reg                any_match_r;
+    reg                any_unc_r;
     reg [`SB_W-1:0]    q_idx;
     integer            qi, b;
 
@@ -180,7 +246,7 @@ module store_buffer(
         q_idx        = {`SB_W{1'b0}};
 
         for (qi = 0; qi < `SB_SIZE; qi = qi + 1) begin
-            q_idx = tail - 1'b1 - qi[`SB_W-1:0];   // 最年轻 -> 最老（环回）
+            q_idx = tail - 1'b1 - qi[`SB_W-1:0];
             if (valid[q_idx]) begin
                 if (uncached[q_idx]) begin
                     any_unc_r = 1'b1;
@@ -202,8 +268,6 @@ module store_buffer(
         end
     end
 
-    // uncached load 的设备写序保证：缓冲里还有任何 uncached store 未排空
-    // 即报 partial（4-state 防御：query_uncached_i 悬空/X 视为 0）
     wire unc_order_block = (query_uncached_i === 1'b1) && any_unc_r;
 
     assign query_hit_o     = (&byte_found) && !unc_order_block;

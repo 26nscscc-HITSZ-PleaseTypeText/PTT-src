@@ -3,7 +3,8 @@
 // ------------------------------------------------------------
 // 功能/结构：
 // - 基础表 8192×2bit（bimodal）+ 4 个标记表 1024×{tag12,ctr3,u2}；
-//   全部推断 BRAM（1R+1W），查询 1 拍延迟返回；
+//   全部推断 BRAM（真双读口 2R+1W：查询口 q_* 与训练口 t_* 独立），
+//   查询仍 1 拍延迟返回，训练读表可与查询同拍并行；
 // - GHR 单份、训练到达时移入实际方向（不做检查点回滚——训练走队列，
 //   入队时快照当拍 GHR，出队训练用快照重算索引，与查询解耦）；
 // - 索引/标签用历史折叠（GHR 按各表历史长度 fold 到 10/12 位再与 PC 异或）；
@@ -11,9 +12,10 @@
 //   {prov_useful(2), prov_ctr(3), prov_idx(10), prov_id(2), prov_valid(1),
 //    alt_taken(1), base_ctr(2), base_idx(13), hits(4)}，另加 tage_valid@38、
 //   prov_tag(12)@43（44b 有效装入 64b `BPU_META_W；训练按位解包定位 provider）；
-// - 训练走「更新 FIFO + 3 级小流水」：满则丢弃计 overflow；查询优先占读口，
-//   空闲拍出队读表，随后 provider 原地更新 ctr/useful；误预测时向更长历史表
-//   分配新项，无位可分则把更长历史表的 useful 清 0（腾位）。
+// - 训练走「更新 FIFO + 3 级小流水」：满则丢弃计 overflow；因 2R 不占查询读口，
+//   FIFO 非空即可每拍出队读表；随后 provider 原地更新 ctr/useful；误预测时向
+//   更长历史表分配新项，无位可分则把更长历史表的 useful 清 0（腾位）；
+// - 写旁路：BRAM 同址同拍写转发进读寄存器；查询响应另对 T2 写口做组合旁路。
 // ============================================================
 `include "mycpu.h"
 
@@ -165,8 +167,8 @@ reg [TAGE_UPDATE_Q_CNT_W-1:0] uq_count;
 
 wire tage_update_queue_empty = (uq_count == {TAGE_UPDATE_Q_CNT_W{1'b0}});
 wire tage_update_queue_full  = (uq_count == TAGE_UPDATE_Q_DEPTH_C);
-wire train_read_stage_ready  = 1'b1;
-wire train_read_grant        = !query_valid_i && !tage_update_queue_empty && train_read_stage_ready;
+// 2R+1W：训练读口独立，FIFO 非空即可出队，不再等查询空闲拍
+wire train_read_grant        = !tage_update_queue_empty;
 wire tage_update_enqueue     = train_valid_i && (!tage_update_queue_full || train_read_grant);
 wire tage_update_overflow    = train_valid_i && tage_update_queue_full && !train_read_grant;
 wire tage_update_dequeue     = train_read_grant;
@@ -197,23 +199,26 @@ end
 // synthesis translate_on
 `endif
 
-// ---------------- 基础表（bimodal）----------------
+// ---------------- 基础表（bimodal，2R+1W）----------------
 wire [BASE_IDXW-1:0] q_base_idx = query_pc_i[2 +: BASE_IDXW];
-wire [BASE_IDXW-1:0] base_raddr = train_read_grant ? uq_head_pc[2 +: BASE_IDXW] : q_base_idx;
-wire [1:0] base_rdata;
+wire [1:0] base_q_rdata;
+wire [1:0] base_train_rdata;
 reg        base_we;
 reg [BASE_IDXW-1:0] base_waddr;
 reg [1:0]  base_wdata;
 
 tage_base_ram u_base(
-    .clk(clk), .raddr(base_raddr), .rdata(base_rdata),
+    .clk(clk),
+    .q_raddr(q_base_idx), .q_rdata(base_q_rdata),
+    .t_raddr(uq_head_pc[2 +: BASE_IDXW]), .t_rdata(base_train_rdata),
     .we(base_we), .waddr(base_waddr), .wdata(base_wdata)
 );
 
-// ---------------- 4 个标记表 ----------------
+// ---------------- 4 个标记表（2R+1W）----------------
 wire [TIDXW-1:0] q_idx [0:3];
 wire [`TAGE_TAG_W-1:0] q_tag [0:3];
-wire [TENTRY_W-1:0] t_rdata [0:3];
+wire [TENTRY_W-1:0] t_q_rdata [0:3];
+wire [TENTRY_W-1:0] t_train_rdata [0:3];
 reg  [3:0] t_we;
 reg  [TIDXW-1:0] t_waddr [0:3];
 reg  [TENTRY_W-1:0] t_wdata [0:3];
@@ -234,8 +239,10 @@ for (g = 0; g < 4; g = g + 1) begin : gen_ttab
     assign q_tag[g] = ttag(query_pc_i, g);
     tage_tag_ram u_ttab(
         .clk(clk),
-        .raddr(train_read_grant ? train_raddr : q_idx[g]),
-        .rdata(t_rdata[g]),
+        .q_raddr(q_idx[g]),
+        .q_rdata(t_q_rdata[g]),
+        .t_raddr(train_raddr),
+        .t_rdata(t_train_rdata[g]),
         .we(t_we[g]),
         .waddr(t_waddr[g]),
         .wdata(t_wdata[g])
@@ -258,22 +265,26 @@ always @(posedge clk) begin
     q_bidx_r <= q_base_idx;
 end
 
+// 查询侧组合写旁路：T2 写回与查询响应同拍命中同一索引时，用新值
 wire [3:0] thit;
+wire [TENTRY_W-1:0] t_q_entry_eff [0:3];
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_thit
+    assign t_q_entry_eff[g] = (t_we[g] && (t_waddr[g] == q_idx_r[g])) ? t_wdata[g] : t_q_rdata[g];
     assign thit[g] = q_valid_r
-                    && t_rdata[g][TENTRY_W-1]
-                    && (t_rdata[g][TENTRY_W-2 -: `TAGE_TAG_W] == q_tag_r[g]);
+                    && t_q_entry_eff[g][TENTRY_W-1]
+                    && (t_q_entry_eff[g][TENTRY_W-2 -: `TAGE_TAG_W] == q_tag_r[g]);
 end
 endgenerate
 
 // provider = 命中的最长历史表（表号大者优先）
 wire       prov_valid = |thit;
 wire [1:0] prov_id    = thit[3] ? 2'd3 : thit[2] ? 2'd2 : thit[1] ? 2'd1 : 2'd0;
-wire [2:0] prov_ctr   = t_rdata[prov_id][4:2];
-wire [1:0] prov_u     = t_rdata[prov_id][1:0];
-wire [`TAGE_TAG_W-1:0] prov_tag = t_rdata[prov_id][TENTRY_W-2 -: `TAGE_TAG_W];
-wire       base_taken = base_rdata[1];
+wire [2:0] prov_ctr   = t_q_entry_eff[prov_id][4:2];
+wire [1:0] prov_u     = t_q_entry_eff[prov_id][1:0];
+wire [`TAGE_TAG_W-1:0] prov_tag = t_q_entry_eff[prov_id][TENTRY_W-2 -: `TAGE_TAG_W];
+wire [1:0] base_q_eff = (base_we && (base_waddr == q_bidx_r)) ? base_wdata : base_q_rdata;
+wire       base_taken = base_q_eff[1];
 
 assign resp_valid_o = q_valid_r;
 assign taken_o = q_valid_r && (prov_valid ? prov_ctr[2] : base_taken);
@@ -283,7 +294,7 @@ assign taken_o = q_valid_r && (prov_valid ? prov_ctr[2] : base_taken);
 wire [`BPU_META_W-1:0] meta_raw =
     { {(`BPU_META_W-META_RAW_W){1'b0}},
       prov_u, prov_ctr, q_idx_r[prov_id], prov_id, prov_valid,
-      base_taken, base_rdata, q_bidx_r, thit };
+      base_taken, base_q_eff, q_bidx_r, thit };
 wire [`BPU_META_W-1:0] meta_provider_tag =
     { {(`BPU_META_W-META_PROVIDER_TAG_W){1'b0}}, prov_tag } << META_PROVIDER_TAG_LSB;
 assign meta_o = q_valid_r ? (meta_raw | meta_provider_tag) : {`BPU_META_W{1'b0}};
@@ -432,8 +443,8 @@ always @(posedge clk) begin
             for (pk = 0; pk < 4; pk = pk + 1) begin
                 t1_alloc_idx[pk]  <= tidx_h(t0_pc, pk, t0_ghr);
                 t1_alloc_tag[pk]  <= ttag_h(t0_pc, pk, t0_ghr);
-                t1_rd_entry[pk]   <= t_rdata[pk];
-                t1_rd_tag[pk]     <= t_rdata[pk][TENTRY_W-2 -: `TAGE_TAG_W];
+                t1_rd_entry[pk]   <= t_train_rdata[pk];
+                t1_rd_tag[pk]     <= t_train_rdata[pk][TENTRY_W-2 -: `TAGE_TAG_W];
             end
         end
         t2_valid <= t1_valid;
@@ -454,7 +465,9 @@ always @(posedge clk) begin
 end
 
 // lint 吸收
-wire tage_lint = (|m_hits) | t0_mispred | (|t0_ptag);
+wire tage_lint = (|m_hits) | t0_mispred | (|t0_ptag) | (|base_train_rdata)
+               | t0_meta_valid | t0_pvalid | (|t0_pid) | (|t0_pidx)
+               | train_meta_valid;
 
 `ifdef SYNTHESIS
 // synthesis translate_off
@@ -613,12 +626,15 @@ end
 endmodule
 
 // ------------------------------------------------------------
-// tage_base_ram / tage_tag_ram：简单双口同步 RAM 包装（推断 BRAM）
+// tage_base_ram / tage_tag_ram：真双读口同步 RAM（2R+1W，推断 BRAM）
+// 同址同拍写转发进对应读寄存器，避免训练写与查询/训练读 RAW 旧值。
 // ------------------------------------------------------------
 module tage_base_ram(
     input  wire        clk,
-    input  wire [12:0] raddr,
-    output reg  [1:0]  rdata,
+    input  wire [12:0] q_raddr,
+    output reg  [1:0]  q_rdata,
+    input  wire [12:0] t_raddr,
+    output reg  [1:0]  t_rdata,
     input  wire        we,
     input  wire [12:0] waddr,
     input  wire [1:0]  wdata
@@ -629,7 +645,8 @@ initial begin
     for (i = 0; i < `TAGE_BASE_DEPTH; i = i + 1) mem[i] = 2'b01;  // 弱不跳初值
 end
 always @(posedge clk) begin
-    rdata <= mem[raddr];
+    q_rdata <= (we && (waddr == q_raddr)) ? wdata : mem[q_raddr];
+    t_rdata <= (we && (waddr == t_raddr)) ? wdata : mem[t_raddr];
     if (we) mem[waddr] <= wdata;
 end
 endmodule
@@ -638,8 +655,10 @@ module tage_tag_ram #(
     parameter ENTRY_W = 1 + `TAGE_TAG_W + 3 + 2
 )(
     input  wire        clk,
-    input  wire [9:0]  raddr,
-    output reg  [ENTRY_W-1:0] rdata,
+    input  wire [9:0] q_raddr,
+    output reg  [ENTRY_W-1:0] q_rdata,
+    input  wire [9:0] t_raddr,
+    output reg  [ENTRY_W-1:0] t_rdata,
     input  wire        we,
     input  wire [9:0]  waddr,
     input  wire [ENTRY_W-1:0] wdata
@@ -650,7 +669,8 @@ initial begin
     for (i = 0; i < `TAGE_TAG_DEPTH; i = i + 1) mem[i] = {ENTRY_W{1'b0}};
 end
 always @(posedge clk) begin
-    rdata <= mem[raddr];
+    q_rdata <= (we && (waddr == q_raddr)) ? wdata : mem[q_raddr];
+    t_rdata <= (we && (waddr == t_raddr)) ? wdata : mem[t_raddr];
     if (we) mem[waddr] <= wdata;
 end
 endmodule

@@ -16,7 +16,7 @@
 // - push_*          ：dispatch 入站口（一拍最多 1 条）
 // - can_accept/occupancy ：空位信息
 // - wb0~3_*         ：4 路写回唤醒总线（alu0/alu1/mem/mdu）
-// - early0~2_*      ：提前唤醒（alu0/alu1 发射拍；early2=LSU 暂不用）
+// - early0~2_*      ：提前唤醒（alu0/alu1 发射拍；early2=LSU DC 命中限定）
 // - issue_*         ：发射口（到 fu_alu，ALU 恒可接收）
 // - flush_i         ：全局冲刷清空
 //
@@ -64,12 +64,12 @@ module rs_alu(
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
 
-    // ---------------- 提前唤醒总线 ×3（无数据；early0/1 已接通，early2 预留）----------------
+    // ---------------- 提前唤醒总线 ×3（无数据；early0/1/2 均已接通）----------------
     input  wire                       early0_valid_i,    // fu_alu0 发射拍唤醒
     input  wire [`ROB_W-1:0]          early0_robid_i,
     input  wire                       early1_valid_i,    // fu_alu1 发射拍唤醒
     input  wire [`ROB_W-1:0]          early1_robid_i,
-    input  wire                       early2_valid_i,    // lsu AGU 级投机唤醒（预留未接）
+    input  wire                       early2_valid_i,    // lsu DC 命中限定唤醒（V3.4）
     input  wire [`ROB_W-1:0]          early2_robid_i,
 
     // ---------------- 发射口（到 fu_alu，组合）----------------
@@ -159,13 +159,15 @@ for (gw = 0; gw < `RS_ALU_SIZE; gw = gw + 1) begin : g_wake
                              (wb3_valid_i && (wb3_robid_i == s1_robid[gw]));
     assign s0_wbhit[gw] = !s0_val_valid[gw] && s0_wb_match[gw];
     assign s1_wbhit[gw] = !s1_val_valid[gw] && s1_wb_match[gw];
-    // 只认 ALU early0/1；early2(LSU) 投机，暂不接入
+    // early0/1=ALU 发射拍；early2=LSU DC 命中限定（见 lsu early_wakeup）
     assign s0_earlyhit[gw] = !s0_ready[gw] && !s0_wbhit[gw] &&
                              ((early0_valid_i && (early0_robid_i == s0_robid[gw])) ||
-                              (early1_valid_i && (early1_robid_i == s0_robid[gw])));
+                              (early1_valid_i && (early1_robid_i == s0_robid[gw])) ||
+                              (early2_valid_i && (early2_robid_i == s0_robid[gw])));
     assign s1_earlyhit[gw] = !s1_ready[gw] && !s1_wbhit[gw] &&
                              ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
-                              (early1_valid_i && (early1_robid_i == s1_robid[gw])));
+                              (early1_valid_i && (early1_robid_i == s1_robid[gw])) ||
+                              (early2_valid_i && (early2_robid_i == s1_robid[gw])));
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :
