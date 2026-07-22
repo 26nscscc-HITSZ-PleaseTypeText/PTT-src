@@ -32,7 +32,7 @@ module csr_exception_commit_handler (
     input  wire [11:0] csr_rnum,
 
 
-    // ---------------- CSR 访问（来自 csr 指令，在WB真正执行） ----------------------------
+    // ---------------- CSR 访问（来自 csr 指令，commit 提交拍真正执行） ----------------------------
     input  wire [11:0] csr_num,    // CSR寄存器号
     input  wire        csr_we,     // CSR寄存器写使能
     input  wire [31:0] csr_wmask,  // CSR寄存器写掩码
@@ -60,10 +60,10 @@ module csr_exception_commit_handler (
     input  wire [31:0] wb_pc,
     input  wire        wb_is_ertn,    // ERTN指令要冲刷流水线
     input  wire [31:0] wb_vaddr,      // 用给BADV
-    input  wire        wb_ex,         // 异常处理触发信号，在WB由那几个valid相或驱动
+    input  wire        wb_ex,         // 异常处理触发信号（commit 各异常 valid 相或；wb_* 前缀系历史命名）
     input  wire [`TLB_OP_NUM-1:0] wb_tlb_op,
 
-    // 注意：有优先级，INT中断最大>IF检测出的异常>ID>EXE>MEM>WB
+    // 注意：有优先级，INT 最高，其余按 exception_Decoder 的链式次序编码
     input  wire        INT_valid,     // 中断是否触发，高电平即为有中断异常
     input  wire        ADEF_valid,    // 取指地址错位异常，特指pc
     input  wire        ADEM_valid,    // 访存物理地址越界异常（ESUBCODE=1，与 ADEF 区分）

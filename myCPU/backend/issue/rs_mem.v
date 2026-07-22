@@ -71,32 +71,32 @@ module rs_mem(
     input  wire                       lsu_ready_i          // LSU 本拍可接收（AGU 级空闲）
 );
 
-//TODO: 实现 4 项 FIFO 顺序发射保留站（参考：mariver station.v 的 MU 保留站部分，
-//      "MU和MDU必须顺序发射"——只允许队头发射）
+// 设计说明（已实现，参考 mariver station.v 的 MU 保留站部分 + 有限 load 越过）
 //
-//TODO: 存储结构：
+// 存储结构：
 //      与 rs_alu 类似（valid/robid/op/双源/imm），但组织成 FIFO：
-//      reg [`SB_W...] 不需要 prior，改用 head/tail 指针（4 项 -> 2bit 指针）。
-//      入站写 tail 项，tail++；发射出队 head 项，head++。
+//      head/tail 指针（4 项 -> 2bit）；入站写 tail 项 tail++，发射出队 head++。
 //
-//TODO: 唤醒与数据捕获：与 rs_alu 完全相同（4 路 wb 总线逐项逐源比较捕获，
+// 唤醒与数据捕获：与 rs_alu 完全相同（4 路 wb 总线逐项逐源比较捕获，
 //      入站同拍旁路同样要做）。
 //
-//TODO: 发射（仅队头）：
-//      issue_valid_o = valid[head] && s0_ready[head] && s1_ready[head] && lsu_ready_i;
-//      发射成功（issue_valid && lsu_ready）当拍出队。
-//      注意 store 即使 src1（数据）未就绪也不能让位给后面的 load —— 这就是
-//      顺序发射强制保证的"无地址消歧的正确性"。
+// 发射（队头优先 + 有限 load 越过，见头注）：
+//      默认发队头：issue = valid[head] && 双源 ready && lsu_ready_i；
+//      队头是未就绪普通 load 时，可从其后连续的普通 load 中选一条就绪的，
+//      发射拍与队头【交换】后按 head 出队（保持 FIFO 紧凑）；
+//      store/ll/sc/cacop 是序屏障——不可被越过，自身也不越过别人；
+//      store 即使 src1（数据）未就绪也不能让位给后面的 load ——
+//      无地址消歧时这是内存序正确性的底线。
 //
-//TODO: 冲刷：flush_i 清空 head/tail/valid。
+// 冲刷：flush_i 清空 head/tail/valid。
 //
-//TODO: 坑点提示：
+// 坑点提示：
 //      1. lsu_ready_i 为 0 时队头保持，不要丢发射（脉冲式发射 + not-ready 丢失
 //         是常见 bug，发射条件里与上 lsu_ready 即可避免）。
-//      2. 二期若做"load 提前唤醒"（lsu AGU 级 early2 总线），唤醒的是
-//         依赖 load 结果的 ALU 指令，本站自身的唤醒逻辑不变。
-//      3. 二期若想 load/store 之间乱序（load 越过前面的 store），必须加
-//         store 地址比较（内存消歧）+ 违例恢复，工作量大，务必先评估收益。
+//      2. 若做"load 提前唤醒"（lsu AGU 级 early2 总线，当前预留未接），唤醒的
+//         是依赖 load 结果的 ALU 指令，本站自身的唤醒逻辑不变。
+//      3. 若想 load 越过前面的 store，必须加 store 地址比较（内存消歧）+
+//         违例恢复，工作量大，务必先评估收益。
 
 reg                     valid [0:`RS_MEM_SIZE-1];
 reg [`ROB_W-1:0]        robid [0:`RS_MEM_SIZE-1];

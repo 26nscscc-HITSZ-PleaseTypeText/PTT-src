@@ -11,7 +11,7 @@
 // - 重要语义（与其他队列的本质区别！）：
 //   * 全局冲刷 flush 时本缓冲【不清空】—— 缓冲里全部是"已提交"的 store，
 //     体系结构上已经发生，必须继续写出；只有复位才清。
-//   * ibar/dbar/ll 等屏障语义：commit 等 sb_empty 后才放行。
+//   * ibar/dbar、cacop 等屏障语义：commit 等 sb_empty 后才放行。
 //   * difftest 的 StoreEvent 在 commit 提交点报告（不等本缓冲排空），
 //     与 NEMU 的提交序一致；本缓冲只是写出延迟，软件不可见。
 //
@@ -21,7 +21,8 @@
 // - cached 与 uncached 走同一出口（dcache 内部按 uncached 旁路 AXI），
 //   uncached 写用 push_size_i 给出真实 AXI 宽度（外设按字节写的坑！）；
 // - sb_empty 判定严格："队列空 且 无在途未完成写"（inflight 计入），
-//   它是 ibar/ll/uncached-load 放行的依据。
+//   它是 commit 放行 ibar/cacop 的依据（uncached load 的序则由 LSU 侧
+//   query_partial 查询把关，不经 sb_empty）。
 //
 // 前递查询（纯组合，二期完整版——逐字节合并）：
 // - 对查询字地址（paddr[31:2]），4 个字节道各自独立从最年轻项向老扫描，

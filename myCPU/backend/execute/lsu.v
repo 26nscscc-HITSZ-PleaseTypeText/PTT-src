@@ -70,7 +70,7 @@ module lsu(
     input  wire                       sb_query_partial_i,  // 部分命中：load 等排空重试
 
     // ---------------- uncached load 许可（与 ROB head 比较）----------------
-    input  wire [`ROB_W-1:0]          rob_head_robid_i,    // 编码约定见头注
+    input  wire [`ROB_W-1:0]          rob_head_robid_i,    // 编码：MSB=槽0 仍未提交，低位=head 对指针（顶层拼装，见 mycpu_top）
     input  wire                       rob_head_valid_i,
     output wire                       uncached_ld_inflight_o, // 有 uncached load 在飞（commit 屏蔽中断用）
 
@@ -425,6 +425,10 @@ wire d_done  = wb_excp_case || wb_st_case || wb_ld_sb_case || wb_ld_dc_case
 // 年轻 UC park（宽版）：仅对【比 DC 中 UC 更老】的 AGU 让位。
 // 勿对更年轻 AGU 让位（会覆盖 u / 堵 RS）；u_valid 期间禁更年轻进 DC。
 // digftest 曾用此版到 /#；窄版（仅 a_at_head）在 account_user_time 错载。
+// V2.3 探索注记（p2-park，已回退）：曾放行「年轻 cached load/cacop」越过
+// 停车的 u——探针实测该路径在 lab19/Linux 全程 0 次触发（RS_MEM 的
+// store/ll/sc/cacop 屏障使年轻 cached load 根本到不了 AGU），Linux 软门
+// 周期数逐位相同，故撤销保持绿版原样。
 wire d_uc_yield = d_is_unc_load && !d_at_head && !d_req_sent && !d_drop;
 wire u_at_head = u_valid
               && (u_robid[`ROB_PAIR_W-1:0] == head_pair)

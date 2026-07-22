@@ -5,8 +5,10 @@
 // - 4 路 × 1024 组，推断 BRAM（1R+1W 简单双口），查询 1 拍延迟；
 // - 条目 {valid, tag(20), br_type(2), len(3), target(32)}；
 //   fall_through 不存全宽：由 len 重建（= 块PC + 4*len）；
-// - 更新走内部 2 级小流水：U0 借用查询读口读出组内 4 路（该拍查询作废，
-//   预测器允许偶发 miss），U1 比较命中路原地更新 / victim 轮转分配；
+// - 更新走「训练 FIFO + 内部 2 级小流水」：训练请求先入小队列（深度
+//   `FTB_UPDATE_Q_DEPTH，满则丢弃计 overflow），查询优先占读口，U0 只在
+//   无查询的空闲拍出队借读口读出组内 4 路，U1 比较命中路原地更新 /
+//   victim 轮转分配（查询永不被作废）；
 // - 复位逐组清 valid（1024 拍）。
 // ============================================================
 `include "mycpu.h"
@@ -61,11 +63,13 @@ wire [`FTB_INDEX_W-1:0] u1_index= u1_pc[2 +: `FTB_INDEX_W];
 reg                     initing;
 reg [`FTB_INDEX_W-1:0]  init_set;
 
-reg [31:0]           uq_pc      [0:FTB_UPDATE_Q_DEPTH-1];
-reg [31:0]           uq_target  [0:FTB_UPDATE_Q_DEPTH-1];
-reg [31:0]           uq_ft      [0:FTB_UPDATE_Q_DEPTH-1];
-reg [`BR_TYPE_W-1:0] uq_btype   [0:FTB_UPDATE_Q_DEPTH-1];
-reg                  uq_alloc   [0:FTB_UPDATE_Q_DEPTH-1];
+// 训练 FIFO 载荷：强制分布式 RAM——32 项小队列若被推断成 RAMB18
+// 利用率仅 ~6%，且 BRAM 读延迟约束会打断"出队拍借读口"的异步读用法
+(* ram_style = "distributed" *) reg [31:0]           uq_pc      [0:FTB_UPDATE_Q_DEPTH-1];
+(* ram_style = "distributed" *) reg [31:0]           uq_target  [0:FTB_UPDATE_Q_DEPTH-1];
+(* ram_style = "distributed" *) reg [31:0]           uq_ft      [0:FTB_UPDATE_Q_DEPTH-1];
+(* ram_style = "distributed" *) reg [`BR_TYPE_W-1:0] uq_btype   [0:FTB_UPDATE_Q_DEPTH-1];
+(* ram_style = "distributed" *) reg                  uq_alloc   [0:FTB_UPDATE_Q_DEPTH-1];
 reg [FTB_UPDATE_Q_PTR_W-1:0] uq_rptr, uq_wptr;
 reg [FTB_UPDATE_Q_CNT_W-1:0] uq_count;
 

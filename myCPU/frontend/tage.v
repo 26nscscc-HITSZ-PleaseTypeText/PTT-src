@@ -1,17 +1,19 @@
 // ============================================================
-// tage 濡€虫健閿涘湵AGE 閺夆€叉閸掑棙鏁弬鐟版倻妫板嫭绁撮崳顭掔礆
+// tage 模块（TAGE 条件分支方向预测器）
 // ------------------------------------------------------------
-// 閸欏倽鈧啫鐤勯悳鎷岊嚛閺勫函绱?
-// - 閸╄櫣顢呯悰?8192鑴?bit閿涘潌imodal閿? 4 娑擃亝鐖ｇ拋鎷屻€?1024鑴硔tag12,ctr3,u2}閿?
-//   閸忋劑鍎撮幒銊︽焽 BRAM閿?R+1W閿涘绱濋弻銉嚄 1 閹峰秴娆㈡潻鐕傜幢
-// - GHR 娑撯偓閺堢喍绮庨幓鎰唉鐠侇厾绮岄弮鍓佇╅崗銉ョ杽闂勫懏鏌熼崥鎴礄濮樻瓕绻欏锝団€橀敍宀€绨挎惔锔炬殣娣囨繂鐣ч敍澶涚幢
-// - 缁便垹绱?閺嶅洩顔囬崫鍫濈瑖閿涙HR 瀵倹鍨ㄩ幎妯哄綌閿涘潚old 10/12 娴ｅ稄绱歗 PC 娴ｅ秵顔岄敍?
-// - meta 閹垫挸瀵橀敍?4b 閻?64b 鐎圭懓娅掗敍澶涚窗
+// 功能/结构：
+// - 基础表 8192×2bit（bimodal）+ 4 个标记表 1024×{tag12,ctr3,u2}；
+//   全部推断 BRAM（1R+1W），查询 1 拍延迟返回；
+// - GHR 单份、训练到达时移入实际方向（不做检查点回滚——训练走队列，
+//   入队时快照当拍 GHR，出队训练用快照重算索引，与查询解耦）；
+// - 索引/标签用历史折叠（GHR 按各表历史长度 fold 到 10/12 位再与 PC 异或）；
+// - meta 打包（低位起）：
 //   {prov_useful(2), prov_ctr(3), prov_idx(10), prov_id(2), prov_valid(1),
-//    alt_taken(1), base_ctr(2), base_idx(13), hits(4)} 閳ユ柡鈧?鐠侇厾绮岄崗宥夊櫢缁?provider閿?
-// - 鐠侇厾绮?2 缁狙冪毈濞翠焦鎸夐敍姝? 閸婄喐鐓＄拠銏ｎ嚢閸欙綀顕?4 鐞涖劌鍨庨柊宥呪偓娆撯偓?+ 閸╄櫣顢呯悰銊︽＋閸婄》绱?
-//   T1 閸愭瑱绱伴崺铏诡攨鐞?provider 鐠佲剝鏆熼妴涔絪eful閵嗕浇顕ゆ０鍕ゴ閸掑棝鍘ら敍鍧瞫eful==0 妞ょ櫢绱?
-//   閺冪姷鈹栨担宥呭灟鐏忓棙娲块梹鑳€?useful 濞?0 閼靛彞缍呴敍澶堚偓?
+//    alt_taken(1), base_ctr(2), base_idx(13), hits(4)}，另加 tage_valid@38、
+//   prov_tag(12)@43（44b 有效装入 64b `BPU_META_W；训练按位解包定位 provider）；
+// - 训练走「更新 FIFO + 3 级小流水」：满则丢弃计 overflow；查询优先占读口，
+//   空闲拍出队读表，随后 provider 原地更新 ctr/useful；误预测时向更长历史表
+//   分配新项，无位可分则把更长历史表的 useful 清 0（腾位）。
 // ============================================================
 `include "mycpu.h"
 
@@ -19,20 +21,20 @@ module tage(
     input  wire                       clk,
     input  wire                       reset,
 
-    // ---------------- 閺屻儴顕楅崣锝忕礄1 閹峰秴娆㈡潻鐕傜礆----------------
+    // ---------------- 查询口（1 拍延迟返回）----------------
     input  wire                       query_valid_i,
-    input  wire [31:0]                query_pc_i,         // 妫板嫭绁撮崸妤勬崳婵?PC
+    input  wire [31:0]                query_pc_i,         // 预测块起始 PC
 
-    output wire                       taken_o,            // 閺傜懓鎮滄０鍕ゴ閿涘牊娅?1 閹峰稄绱?
+    output wire                       taken_o,            // 方向预测（晚查询 1 拍）
     output wire                       resp_valid_o,
-    output wire [`BPU_META_W-1:0]     meta_o,             // 鐠侇厾绮岄崗鍐╂殶閹?
+    output wire [`BPU_META_W-1:0]     meta_o,             // 训练回带信息
 
-    // ---------------- 鐠侇厾绮岄崣锝忕礄閹绘劒姘︾痪褝绱濇禒鍛蒋娴犺泛鍨庨弨顖ょ礆----------------
+    // ---------------- 训练口（提交级 BPU 训练，经内部 FIFO 缓冲）----------------
     input  wire                       train_valid_i,
     input  wire [31:0]                train_pc_i,
-    input  wire                       train_taken_i,      // 鐎圭偤妾弬鐟版倻
-    input  wire                       train_mispred_i,    // 閺勵垰鎯佺拠顖烆暕濞?
-    input  wire [`BPU_META_W-1:0]     train_meta_i        // 妫板嫭绁撮弮鍓佹畱 meta 閸樼喐鐗遍崶鐐扮炊
+    input  wire                       train_taken_i,      // 实际方向
+    input  wire                       train_mispred_i,    // 该分支发生误预测
+    input  wire [`BPU_META_W-1:0]     train_meta_i        // 查询时的 meta 原样回传
 );
 
 localparam BASE_IDXW = 13;          // 8192
@@ -60,7 +62,7 @@ localparam [TAGE_UPDATE_Q_CNT_W-1:0] TAGE_UPDATE_Q_DEPTH_C = TAGE_UPDATE_Q_DEPTH
 // ---------------- GHR ----------------
 reg [`GHR_LEN-1:0] ghr;
 
-// ---------------- 閹舵ê褰旈崫鍫濈瑖 ----------------
+// ---------------- 历史折叠函数 ----------------
 function [TIDXW-1:0] fold10;
     input [`GHR_LEN-1:0] h;
     input integer len;
@@ -83,7 +85,7 @@ function [`TAGE_TAG_W-1:0] fold12;
     end
 endfunction
 
-// 閸氬嫯銆冪槐銏犵穿/閺嶅洩顔囬敍鍫熺叀鐠囥垻鏁?query_pc閿涘矁顔勭紒鍐ㄥ瀻闁板秶鏁?train_pc閿涘苯鍙￠悽銊ュ毐閺佸府绱?
+// 索引/标签生成：查询用 query_pc + 当前 ghr；训练用入队快照的 ghr（_h 版本）
 function [TIDXW-1:0] tidx;
     input [31:0] pc;
     input integer t;
@@ -130,7 +132,7 @@ function [`TAGE_TAG_W-1:0] ttag_h;
     end
 endfunction
 
-// ---------------- 鐠侇厾绮屽ù浣规寜鐎靛嫬鐡ㄩ崳顭掔礄T0 閸婄喕顕伴崣锝忕礆----------------
+// ---------------- 训练流水线寄存器（T0 读表 / T1 / T2 写回）----------------
 reg        t0_valid;
 reg        t0_ghr_valid;
 reg [31:0] t0_pc;
@@ -195,7 +197,7 @@ end
 // synthesis translate_on
 `endif
 
-// ---------------- 閸╄櫣顢呯悰?----------------
+// ---------------- 基础表（bimodal）----------------
 wire [BASE_IDXW-1:0] q_base_idx = query_pc_i[2 +: BASE_IDXW];
 wire [BASE_IDXW-1:0] base_raddr = train_read_grant ? uq_head_pc[2 +: BASE_IDXW] : q_base_idx;
 wire [1:0] base_rdata;
@@ -208,7 +210,7 @@ tage_base_ram u_base(
     .we(base_we), .waddr(base_waddr), .wdata(base_wdata)
 );
 
-// ---------------- 4 娑擃亝鐖ｇ拋鎷屻€?----------------
+// ---------------- 4 个标记表 ----------------
 wire [TIDXW-1:0] q_idx [0:3];
 wire [`TAGE_TAG_W-1:0] q_tag [0:3];
 wire [TENTRY_W-1:0] t_rdata [0:3];
@@ -241,7 +243,7 @@ for (g = 0; g < 4; g = g + 1) begin : gen_ttab
 end
 endgenerate
 
-// ---------------- 閺屻儴顕楅崥鍫熷灇閿涘牊娅?1 閹峰稄绱?---------------
+// ---------------- 查询响应（相对查询晚 1 拍）----------------
 reg        q_valid_r;
 reg [`TAGE_TAG_W-1:0] q_tag_r [0:3];
 reg [TIDXW-1:0]       q_idx_r [0:3];
@@ -265,7 +267,7 @@ for (g = 0; g < 4; g = g + 1) begin : gen_thit
 end
 endgenerate
 
-// provider = 閸涙垝鑵戠悰銊よ厬閸樺棗褰堕張鈧梹鑳偓?
+// provider = 命中的最长历史表（表号大者优先）
 wire       prov_valid = |thit;
 wire [1:0] prov_id    = thit[3] ? 2'd3 : thit[2] ? 2'd2 : thit[1] ? 2'd1 : 2'd0;
 wire [2:0] prov_ctr   = t_rdata[prov_id][4:2];
@@ -276,8 +278,8 @@ wire       base_taken = base_rdata[1];
 assign resp_valid_o = q_valid_r;
 assign taken_o = q_valid_r && (prov_valid ? prov_ctr[2] : base_taken);
 
-// meta 閹垫挸瀵橀敍姝縫rov_useful(2), prov_ctr(3), prov_idx(10), prov_id(2), prov_valid(1),
-//             alt_taken(1), base_ctr(2), base_idx(13), hits(4)}  閸?38 娴?
+// meta 打包：{prov_useful(2), prov_ctr(3), prov_idx(10), prov_id(2), prov_valid(1),
+//             alt_taken(1), base_ctr(2), base_idx(13), hits(4)} 共 38 位，
 wire [`BPU_META_W-1:0] meta_raw =
     { {(`BPU_META_W-META_RAW_W){1'b0}},
       prov_u, prov_ctr, q_idx_r[prov_id], prov_id, prov_valid,
@@ -286,7 +288,7 @@ wire [`BPU_META_W-1:0] meta_provider_tag =
     { {(`BPU_META_W-META_PROVIDER_TAG_W){1'b0}}, prov_tag } << META_PROVIDER_TAG_LSB;
 assign meta_o = q_valid_r ? (meta_raw | meta_provider_tag) : {`BPU_META_W{1'b0}};
 
-// meta 鐟欙絽瀵橀敍鍫ｎ唲缂佸啰顏敍?
+// meta 解包（训练 T2 拍使用）
 wire                  train_meta_valid = train_meta_i[META_TAGE_VALID_BIT];
 wire [3:0]            m_hits     = t2_meta[META_HITS_LSB +: 4];
 wire [BASE_IDXW-1:0]  m_base_idx = t2_meta[META_BASE_IDX_LSB +: BASE_IDXW];
@@ -299,8 +301,8 @@ wire [2:0]            m_pctr     = t2_meta[META_PROVIDER_CTR_LSB +: 3];
 wire [1:0]            m_pu       = t2_meta[META_PROVIDER_U_LSB +: 2];
 wire [`TAGE_TAG_W-1:0] m_ptag    = t2_meta[META_PROVIDER_TAG_LSB +: META_PROVIDER_TAG_W];
 
-// ---------------- 鐠侇厾绮?----------------
-// 妤楀崬鎷扮拋鈩冩殶
+// ---------------- 训练写回 ----------------
+// 饱和计数器
 function [1:0] sat2;
     input [1:0] c;
     input taken;
@@ -318,7 +320,7 @@ function [2:0] sat3;
     end
 endfunction
 
-// T1 閹峰稄绱伴崚鍡涘帳閸婃瑩鈧?= provider 閺囨挳鏆遍惃鍕€冩稉?useful==0 閼板拑绱橳0 鐠囪鍤敍?
+// 分配候选 = 比 provider 历史更长的表中 空项或 useful==0 的项
 wire [3:0] alloc_cand;
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_alloc
@@ -331,7 +333,7 @@ wire alloc_any = |alloc_cand;
 wire [1:0] alloc_sel = alloc_cand[0] ? 2'd0 : alloc_cand[1] ? 2'd1 :
                        alloc_cand[2] ? 2'd2 : 2'd3;
 
-// provider 妫板嫭绁村锝団€樻稉鏂剧瑢 alt 娑撳秴鎮?-> useful++閿涙盯鏁?-> useful--
+// provider 预测与 alt 不同时才动 useful：预测对 -> useful++，错 -> useful--
 wire t1_prov_pred  = m_pctr[2];
 wire t1_prov_corr  = (t1_prov_pred == t2_taken);
 wire t1_useful_chg = m_pvalid && (t1_prov_pred != m_alt);
@@ -352,21 +354,21 @@ always @(*) begin
                        t2_taken ? 3'd4 : 3'd3, 2'b00};
     end
         if (t2_valid) begin
-        // 閸╄櫣顢呯悰銊︿航鐠侇厾绮?
+        // 基础表恒训练
         base_we = 1'b1;
         if (m_pvalid && provider_tag_match) begin
-            // provider 閸樼喎婀撮弴瀛樻煀閿涘潏tr + useful閿?
+            // provider 原地更新（ctr + useful；tag 比对通过才写，防队列期间被换项）
             t_we[m_pid]    = 1'b1;
             t_waddr[m_pid] = m_pidx;
             t_wdata[m_pid] = {1'b1,
                               m_ptag,
                               sat3(m_pctr, t2_taken), t1_u_new};
         end
-        // 鐠囶垶顣╁ù瀣剁窗閸氭垶娲块梹鑳€冮崚鍡涘帳閿涘牅绗?provider 閺囧瓨鏌婃稉宥呮倱鐞涱煉绱濋弮鐘插暱缁愪緤绱?
+        // 误预测且有分配候选（且候选不是 provider 自身）：分配新项
         if (t2_mispred && alloc_any && !(m_pvalid && (alloc_sel == m_pid))) begin
             t_we[alloc_sel] = 1'b1;
         end else if (t2_mispred && !alloc_any) begin
-            // 閺?useful==0 缁岃桨缍呴敍姘纯闂€鍨坊閸欒尪銆?useful 濞?0 閼靛彞缍?
+            // 无可分配项：把比 provider 更长历史表的 useful 清 0（腾位）
             for (tk = 0; tk < 4; tk = tk + 1) begin
                 if (!m_pvalid || (tk[1:0] > m_pid)) begin
                     if (t2_rd_entry[tk][1:0] != 2'b00) begin
@@ -382,7 +384,7 @@ always @(*) begin
     end
 end
 
-reg [`TAGE_TAG_W-1:0] t1_rd_tag [0:3];  // lint 閸氬憡鏁归悽?
+reg [`TAGE_TAG_W-1:0] t1_rd_tag [0:3];  // lint 吸收用途
 
 integer pk;
 always @(posedge clk) begin
@@ -396,8 +398,8 @@ always @(posedge clk) begin
         uq_wptr      <= {TAGE_UPDATE_Q_PTR_W{1'b0}};
         uq_count     <= {TAGE_UPDATE_Q_CNT_W{1'b0}};
     end else begin
-        // T0閿涙碍宕熼懢鐤唲缂佸喛绱欓崐鐔活嚢閸欙綇绱辩拠璇叉勾閸р偓閹?鐠侇厾绮岄崜?GHR"缁犳绱濇稉?GHR 缁夎缍呴崥灞惧鐎瑰鍙忛敍?
-        //     ghr 閸?T0 閹规洝骞忛幏宥呯毣閺堫亞些娴ｅ稄绱漈0 鐠囪崵鏁ら弮?GHR閿涘1 閸?idx 娑旂喓鏁?T0 缁犳銈介惃鍕剁礆
+        // T0：出队项进读表级（用入队快照 GHR 重算读地址，已在组合段完成，
+        //     此处仅锁存出队 bundle；meta 无效项直接旁落不进流水）
         if (tage_update_enqueue) begin
             uq_pc[uq_wptr]      <= train_pc_i;
             uq_taken[uq_wptr]   <= train_taken_i;
@@ -420,7 +422,7 @@ always @(posedge clk) begin
             t0_meta    <= uq_head_meta;
             t0_ghr     <= uq_head_ghr;
         end
-        // T1閿涙岸鏀ｇ€?T0 鐠囪鍤稉搴″瀻闁板秴鎼辩敮宀嬬幢GHR 缁夎缍?
+        // T1：锁存 T0 读出的 4 路表项与分配用 idx/tag（快照 GHR 版本）
         t1_valid <= t0_valid;
         if (t0_valid) begin
             t1_taken   <= t0_taken;
@@ -451,7 +453,7 @@ always @(posedge clk) begin
     end
 end
 
-// lint 閸氬憡鏁?
+// lint 吸收
 wire tage_lint = (|m_hits) | t0_mispred | (|t0_ptag);
 
 `ifdef SYNTHESIS
@@ -611,7 +613,7 @@ end
 endmodule
 
 // ------------------------------------------------------------
-// tage_base_ram / tage_tag_ram閿涙氨鐣濋崡鏇炲蓟閸?RAM 濡剝婢橀敍鍫熷腹閺?BRAM閿?
+// tage_base_ram / tage_tag_ram：简单双口同步 RAM 包装（推断 BRAM）
 // ------------------------------------------------------------
 module tage_base_ram(
     input  wire        clk,
@@ -624,7 +626,7 @@ module tage_base_ram(
 reg [1:0] mem [0:`TAGE_BASE_DEPTH-1];
 integer i;
 initial begin
-    for (i = 0; i < `TAGE_BASE_DEPTH; i = i + 1) mem[i] = 2'b01;  // 瀵彉绗夌捄?
+    for (i = 0; i < `TAGE_BASE_DEPTH; i = i + 1) mem[i] = 2'b01;  // 弱不跳初值
 end
 always @(posedge clk) begin
     rdata <= mem[raddr];

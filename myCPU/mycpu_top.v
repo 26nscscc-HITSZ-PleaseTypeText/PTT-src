@@ -7,7 +7,7 @@
 //   后端：decoder x2 -> rename(RAT+ARF/ROB) -> dispatch -> 4xRS
 //         -> FU(ALU0/ALU1/LSU/MDU) -> ROB -> commit(双提交)
 //   访存：LSU(AGU+DC) / store_buffer(提交后写) / DCache / L2 / AXI 桥
-//   特权：csr_exception_commit_handler + tlb_manager(内含 32 项 TLB)
+//   特权：csr_exception_commit_handler + tlb_manager(TLBNUM 项主 TLB，本层参数=32)
 // - 重命名标签 = ROB 编号（mariver 队列式重命名，无独立 PRF/freelist）；
 // - 一切恢复（误预测/异常/ertn/特权 refetch）走提交级统一冲刷（ctrl 广播）；
 // - store 提交后经 store_buffer 按序写出；uncached load 仅在 ROB 头发出。
@@ -722,6 +722,9 @@ module core_top #(
     wire [`ROB_W-1:0]         dsp_rob_raddr0, dsp_rob_raddr1, dsp_rob_raddr2, dsp_rob_raddr3;
     wire                      rob_rrdy0, rob_rrdy1, rob_rrdy2, rob_rrdy3;
     wire [31:0]               rob_rdata0, rob_rdata1, rob_rdata2, rob_rdata3;
+    // commit CSR 写回（rename 的 L0 免冲刷提交口在前面就要用，提前声明）
+    wire                      cmt_csr_we;
+    wire [13:0]               cmt_csr_wnum;
 
 //--------------------------------------------------
 // rename：重命名级（查 RAT / 读 ARF / 分配 ROB / 锁存到分发级）
@@ -1714,7 +1717,9 @@ module core_top #(
     // ROB 提交口（队头一对；cmt*_valid 已在 LSU 前声明）
     wire        rob_cmt0_complete, rob_cmt1_complete;
     wire [31:0] rob_cmt0_pc,       rob_cmt1_pc;
-    wire [31:0] rob_cmt0_inst,     rob_cmt1_inst;
+    wire [31:0] rob_cmt0_inst,     rob_cmt1_inst;      // 仅 debug/difftest（综合视图恒 0）
+    wire        rob_cmt0_inst_is_b0, rob_cmt1_inst_is_b0;   // ROB 预译码（提交真实用途）
+    wire        rob_cmt0_is_direct_b, rob_cmt1_is_direct_b;
     wire        rob_cmt0_rf_we,    rob_cmt1_rf_we;
     wire [4:0]  rob_cmt0_rd,       rob_cmt1_rd;
     wire [31:0] rob_cmt0_result,   rob_cmt1_result;
@@ -1749,8 +1754,7 @@ module core_top #(
     wire        cmt_excp_int, cmt_excp_adef, cmt_excp_adem, cmt_excp_ipe;
     wire        cmt_excp_ale, cmt_excp_sys, cmt_excp_brk, cmt_excp_ine;
     wire [`TLB_EX_NUM-1:0] cmt_excp_tlb_vec;
-    wire        cmt_csr_we;
-    wire [13:0] cmt_csr_wnum;
+    // （cmt_csr_we / cmt_csr_wnum 已在 rename 例化前声明）
     wire [31:0] cmt_csr_wmask;
     wire [31:0] cmt_csr_wvalue;
     wire        cmt_ll_set, cmt_sc_set;
@@ -1863,6 +1867,8 @@ module core_top #(
         .cmt0_complete_o  (rob_cmt0_complete),
         .cmt0_pc_o        (rob_cmt0_pc),
         .cmt0_inst_o      (rob_cmt0_inst),
+        .cmt0_inst_is_b0_o (rob_cmt0_inst_is_b0),
+        .cmt0_is_direct_b_o(rob_cmt0_is_direct_b),
         .cmt0_rf_we_o     (rob_cmt0_rf_we),
         .cmt0_rd_o        (rob_cmt0_rd),
         .cmt0_result_o    (rob_cmt0_result),
@@ -1890,6 +1896,8 @@ module core_top #(
         .cmt1_complete_o  (rob_cmt1_complete),
         .cmt1_pc_o        (rob_cmt1_pc),
         .cmt1_inst_o      (rob_cmt1_inst),
+        .cmt1_inst_is_b0_o (rob_cmt1_inst_is_b0),
+        .cmt1_is_direct_b_o(rob_cmt1_is_direct_b),
         .cmt1_rf_we_o     (rob_cmt1_rf_we),
         .cmt1_rd_o        (rob_cmt1_rd),
         .cmt1_result_o    (rob_cmt1_result),
@@ -1930,6 +1938,8 @@ module core_top #(
         .cmt0_complete_i   (rob_cmt0_complete),
         .cmt0_pc_i         (rob_cmt0_pc),
         .cmt0_inst_i       (rob_cmt0_inst),
+        .cmt0_inst_is_b0_i (rob_cmt0_inst_is_b0),
+        .cmt0_is_direct_b_i(rob_cmt0_is_direct_b),
         .cmt0_rf_we_i      (rob_cmt0_rf_we),
         .cmt0_rd_i         (rob_cmt0_rd),
         .cmt0_result_i     (rob_cmt0_result),
@@ -1957,6 +1967,8 @@ module core_top #(
         .cmt1_complete_i   (rob_cmt1_complete),
         .cmt1_pc_i         (rob_cmt1_pc),
         .cmt1_inst_i       (rob_cmt1_inst),
+        .cmt1_inst_is_b0_i (rob_cmt1_inst_is_b0),
+        .cmt1_is_direct_b_i(rob_cmt1_is_direct_b),
         .cmt1_rf_we_i      (rob_cmt1_rf_we),
         .cmt1_rd_i         (rob_cmt1_rd),
         .cmt1_result_i     (rob_cmt1_result),

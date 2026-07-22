@@ -51,7 +51,7 @@ module rs_mdu(
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
 
-    // ---------------- 提前唤醒总线 ×3（二期）----------------
+    // ---------------- 提前唤醒总线 ×3（early0/1 已接通，early2 预留）----------------
     input  wire                       early0_valid_i,
     input  wire [`ROB_W-1:0]          early0_robid_i,
     input  wire                       early1_valid_i,
@@ -72,12 +72,11 @@ module rs_mdu(
     input  wire                       mdu_ready_i          // MDU 空闲可接收
 );
 
-//TODO: 实现 2 项 FIFO 顺序发射保留站（参考：mariver station.v 的 MDU 保留站部分）
-//      结构与 rs_mem 完全同构（head/tail FIFO + 唤醒捕获 + 队头发射），
-//      只是容量 2 项、bundle 字段不同、反压来自 mdu_ready_i。
-//      建议先写完 rs_mem 再复制改字段，二十分钟的事。
+// 设计说明（已实现，参考 mariver station.v 的 MDU 保留站部分）：
+//      结构与 rs_mem 同构（head/tail FIFO + 唤醒捕获 + 队头发射），
+//      容量 2 项、bundle 字段不同、反压来自 mdu_ready_i。
 //
-//TODO: 坑点提示：
+// 坑点提示：
 //      1. csrxchg 同时用 rj(mask) 和 rd(写值) 两个源，都要等唤醒。
 //      2. invtlb 的 asid 来自 rj[9:0]、va 来自 rk —— 也是双源指令。
 //      3. rdcnt 类无源操作数（use_src=0，rename 已置 ready=1），入站即可发射。

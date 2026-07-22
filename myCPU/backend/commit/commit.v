@@ -21,7 +21,7 @@
 // - tlb/cacop_*  ：TLB 维护与 cache 维护落地
 // - ftq_* / ras_*：BPU 训练与 RAS 提交栈
 // - flush_*      ：冲刷请求（送 ctrl）
-// - debug0/1_*   ：调试/难度对齐接口
+// - debug0/1_*   ：调试/difftest 对齐接口
 // ============================================================
 `include "mycpu.h"
 
@@ -40,7 +40,9 @@ module commit(
     input  wire                       cmt0_valid_i,
     input  wire                       cmt0_complete_i,
     input  wire [31:0]                cmt0_pc_i,
-    input  wire [31:0]                cmt0_inst_i,
+    input  wire [31:0]                cmt0_inst_i,        // 仅 debug/difftest 观测（综合视图恒 0）
+    input  wire                       cmt0_inst_is_b0_i,  // ROB 预译码：inst==0x50000000
+    input  wire                       cmt0_is_direct_b_i, // ROB 预译码：inst[31:26]==010100
     input  wire                       cmt0_rf_we_i,
     input  wire [4:0]                 cmt0_rd_i,
     input  wire [31:0]                cmt0_result_i,
@@ -68,7 +70,9 @@ module commit(
     input  wire                       cmt1_valid_i,
     input  wire                       cmt1_complete_i,
     input  wire [31:0]                cmt1_pc_i,
-    input  wire [31:0]                cmt1_inst_i,
+    input  wire [31:0]                cmt1_inst_i,        // 仅 debug/difftest 观测（综合视图恒 0）
+    input  wire                       cmt1_inst_is_b0_i,
+    input  wire                       cmt1_is_direct_b_i,
     input  wire                       cmt1_rf_we_i,
     input  wire [4:0]                 cmt1_rd_i,
     input  wire [31:0]                cmt1_result_i,
@@ -206,23 +210,23 @@ module commit(
     output wire [31:0]                debug1_inst_o
 );
 
-//TODO: 实现提交仲裁与落地（参考：mariver commit.v 的 can0/can1/flush 体系 +
+// 设计说明（已实现，参考 mariver commit.v 的 can0/can1/flush 体系 +
 //      团队赛报告 2.4.7 节的单/双提交规则。这是全核逻辑最"杂"的模块，
 //      但每条规则都很直白，逐条写即可）
 //
-//TODO: 第一步——基础可提交判定：
+// 第一步——基础可提交判定：
 //      can0 = cmt0_valid_i && cmt0_complete_i;
 //      can1 = can0提交成功 && cmt1_valid_i && cmt1_complete_i && 槽1无单提交限制;
 //      （槽 0 无效但槽 1 有效的情况：恒成对分配下槽 0 无效=空泡，跳过即可，
 //        此时 can1 仅需自身 complete。）
 //
-//TODO: 第二步——中断附着（最高优先级，在一切提交动作之前判断）：
+// 第二步——中断附着（最高优先级，在一切提交动作之前判断）：
 //      int_take = has_int_i && cmt0_valid_i && !uncached_ld_inflight_i;
 //      命中时：槽 0 指令不提交效果（不写 ARF/SB），按 INT 异常走异常流程，
 //      ERA=cmt0_pc_i，flush_type=FLUSH_EXCP，flush_pc=csr_next_pc_i。
 //      （uncached load 在飞时禁止附着：外设读副作用已发出，必须等它提交。）
 //
-//TODO: 第三步——槽 0 异常检查：
+// 第三步——槽 0 异常检查：
 //      cmt0_excp_i 非 0（按 EXCP_* 优先级取最高位）：不提交效果，
 //      向 csr handler 发对应异常 valid（excp_*_o 端口逐位翻译；
 //      取指侧 TLB 异常翻 TLB_EX_TLBR/PIF/PPI，访存侧翻 TLBR/PIL/PIS/PPI/PME，
@@ -230,7 +234,7 @@ module commit(
 //      flush_type=FLUSH_EXCP，flush_pc=csr_next_pc_i（handler 组合给出
 //      EENTRY/TLBRENTRY）。同拍 rob_clear0+pop（该指令"以异常方式退休"）。
 //
-//TODO: 第四步——槽 0 特权类（priv_vec 非 0 且无异常）：单提交 + 落地 + 冲刷：
+// 第四步——槽 0 特权类（priv_vec 非 0 且无异常）：单提交 + 落地 + 冲刷：
 //      PRIV_CSR_WR：csr_we_o=1（wnum/wvalue=result2/wmask=~0），FLUSH_REFETCH pc+4
 //      PRIV_ERTN  ：csr_cmt_ertn_o=1，FLUSH_ERTN，flush_pc=csr_next_pc_i（ERA）
 //      PRIV_TLB   ：tlb_op_cmt_o = cmt0_tlb_op_i（ROB 静态区已存，直通发一拍）；
@@ -246,7 +250,7 @@ module commit(
 //                   FLUSH_REFETCH pc+4
 //      PRIV_IDLE  ：idle_commit_o=1 + FLUSH_REFETCH pc+4（ctrl 冻结取指等中断）
 //
-//TODO: 第五步——槽 0 分支误预测检查（无异常无特权时）：
+// 第五步——槽 0 分支误预测检查（无异常无特权时）：
 //      ftq_query_id_o = cmt0_ftq_id_i（组合查 FTQ 存的预测目标）；
 //      mispred =  (cmt0_br_taken_i != cmt0_pred_taken_i)
 //              || (cmt0_br_taken_i && cmt0_pred_taken_i
@@ -255,7 +259,7 @@ module commit(
 //      命中：本条正常提交（写 ARF），但 flush_type=FLUSH_MISPRED，
 //      flush_pc = br_taken ? br_target : pc+4；本拍只提交槽 0。
 //
-//TODO: 第六步——槽 1 的单提交限制（出现任一情况槽 1 留到下一拍）：
+// 第六步——槽 1 的单提交限制（出现任一情况槽 1 留到下一拍）：
 //      槽1 有异常 / 槽1 priv / 槽1 CALL·RET·jirl 或误预测 /
 //      槽0 也是分支（同拍双分支仍禁，单训练口）/
 //      槽0 冲刷 / 两槽都是 store（SB 单写口）。
@@ -265,7 +269,7 @@ module commit(
 //      jirl 双提，需独立类型/更严间接目标校验，勿再仅靠 BR_TYPE_UNCOND。
 //      未来改进：FTQ 加第二读口后，可放开「不同 ftq_id」的槽1 正确分支双提。
 //
-//TODO: 第七步——常规提交动作（can0/can1 各自独立做）：
+// 第七步——常规提交动作（can0/can1 各自独立做）：
 //      写 ARF：arf_we=rf_we && rd!=0，wdata=result；
 //      释放 RAT：rat_cmt_en=同 arf_we，num=对应 robid
 //                （robid0={1'b0,head}，robid1={1'b1,head}，head 取自 head_robid0_i）；
@@ -276,23 +280,23 @@ module commit(
 //                训练一条分支（槽1 分支已单提交，天然满足））；
 //      RAS 提交栈：br_type==CALL -> ras_cmt_call（retaddr=pc+4）；RET -> ras_cmt_ret。
 //
-//TODO: 第八步——rob_pop/clear 生成：
+// 第八步——rob_pop/clear 生成：
 //      rob_clear0_o=本拍槽0提交（含异常退休）；rob_clear1_o=槽1 提交；
 //      rob_pop_o=队头一对全部处理完（两槽都 clear 过/无效）——注意槽 1 延迟
 //      提交的场景：槽 0 先 clear，下一拍槽 1 提交后才 pop。
 //
-//TODO: 第九步——debug/difftest：
+// 第九步——debug/difftest：
 //      debug0_* = 槽 0 提交信息（valid 仅在真正提交效果时置位）；
 //      debug1_* = 槽 1。chiplab 的 debug0_wb_* 只接槽 0；双提交核用 DIFFTEST
 //      校验两个口（顶层已按此连线）。
 //
-//TODO: 坑点提示：
+// 坑点提示：
 //      1. 冲刷请求 flush_req_o 必须严格一拍脉冲，且发出当拍 ROB 的 clear/pop
 //         也要同拍完成（flush 会清 ROB，时序上别留半提交状态）。
 //      2. 异常指令"不写 ARF 不入 SB"，但 debug/difftest 的异常事件要报
 //         （ExcpEvent），否则 NEMU 对不上。
 //      3. 双提交两条都写同一寄存器（WAW）：ARF 两写口同地址时槽 1 优先
-//         （regfile.v 内部已有约定，见其 TODO）。
+//         （regfile.v 内部已有约定，见其写口说明）。
 //      4. mispred 但 br_taken 与 pred 一致、目标也一致 -> 不冲刷（正确预测），
 //         这正是 BPU 命中的收益路径，确保比较逻辑别写反。
 
@@ -318,7 +322,8 @@ wire cmt1_csr_nofush = cmt1_priv_vec_i[`PRIV_CSR_WR]
 // 真 idle（非套件 `b 0`/0x50000000）：即使已有 has_int 也先退休完成，
 // FLUSH 到 pc+4；中断挂到后继 nop。这样 ERA/s4/NEMU 一致为 idle+4。
 // 若在 idle 上 int_take，NEMU（尤其 tcfg InitVal=0）会把 ERA 记成 idle 自身。
-wire cmt0_true_idle = cmt0_priv_vec_i[`PRIV_IDLE] && (cmt0_inst_i != 32'h50000000);
+// inst 比对已由 ROB 分配拍预译码为 inst_is_b0（提交侧不再读 32b inst）。
+wire cmt0_true_idle = cmt0_priv_vec_i[`PRIV_IDLE] && !cmt0_inst_is_b0_i;
 wire int_take = !flush_pending_i && has_int_i && cmt0_valid_i && !uncached_ld_inflight_i
                 && !cmt0_true_idle;
 wire cmt0_ibar_block = cmt0_ready && cmt0_priv_vec_i[`PRIV_IBAR] && !sb_empty_i;
@@ -358,10 +363,10 @@ wire cmt1_same_ftq = cmt0_valid_i && (cmt0_ftq_id_i == cmt1_ftq_id_i);
 //   3) jirl 的 CALL/RET 变体还要动 RAS，本就约定单提；普通 jirl 与它们仅编码之差。
 //   4) IFU 对 B/cond 有块末截断不变式，jirl 不在同一套预译码截断路径里。
 // 以后若放开：ROB 独立 is_jirl / 间接目标专用校验，再允许 soft，勿仅靠 UNCOND。
-wire cmt1_is_direct_b = (cmt1_inst_i[31:26] == 6'b010100);
+// 直接 B 判定已由 ROB 分配拍预译码（cmt1_is_direct_b_i），提交侧不读 32b inst。
 wire cmt1_br_soft = cmt1_is_branch_i &&
                     ((cmt1_br_type_i == `BR_TYPE_COND) ||
-                     ((cmt1_br_type_i == `BR_TYPE_UNCOND) && cmt1_is_direct_b));
+                     ((cmt1_br_type_i == `BR_TYPE_UNCOND) && cmt1_is_direct_b_i));
 wire cmt1_br_ok   = cmt1_br_soft && cmt1_same_ftq && !cmt1_mispred;
 wire cmt1_br_hard = cmt1_is_branch_i && !cmt1_br_ok;
 
@@ -402,7 +407,7 @@ wire br_sel_cmt1 = (cmt1_dual_effect && cmt1_is_branch_i) || take_slot1_for_csr;
 // CSR/异常 ERA 只用「头槽/中断附着」槽的 PC，不能跟 br_sel 绑到双提槽1 分支 PC
 wire [31:0] csr_sel_pc = take_slot1_for_csr ? cmt1_pc_i : cmt0_pc_i;
 wire [31:0] sel_pc = br_sel_cmt1 ? cmt1_pc_i : cmt0_pc_i;
-wire [31:0] sel_inst = take_slot1_for_csr ? cmt1_inst_i : cmt0_inst_i;
+wire sel_inst_is_b0 = take_slot1_for_csr ? cmt1_inst_is_b0_i : cmt0_inst_is_b0_i;
 wire [31:0] sel_result = take_slot1_for_csr ? cmt1_result_i : cmt0_result_i;
 wire [31:0] sel_result2 = take_slot1_for_csr ? cmt1_result2_i : cmt0_result2_i;
 wire [31:0] sel_paddr = take_slot1_for_csr ? cmt1_paddr_i : cmt0_paddr_i;
@@ -545,7 +550,7 @@ assign flush_type_o = selected_excp_take ? `FLUSH_EXCP :
 assign flush_pc_o = selected_excp_take ? csr_next_pc_i :
                     (selected_effect && sel_priv[`PRIV_ERTN]) ? csr_next_pc_i :
                     (selected_priv_flush && sel_priv[`PRIV_IDLE] &&
-                     (sel_inst != 32'h50000000)) ? (sel_pc + 32'd4) :
+                     !sel_inst_is_b0) ? (sel_pc + 32'd4) :
                     (selected_priv_flush && sel_priv[`PRIV_IDLE]) ? sel_pc :
                     selected_priv_flush ? (sel_pc + 32'd4) :
                     selected_mispred ? (sel_br_taken ? sel_br_target : (sel_pc + 32'd4)) :

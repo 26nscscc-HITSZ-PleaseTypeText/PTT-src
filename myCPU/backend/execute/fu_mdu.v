@@ -3,7 +3,7 @@
 // ------------------------------------------------------------
 // 功能：
 // - 处理低频/多周期/需要特殊端口的指令（mariver 哲学："脏活累活都给 MDU 干"）：
-//   * 乘法 mul/mulh/mulh_u    ：例化 mul.v（DSP 流水，2~3 拍）
+//   * 乘法 mul/mulh/mulh_u    ：例化 mul.v（DSP 流水，固定 3 拍）
 //   * 除法 div/div_u/mod/mod_u：例化 div.v（CLZ 快速除法，常见 5~10 拍）
 //   * CSR 类 csrrd/csrwr/csrxchg：读 CSR 旧值作为写回结果（rd <- old CSR）；
 //     csrwr/csrxchg 同时把"要写入 CSR 的新值"算好放 result2（提交时真正写入）

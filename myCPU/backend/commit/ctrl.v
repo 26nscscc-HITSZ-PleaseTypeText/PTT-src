@@ -8,7 +8,7 @@
 //   BPU 的 PC 重定向到 flush_pc —— 天然正确，无需任何部分恢复逻辑。
 // - idle 指令支持：idle 提交后冻结取指，直到有中断到来才放行。
 // - 二期预留：执行级分支重定向入口（fu_alu 算出误预测当拍冲前端，
-//   需配合 RAT 检查点，见 TODO）。
+//   需配合 RAT 检查点，见文末"二期升级路径"说明）。
 //
 // 端口：
 // - cmt_flush_*    ：commit 冲刷请求（类型 + 目标 PC）
@@ -41,24 +41,19 @@ module ctrl(
     output wire                       fetch_stall_o        // idle 睡眠期间冻结 BPU 取指
 );
 
-//TODO: 实现全局控制（一期非常简单，几十行；参考：团队赛 ctrl.sv 的 flush 仲裁部分）
+// 设计说明（已实现；参考团队赛 ctrl.sv 的 flush 仲裁部分）
 //
-//TODO: 冲刷广播：
-//      flush_o    = cmt_flush_req_i /*| ex_redirect_req_i（二期）*/;
-//      flush_pc_o = cmt_flush_req_i ? cmt_flush_pc_i : ex_redirect_pc_i;
-//      一期 commit 是唯一冲刷源，无需优先级仲裁；打不打一拍寄存看时序
-//      （flush 扇出很大，建议在顶层对 flush 做一级寄存复制再分发，
-//       commit 请求时序上留有余量——但注意打拍后 commit 侧要保证请求只发一拍）。
+// 冲刷广播：commit 是唯一冲刷源，无需优先级仲裁。flush/flush_pc 在本模块
+//      【打一拍寄存】后广播（见下方"100MHz 攻坚"注释——巨扇出组合链被寄存器
+//      一分为二；commit 侧配合 flush_pending 握手保证请求只发一拍）。
 //
-//TODO: idle 睡眠：
-//      reg idle_lock;
+// idle 睡眠：
 //      idle_commit_i（伴随 FLUSH_REFETCH 冲刷）-> idle_lock <= 1（冻结取指）；
 //      idle_lock && has_int_i -> idle_lock <= 0（中断到来，放行取指，
 //        中断本身会在第一条新指令提交时附着触发异常入口）。
-//      fetch_stall_o = idle_lock;（bpu 内 PC 保持、不产生新块；
-//        实现上可直接与 ftq_full 一起作为 BPU 的停止条件，顶层已并联）
+//      fetch_stall_o = idle_lock | idle_commit_i（提交当拍组合冻结，见尾注）。
 //
-//TODO: 二期升级路径（执行级重定向，写给后来人）：
+// 二期升级路径（执行级重定向，写给后来人）：
 //      1. fu_alu 解析出分支误预测当拍 -> ex_redirect_req 冲前端（FTQ/IFU/IB 清空，
 //         BPU 重定向），后端"分支之后的指令"需要选择性作废：
 //         ROB tail 回滚到分支处 + RS 中比分支年轻的项作废（按 robid 年龄判断）。

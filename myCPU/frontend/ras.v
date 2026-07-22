@@ -3,9 +3,18 @@
 // ------------------------------------------------------------
 // 参考实现说明：
 // - 前端推测栈（BPU 预测 CALL push / RET pop）+ 提交栈（commit 维护，恒正确）；
-// - flush 时前端栈整体复制提交栈（指针+内容+计数一拍对拷）；
+// - flush 时前端栈视图恢复为提交栈（指针/计数对拷 + 覆盖位图清零）；
 // - 同拍 flush 与 cmt_push/pop：先算提交栈新值再恢复（用 next 值）；
 // - 栈满环形回绕覆盖最旧项（深调用链精度下降可接受）。
+//
+// 存储实现（LUTRAM 化，行为与"整栈一拍对拷"版等价或更优）：
+// - 两个栈体均为 1 写口 + 异步读的分布式 RAM（拍拷贝会强制全 FF，弃用）；
+// - spec_ovl 位图（FF）标记"该项已被推测栈覆盖"：置位读 spec 体，
+//   否则读提交体；flush 只清位图 + 拷指针/计数，一拍完成；
+// - 唯一行为差异：flush 后提交栈在该槽再次 push 时，未覆盖槽的推测读
+//   会看到新提交值而非旧快照——该情形仅出现在"BPU 漏识别 call"的
+//   错位场景，两种取值都是纯预测提示，且新提交值更准（RAS 只影响
+//   预测准确率，不影响正确性）。
 // ============================================================
 `include "mycpu.h"
 
@@ -14,7 +23,7 @@ module ras(
     input  wire                reset,
 
     // ---------------- 冲刷恢复 ----------------
-    input  wire                flush_i,            // 前端栈整体复制提交栈
+    input  wire                flush_i,            // 前端栈视图恢复为提交栈
 
     // ---------------- 前端推测栈 ----------------
     input  wire                spec_push_i,        // BPU 预测到 CALL
@@ -29,10 +38,11 @@ module ras(
     input  wire                cmt_pop_i           // commit 提交 ret
 );
 
-reg [31:0]        spec_stack [0:`RAS_DEPTH-1];
-reg [31:0]        cmt_stack  [0:`RAS_DEPTH-1];
-reg [`RAS_W-1:0]  spec_ptr,  cmt_ptr;     // 指向当前栈顶
-reg [`RAS_W:0]    spec_cnt,  cmt_cnt;     // 计数（饱和在 DEPTH）
+(* ram_style = "distributed" *) reg [31:0] spec_stack [0:`RAS_DEPTH-1];
+(* ram_style = "distributed" *) reg [31:0] cmt_stack  [0:`RAS_DEPTH-1];
+reg [`RAS_DEPTH-1:0] spec_ovl;              // 推测覆盖位图（flush 一拍清零）
+reg [`RAS_W-1:0]  spec_ptr,  cmt_ptr;       // 指向当前栈顶
+reg [`RAS_W:0]    spec_cnt,  cmt_cnt;       // 计数（饱和在 DEPTH）
 
 // 提交栈 next 值（flush 同拍先提交后恢复）
 wire [`RAS_W-1:0] cmt_ptr_n = cmt_push_i ? (cmt_ptr + 1'b1)
@@ -42,34 +52,45 @@ wire [`RAS_W:0]   cmt_cnt_n = cmt_push_i ? ((cmt_cnt == `RAS_DEPTH) ? cmt_cnt : 
                             : (cmt_pop_i && (cmt_cnt != 0)) ? (cmt_cnt - 1'b1)
                             : cmt_cnt;
 
-assign top_addr_o = spec_stack[spec_ptr];
+// 栈顶读：推测覆盖过读 spec 体，否则读提交体（异步读，LUTRAM 多读口由综合复制）
+assign top_addr_o = spec_ovl[spec_ptr] ? spec_stack[spec_ptr] : cmt_stack[spec_ptr];
 assign empty_o    = (spec_cnt == 0);
 
-integer k;
+wire [`RAS_W-1:0] spec_wr_idx = spec_ptr + 1'b1;
+wire [`RAS_W-1:0] cmt_wr_idx  = cmt_ptr + 1'b1;
+
+// 栈体写口（各自唯一；提交写不受 flush 影响）
+always @(posedge clk) begin
+    if (!reset && cmt_push_i)
+        cmt_stack[cmt_wr_idx] <= cmt_push_addr_i;
+end
+always @(posedge clk) begin
+    if (!reset && !flush_i && spec_push_i)
+        spec_stack[spec_wr_idx] <= spec_push_addr_i;
+end
+
 always @(posedge clk) begin
     if (reset) begin
         spec_ptr <= {`RAS_W{1'b0}};
         cmt_ptr  <= {`RAS_W{1'b0}};
         spec_cnt <= {(`RAS_W+1){1'b0}};
         cmt_cnt  <= {(`RAS_W+1){1'b0}};
+        spec_ovl <= {`RAS_DEPTH{1'b0}};
     end else begin
-        // ---- 提交栈 ----
-        if (cmt_push_i) cmt_stack[cmt_ptr + 1'b1] <= cmt_push_addr_i;
+        // ---- 提交栈指针/计数 ----
         cmt_ptr <= cmt_ptr_n;
         cmt_cnt <= cmt_cnt_n;
 
-        // ---- 前端栈 ----
+        // ---- 前端栈视图 ----
         if (flush_i) begin
-            // 整体复制提交栈（用本拍提交后的新值）
-            for (k = 0; k < `RAS_DEPTH; k = k + 1)
-                spec_stack[k] <= cmt_stack[k];
-            if (cmt_push_i) spec_stack[cmt_ptr + 1'b1] <= cmt_push_addr_i;
+            // 恢复为提交栈（本拍提交后的新值）；清覆盖位图即"视图对拷"
+            spec_ovl <= {`RAS_DEPTH{1'b0}};
             spec_ptr <= cmt_ptr_n;
             spec_cnt <= cmt_cnt_n;
         end else begin
             if (spec_push_i) begin
-                spec_stack[spec_ptr + 1'b1] <= spec_push_addr_i;
-                spec_ptr <= spec_ptr + 1'b1;
+                spec_ovl[spec_wr_idx] <= 1'b1;
+                spec_ptr <= spec_wr_idx;
                 if (spec_cnt != `RAS_DEPTH) spec_cnt <= spec_cnt + 1'b1;
             end else if (spec_pop_i && (spec_cnt != 0)) begin
                 spec_ptr <= spec_ptr - 1'b1;

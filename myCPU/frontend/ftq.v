@@ -83,12 +83,19 @@ module ftq(
 );
 
 // ---------------- 存储 ----------------
-reg [31:0]            blk_pc    [0:`FTQ_SIZE-1];
+// 多写口小字段（P0/P1/predec 三写）保持触发器；
+// 宽载荷 blk_pc / blk_meta 改单写口 LUTRAM（见下方专用写块）：
+// - blk_pc 只由 P0 写：P1 覆盖拍的 p1_pc 恒等于上拍 P0 已写的块 PC
+//   （bpu.v：p1_pc_o=pc_r，且 p1 仅在 p0_wrote_r 时有效），原 P1 写是冗余值；
+// - blk_meta 只由 P1 写；原"P0 写 0 清空"改为 meta_set 位图（FF）：
+//   P0 清位、P1 置位，读侧位图为 0 时给全 0，与原语义等价。
 reg [`BLK_LEN_W-1:0]  blk_len   [0:`FTQ_SIZE-1];
 reg                   blk_taken [0:`FTQ_SIZE-1];
 reg [31:0]            blk_target[0:`FTQ_SIZE-1];
 reg [`BR_TYPE_W-1:0]  blk_btype [0:`FTQ_SIZE-1];
-reg [`BPU_META_W-1:0] blk_meta  [0:`FTQ_SIZE-1];
+(* ram_style = "distributed" *) reg [31:0]            blk_pc   [0:`FTQ_SIZE-1];
+(* ram_style = "distributed" *) reg [`BPU_META_W-1:0] blk_meta [0:`FTQ_SIZE-1];
+reg [`FTQ_SIZE-1:0]   blk_meta_set;   // 该槽 meta 已由 P1 写入（读 0 语义门控）
 
 reg [`FTQ_W-1:0] bpu_ptr, ifu_ptr, cmt_ptr;
 reg              p0_wrote_r;     // 上一拍 P0 写入过（"P1 安定"判定）
@@ -103,6 +110,7 @@ initial begin
         blk_btype[ftq_i]  = `BR_TYPE_COND;
         blk_meta[ftq_i]   = {`BPU_META_W{1'b0}};
     end
+    blk_meta_set = {`FTQ_SIZE{1'b0}};
     bpu_ptr    = {`FTQ_W{1'b0}};
     ifu_ptr    = {`FTQ_W{1'b0}};
     cmt_ptr    = {`FTQ_W{1'b0}};
@@ -147,6 +155,34 @@ assign cmt_blk_target_o = blk_target[cmt_query_id_i];
 // （旧 redir_cmt_skip 的无符号 >= 比较在环形回绕处会误判、假释活块，已移除）
 wire [`FTQ_W:0] cmt_adv = (|cmt_release_i) ? {1'b0, cmt_release_i} : {(`FTQ_W+1){1'b0}};
 
+// ---------------- LUTRAM 载荷写口（单写口，与原写入同拍同条件）----------------
+wire ftq_run      = !reset && !flush_i;
+wire blk_pc_wr    = ftq_run && !predec_redirect_i && p0_valid_i;   // 原 P0 写；P1 写为冗余值已删
+wire blk_meta_wr  = ftq_run && p1_meta_valid_i;
+
+always @(posedge clk) begin
+    if (blk_pc_wr)
+        blk_pc[bpu_ptr] <= p0_pc_i;
+end
+always @(posedge clk) begin
+    if (blk_meta_wr)
+        blk_meta[bpu_prev] <= p1_meta_i;
+end
+
+// meta 有效位图：P0 清（对应原"写 0 清空"），P1 写置位
+always @(posedge clk) begin
+    if (reset)
+        blk_meta_set <= {`FTQ_SIZE{1'b0}};
+    else begin
+        if (blk_pc_wr)   blk_meta_set[bpu_ptr]  <= 1'b0;
+        if (blk_meta_wr) blk_meta_set[bpu_prev] <= 1'b1;
+    end
+end
+
+// meta 读口（位图为 0 给全 0，等价原"P0 清零后未被 P1 覆盖"取值）
+wire [`BPU_META_W-1:0] blk_meta_cmt_rd =
+    blk_meta_set[cmt_ftq_id_i] ? blk_meta[cmt_ftq_id_i] : {`BPU_META_W{1'b0}};
+
 // ---------------- 指针与块写入 ----------------
 always @(posedge clk) begin
     if (reset) begin
@@ -177,28 +213,22 @@ always @(posedge clk) begin
         end else begin
             p0_wrote_r <= p0_valid_i;
 
-            // P0 写入
+            // P0 写入（blk_pc/blk_meta 已移至上方 LUTRAM 写块）
             if (p0_valid_i) begin
-                blk_pc[bpu_ptr]     <= p0_pc_i;
                 blk_len[bpu_ptr]    <= p0_length_i;
                 blk_taken[bpu_ptr]  <= p0_taken_i;
                 blk_target[bpu_ptr] <= p0_target_i;
                 blk_btype[bpu_ptr]  <= p0_br_type_i;
-                blk_meta[bpu_ptr]   <= {`BPU_META_W{1'b0}};
                 bpu_ptr             <= bpu_ptr + 1'b1;
             end
         end
 
         // P1 覆盖（bpu_ptr-1；与 P0 同拍时 P0 写新槽、P1 写旧槽，不冲突）
         if (p1_valid_i) begin
-            blk_pc[bpu_prev]     <= p1_pc_i;
             blk_len[bpu_prev]    <= p1_length_i;
             blk_taken[bpu_prev]  <= p1_taken_i;
             blk_target[bpu_prev] <= p1_target_i;
             blk_btype[bpu_prev]  <= p1_br_type_i;
-        end
-        if (p1_meta_valid_i) begin
-            blk_meta[bpu_prev]   <= p1_meta_i;
         end
 
         // IFU 取走
@@ -232,7 +262,7 @@ always @(posedge clk) begin
         train_target_r    <= cmt_target_i;
         train_btype_r     <= cmt_br_type_i;
         train_ft_r        <= cmt_pc_i + 32'd4;     // 实际块出口 = 分支 PC + 4
-        train_meta_r      <= blk_meta[cmt_ftq_id_i];
+        train_meta_r      <= blk_meta_cmt_rd;
     end
 end
 
@@ -246,8 +276,9 @@ assign train_br_type_o      = train_btype_r;
 assign train_fall_through_o = train_ft_r;
 assign train_meta_o         = train_meta_r;
 
-// lint 吸收（blk_btype 读口暂未对外）
-wire ftq_lint = (|blk_btype[0]);
+// lint 吸收（blk_btype 读口暂未对外；p1_pc 因 blk_pc 单写口化不再使用，
+// 端口保留以兼容 BPU 接口）
+wire ftq_lint = (|blk_btype[0]) | (|p1_pc_i);
 
 
 `ifdef SYNTHESIS
@@ -276,7 +307,7 @@ always @(posedge clk) begin
             p1_correction_count <= p1_correction_count + 64'd1;
         if (cmt_valid_i && cmt_is_branch_i && (cmt_br_type_i == `BR_TYPE_COND)) begin
             commit_cond_branch_count <= commit_cond_branch_count + 64'd1;
-            if (blk_meta[cmt_ftq_id_i][META_TAGE_VALID_BIT])
+            if (blk_meta_cmt_rd[META_TAGE_VALID_BIT])
                 commit_cond_meta_valid_count <= commit_cond_meta_valid_count + 64'd1;
             else
                 commit_cond_meta_invalid_count <= commit_cond_meta_invalid_count + 64'd1;

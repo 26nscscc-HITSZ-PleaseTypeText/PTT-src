@@ -172,9 +172,9 @@ module dispatch(
     output wire [`ROB_W-1:0]          rs_mdu_push_src1_robid_o
 );
 
-//TODO: 实现分发逻辑（纯组合；参考：mariver dispatch.v 137~243 行）
+// 设计说明（已实现；纯组合，参考 mariver dispatch.v 137~243 行）
 //
-//TODO: 第一步——读 ROB 补操作数：
+// 第一步——读 ROB 补操作数：
 //      rob_raddr0~3 直接接 4 个源的 robid；
 //      最终就绪/值（以槽0 src0 为例）：
 //        ready = dis0_src0_ready_i | rob_rrdy0_i;
@@ -182,33 +182,27 @@ module dispatch(
 //        robid 原样带走（没 ready 的在 RS 里等唤醒）。
 //      注意 ROB 读口内部已带"同拍 FU 写回旁路"（rob.v 实现），这里无需再旁路。
 //
-//TODO: 第二步——路由决策（组合）：
+// 第二步——路由决策（组合）：
 //      slot0_is_alu/mem/mdu = dis0_futype_i 独热位；slot1 同理。
-//      ALU 负载均衡（两条都是 ALU 时）：槽0 进占用少的那个 RS，槽1 进另一个；
-//      只有一条 ALU 时：进占用少且 can_accept 的 RS（mariver alucap 比较）。
-//      MEM/MDU：每拍每站最多 1 条；两条同类时本拍只发槽 0（槽 1 等下一拍，
-//      见第三步的"全收或全停"约定——一期从简）。
+//      双 ALU 且两站都能收：固定程序序 槽0→rs_alu0、槽1→rs_alu1 同拍双压；
+//      只有一条 ALU：进占用少且 can_accept 的站（alucap 比较）。
+//      MEM/MDU：每拍每站最多 1 条；两条同类时本拍只发槽 0，槽 1 下拍再发
+//      （per-slot fire，见第三步）。
 //
-//TODO: 第三步——dispatch_ready_o（一期"全收或全停"约定，最简单且无半发状态）：
-//      dispatch_ready_o = 所有 valid 槽都能在本拍入站：
-//        - 两条 ALU：rs_alu0_can_accept && rs_alu1_can_accept
-//        - 一条 ALU：rs_alu0/1 至少一个 can_accept
-//        - MEM/MDU 槽：对应 RS can_accept，且两槽不同类（两条同 MEM/同 MDU -> not ready）
-//      ready=0 时所有 push_valid 必须为 0（rename 流水寄存器保持，下拍重试）。
-//      //二期优化 TODO：mask 部分分发（mariver mask0/mask1 机制——先发能发的，
-//        记录已发标记，剩下的下拍再发；能提升 RS 利用率，但要在 rename 流水
-//        寄存器加 per-slot issued 标记，建议框架跑通后再做）。
+// 第三步——per-slot fire 与 dispatch_ready_o：
+//      dis0_fire/dis1_fire 按槽独立判定（dis1 不得越过未发出的 dis0，保序）；
+//      dispatch_ready_o = 所有 valid 槽本拍都 fire（或槽本就空）——
+//      支持同拍 vacate + refill，消除对 rename 的固有隔拍阻塞。
+//      入站不要求源就绪：未齐则带 robid 进 RS 等唤醒，避免槽0 相关阻塞拖死 rename。
 //
-//TODO: 第四步——push 信号拼装：
+// 第四步——push 信号拼装：
 //      把对应槽的字段（含第一步补全后的 src ready/val）按路由结果接到
 //      rs_*_push_* 上；未选中的 RS push_valid=0。
 //
-//TODO: 坑点提示：
-//      1. 本级为纯组合，dispatch_ready_o 会反压 rename 的 can_go ——
-//         不要在该环路里引入 RS 的 issue 信号（用"项数<容量"判 can_accept，
-//         不要用"本拍发射后会空出一项"做超前判断，避免组合环）。
-//      2. 两槽指令路由进两个 ALU RS 时，槽 0（更老）建议进占用多的站也可以——
-//         顺序无关紧要，RS 内部按 robid 年龄选择发射；负载均衡只为吞吐。
+// 坑点提示：
+//      本级为纯组合，dispatch_ready_o 会反压 rename 的 can_go ——
+//      不要在该环路里引入 RS 的 issue 信号（用"项数<容量"判 can_accept，
+//      不要用"本拍发射后会空出一项"做超前判断，避免组合环）。
 
 wire dis0_is_alu;
 wire dis0_is_mem;

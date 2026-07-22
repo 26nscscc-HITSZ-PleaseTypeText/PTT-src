@@ -7,7 +7,8 @@
 //   addr_ok 接受新请求同拍发生；FTQ 新块在进入 PRE 的同拍可直发 I$，
 //   数据在 PRE 滞留期间返回被弃时由 if_replay_req 重发兜底；
 // - 取指异常整块占位（inst=0，不打 ICache）；
-// - 预译码仅识别 B/BL 直接跳转，漏预测时截断块并全量 predec_redirect；
+// - 预译码识别两类截断并全量 predec_redirect：漏预测的 B/BL 直接跳转
+//   （重定向到立即数目标）、块中部的条件分支（截断并重定向到 fall-through）；
 // - ic_cancel_o 恒 0（I$ 忽略 cancel，本模块自行丢弃）。
 // - pred_taken：保留 slot_pred_taken（仅块末真实 cond/B/BL），禁止块末 ALU
 //   被标 taken（Linux makecontext 静默跳过指令回归防护）。

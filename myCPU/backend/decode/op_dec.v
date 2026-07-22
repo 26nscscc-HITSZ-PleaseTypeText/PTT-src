@@ -123,10 +123,10 @@ module op_dec(
     assign alu_op[`ALU_OP_PCADD] = inst_pcaddu12i | inst_pcaddi;
 
 //分支跳转操作码生成
-//inst_b 无条件跳转到目标地址，地址偏移值为i26offs26逻辑左移两位再符号拓展
-//inst_bl 无条件跳转到目标地址，偏移值同上，同时将该指令的pc＋4存到rl
-//inst_beq rjrd相等跳转目标地址
-//inst_jirl 无条件跳转到目标地址，将pc值加＋存到rd，目标地址为i16offs16逻辑左移两位后再符号拓展加rj的值
+//inst_b 无条件跳转到目标地址，地址偏移值为 i26(offs26) 逻辑左移两位再符号拓展
+//inst_bl 无条件跳转到目标地址，偏移值同上，同时将该指令的 pc+4 存到 r1
+//inst_beq 将通用寄存器 rj 和 rd 的值比较，相等则跳转到目标地址
+//inst_jirl 无条件跳转到目标地址，将 pc+4 存到 rd，目标地址为 i16(offs16) 逻辑左移两位符号拓展后加 rj 的值
 //inst_bne 将通用寄存器 rj 和通用寄存器 rd 的值进行比较，如果两者不等则跳转到目标地址，否则不跳转。
 //inst_blt 将通用寄存器 rj 和通用寄存器 rd 的值进行比较，如果 rj 的值小于 rd 的值（有符号比较），则跳转到目标地址，否则不跳转。
 //inst_bge 将通用寄存器 rj 和通用寄存器 rd 的值进行比较，如果 rj 的值大于或等于 rd 的值（有符号比较），则跳转到目标地址，否则不跳转。
@@ -142,17 +142,7 @@ module op_dec(
     assign br_op[`BR_OP_BLTU] = inst_bltu;
     assign br_op[`BR_OP_BGEU] = inst_bgeu;
 
-// mem_op操作码生成
-// `define MEM_OP_LD_W     1   // load，从内存取数据写入寄存器堆（与 {inst_ld_w, inst_st_w} 对齐）
-// `define MEM_OP_ST_W     0   // store，从寄存器堆数据存入内存（与 {inst_ld_w, inst_st_w} 对齐）
-// `define MEM_OP_ST_B     2   // store byte，从寄存器堆数据存入内存（与 {inst_ld_b, inst_st_b} 对齐）
-// `define MEM_OP_ST_H     3   // store half，从寄存器堆数据存入内存（与 {inst_ld_h, inst_st_h} 对齐）
-// `define MEM_OP_LD_B     4   // load byte，从内存取数据写入寄存器堆（与 {inst_ld_b, inst_st_b} 对齐）
-// `define MEM_OP_LD_H     5   // load half，从内存取数据写入寄存器堆（与 {inst_ld_h, inst_st_h} 对齐）    
-// `define MEM_OP_LD_BU    6   // load byte unsigned，从内存取数据写入寄存器堆（与 {inst_ld_b, inst_st_b} 对齐）
-// `define MEM_OP_LD_HU    7   // load half unsigned，从内存取数据写入寄存器堆（与 {inst_ld_h, inst_st_h} 对齐）
-// `define MEM_OP_LL_W     8   // load linked，从内存取数据写入寄存器堆（与 {inst_ll_w, inst_sc_w} 对齐）
-// `define MEM_OP_SC_W     9   // store conditional，从寄存器堆数据存入内存（与 {inst_ll_w, inst_sc_w} 对齐）
+// mem_op 操作码生成（独热位定义见 mycpu.h 的 `MEM_OP_*`）
     assign mem_op[`MEM_OP_ST_W] = inst_st_w;
     assign mem_op[`MEM_OP_ST_B] = inst_st_b;
     assign mem_op[`MEM_OP_ST_H] = inst_st_h;

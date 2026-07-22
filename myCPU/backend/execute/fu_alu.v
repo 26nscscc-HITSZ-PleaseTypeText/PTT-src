@@ -7,7 +7,7 @@
 //   * 分支：判方向（beq/bne/blt/bge/bltu/bgeu）、算目标
 //     （条件分支/B/BL: pc+offs；jirl: src0+offs）、算链接值（pc+4）
 // - 写回 ROB：结果 + 分支实际方向/实际目标（提交级据此判误预测）。
-// - 发射拍对外广播提前唤醒（robid），缩短背靠背 RAW 延迟（二期接通）。
+// - 发射拍对外广播提前唤醒（robid），缩短背靠背 RAW 延迟（已接通各 RS）。
 // - 二期预留执行级重定向输出（误预测当拍冲前端，配合 RAT 检查点）。
 //
 // 端口：
@@ -42,7 +42,7 @@ module fu_alu(
     output wire                       wb_br_taken_o,     // 分支实际方向（非分支恒 0）
     output wire [31:0]                wb_br_target_o,    // 分支实际目标（taken 时有效）
 
-    // ---------------- 提前唤醒广播（发射拍，二期接入 RS）----------------
+    // ---------------- 提前唤醒广播（发射拍，已接入各 RS 的 early0/1）----------------
     output wire                       early_wakeup_valid_o,
     output wire [`ROB_W-1:0]          early_wakeup_robid_o,
 

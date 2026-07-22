@@ -1,5 +1,22 @@
 `include "mycpu.h"
 
+// ============================================================
+// inst_buffer 模块（指令缓冲，`IB_SIZE=16 项环形 FIFO）
+// ------------------------------------------------------------
+// 功能：
+// - 前端（IFU 切割后的指令流）与后端（decoder×2/rename）的解耦缓冲：
+//   入口一拍最多 4 条（push0~3，同拍连续写 tail~tail+3），
+//   出口一拍最多 2 条（pop0/1，组合读 head/head+1，槽 0 先消费）；
+// - 载荷每项 {excp, ftq_id, is_last, pred_taken, inst, pc} 打包存储；
+// - can_push_o 只看寄存器 count（留足 4 空位才放行），与 push_n 解耦断
+//   组合环（详见下方注释）；
+// - flush_i 一拍清空（head/tail/count 归零，载荷无需清）。
+//
+// 端口：
+// - push0~3_*：IFU 推入口（valid 独立，数据同拍写入）
+// - pop0/1_* ：rename/decoder 弹出口（valid/ready 握手）
+// - can_push_o：入口反压（保守判定，见正文）
+// ============================================================
 module inst_buffer(
     input  wire                       clk,
     input  wire                       reset,

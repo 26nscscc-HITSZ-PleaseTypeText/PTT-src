@@ -6,8 +6,9 @@
 // 功能（新架构下角色不变，作为 csr_exception_commit_handler 的内部工具）：
 // - 把 commit 提交级送来的各异常 valid 信号按优先级编码成 8 位 Ecode 与
 //   Esubcode，供 CSR 写 ESTAT/选择异常入口使用。
-// - 优先级（高 -> 低）：INT > 取指类（ADEF/TLBR/PIF/PPI）> INE > IPE
-//   > SYS/BRK > ALE/ADEM > 访存 TLB 类（TLBR/PIL/PIS/PPI/PME）。
+// - 优先级（高 -> 低，与下方链式选择一致）：INT > ADEF > TLBR/PIF/PPI
+//   （TLBR/PPI 位取指访存共用，见尾注）> INE > IPE > SYS/BRK > ALE/ADEM
+//   > 访存页异常（PIL/PIS/PME）。
 //   注意：commit 每次只会送一条指令的异常（双提交时异常指令必单提交），
 //   同一条指令多个异常位同时有效时按上述优先级取最高者。
 // ============================================================

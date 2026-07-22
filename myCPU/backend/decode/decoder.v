@@ -15,7 +15,7 @@
 // 端口：
 // - inst_i / pc_i      ：指令与 PC
 // - csr_plv_i          ：当前特权级（检测 IPE：用户态执行特权指令）
-// - csr_llbit_i        ：LLBIT 当前值（sc.w 译码期决定行为，见 TODO）
+// - csr_llbit_i        ：LLBIT 当前值（sc.w 译码期按其选择「真写/假写」路径）
 // - 输出 uop 各字段（全组合）
 // ============================================================
 `include "mycpu.h"
@@ -310,7 +310,7 @@ assign futype_o[`FU_MDU] = fu_mdu;
 
 assign csr_num_o = {2'b00, inst_i[23:10]};
 assign cacop_code_o = inst_i[4:0];
-//判断地址是否有效，这两个信号后面 rename/dispatch 会用，决定是否需要查 RAT、是否等待源操作数。
+// 源寄存器地址透传；是否真正使用由下方 use_src*_o 决定（rename 据此查 RAT/等操作数）。
 assign src0_addr_o = src0_addr_raw;
 assign src1_addr_o = src1_addr_raw;
 

@@ -6,7 +6,8 @@
 // 方案 A：纯组合 ALU。
 // - 只承担单周期组合运算：加减/逻辑/移位/比较/LUI（含 ANDN/ORN）；
 // - 乘除职责已迁出到 fu_mdu（mul.v/div.v），本模块乘除位输出 0；
-// - 端口保持框架原样，clk/reset/exe_pc 仅占位，方便现有 fu_alu 对接。
+// - 端口保持框架原样：clk/reset 仅占位（lint 吸收）；exe_pc 供
+//   PCADD（pcaddu12i/pcaddi）作加法源使用。
 // ============================================================
 module alu(
     input  wire                    clk,

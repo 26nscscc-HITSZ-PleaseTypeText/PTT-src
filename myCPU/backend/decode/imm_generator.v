@@ -5,7 +5,8 @@
 // ------------------------------------------------------------
 // 被 decoder.v 内部例化复用（原 IDport 已删除）。
 // 根据指令类型选择并扩展不同位宽的立即数字段，alu_imm 进 RS 的 imm 字段，
-// br_imm 进 RS 的 br_offs 字段（分支目标 = pc + br_offs 在 fu_alu 算）。
+// br_imm 进 RS 的 br_offs 字段（分支目标在 fu_alu 算：一般为 pc+br_offs，
+// jirl 为 src0(rj)+br_offs）。
 // 零改动复用。
 // ============================================================
 module imm_generator (

@@ -90,8 +90,10 @@ localparam S_UC_RDATA = 3'd6;
 reg [2:0] state;
 
 // ---------------- 存储阵列 ----------------
+// valid 需复位/一拍失效，保持触发器；tag 拆 per-way 一维阵列（见下 gen_tag）
+// —— 二维 reg 数组 Vivado 推断不出分布式 RAM，会落成 ~10k FF + 巨型读 mux。
 reg [NSET-1:0] valid_arr [0:NWAY-1];
-reg [TAGW-1:0] tag_arr   [0:NWAY-1][0:NSET-1];   // LUTRAM（异步读）
+wire [TAGW-1:0] tag_rd [0:NWAY-1];               // 各路 tag 在 req_set 处的异步读值
 
 wire [LINEW-1:0] data_out [0:NWAY-1];
 reg  [IDXW-1:0]  ram_addr;
@@ -119,12 +121,27 @@ reg [LINEW-1:0]  uc_line;         // uncached 部分有效行拼装
 wire [IDXW-1:0] req_set = req_paddr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
 wire [TAGW-1:0] req_tag = req_paddr[31:IDXW+`CACHE_LINE_W];
 
+// ---------------- tag 阵列（per-way LUTRAM：1 写口 + req_set 异步读）----------------
+// 写口唯一：refill 末拍写 victim way（与原 FSM 内 tag_arr 写同拍同条件）；
+// 复位不清 tag（valid=0 即无效），与 LUTRAM 无复位的特性一致。
+genvar gt;
+generate
+for (gt = 0; gt < NWAY; gt = gt + 1) begin : gen_tag
+    (* ram_style = "distributed" *) reg [TAGW-1:0] tag_ram [0:NSET-1];
+    always @(posedge clk) begin
+        if (refill_wr && (victim_way == gt[1:0]))
+            tag_ram[req_set] <= req_tag;
+    end
+    assign tag_rd[gt] = tag_ram[req_set];
+end
+endgenerate
+
 // ---------------- 命中判定（LOOKUP 拍）----------------
 wire [NWAY-1:0] way_hit;
 genvar gw;
 generate
 for (gw = 0; gw < NWAY; gw = gw + 1) begin : gen_hit
-    assign way_hit[gw] = valid_arr[gw][req_set] && (tag_arr[gw][req_set] == req_tag);
+    assign way_hit[gw] = valid_arr[gw][req_set] && (tag_rd[gw] == req_tag);
 end
 endgenerate
 wire       hit_any = |way_hit;
@@ -266,7 +283,7 @@ always @(posedge clk) begin
             S_RDATA: begin
                 if (axi_ret_valid) begin
                     if (axi_ret_last) begin
-                        tag_arr[victim_way][req_set]   <= req_tag;
+                        // tag 写已移至 gen_tag（refill_wr 同拍同条件）
                         valid_arr[victim_way][req_set] <= 1'b1;
                         resp_line <= refill_line;
                         state     <= S_RESP;

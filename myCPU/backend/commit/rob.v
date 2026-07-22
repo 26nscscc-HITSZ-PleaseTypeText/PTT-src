@@ -122,7 +122,9 @@ module rob(
     output wire                       cmt0_valid_o,
     output wire                       cmt0_complete_o,
     output wire [31:0]                cmt0_pc_o,
-    output wire [31:0]                cmt0_inst_o,
+    output wire [31:0]                cmt0_inst_o,        // 仅仿真视图有效（difftest/调试）；综合恒 0
+    output wire                       cmt0_inst_is_b0_o,  // 预译码：inst==0x50000000（套件 `b 0` 空转）
+    output wire                       cmt0_is_direct_b_o, // 预译码：inst[31:26]==010100（直接 B）
     output wire                       cmt0_rf_we_o,
     output wire [4:0]                 cmt0_rd_o,
     output wire [31:0]                cmt0_result_o,      // 写回 ARF 的值
@@ -150,7 +152,9 @@ module rob(
     output wire                       cmt1_valid_o,
     output wire                       cmt1_complete_o,
     output wire [31:0]                cmt1_pc_o,
-    output wire [31:0]                cmt1_inst_o,
+    output wire [31:0]                cmt1_inst_o,        // 仅仿真视图有效；综合恒 0
+    output wire                       cmt1_inst_is_b0_o,
+    output wire                       cmt1_is_direct_b_o,
     output wire                       cmt1_rf_we_o,
     output wire [4:0]                 cmt1_rd_o,
     output wire [31:0]                cmt1_result_o,
@@ -181,83 +185,65 @@ module rob(
     input  wire                       cmt_clear1_i        // 槽 1 已提交
 );
 
-//TODO: 实现奇偶双体 ROB（参考：mariver rob.v 全文，结构一一对应，必读！）
+// 设计说明（已实现，参考 mariver rob.v，结构一一对应）
 //
-//TODO: 指针与满判据（mariver 137~142 行的精髓）：
+// 指针与满判据（mariver 137~142 行的精髓）：
 //      reg [`ROB_PAIR_W-1:0] head, tail;
-//      assign rob_full_o  = (head == trunc(tail + ROB_GUARD)); // 保留安全间距，必须环形截断
-//      assign rob_empty_o = (head == tail);
+//      rob_full_o  = (head == trunc(tail + ROB_GUARD)); // 保留安全间距，环形截断
+//      rob_empty_o = (head == tail);
 //      为什么留间距：提交后（clear/pop）该表项的 result 仍可能在同拍/下拍被
 //      dispatch 读口用旧编号读取（rename 在它提交前一拍刚查到这个标签）；
 //      留 GUARD 对间距保证新分配不会立即覆盖刚提交项的结果。删掉间距会出现
 //      "偶发读到新指令结果"的恶性随机错误，几乎无法调试——千万别省。
 //
-//TODO: 存储结构（全 reg/LUTRAM；32 项 = [`ROB_SIZE-1:0]，编号={奇偶,对指针}）：
-//      静态区（分配写）：valid、pc、inst、rf_we、rd、futype、is_load/store/branch、
-//                        br_type、pred_taken、is_last、ftq_id、priv_vec、csr_num、
-//                        cacop_code、excp_static、is_nop
-//      动态区（写回写）：complete、result[32]、result2[32]、paddr/vaddr[32]、
-//                        wstrb[4]、size[3]、uncached、br_taken、br_target[32]、
-//                        excp_dynamic[`EXCP_NUM]
-//      （奇偶可以共用"对索引"的静态数组×2 份，或直接 32 项平铺，二选一；
-//        平铺写法简单，推荐。）
+// 存储结构（V2.3 版，编号={奇偶,对指针}）：
+//      静态区（分配写、提交读一次）：按【奇偶双体 LUTRAM】存放（sta0_*/sta1_*，
+//        每体 dispatch 单写口）：pc、csr_num、tlb_op、cacop_code、ftq_id、
+//        br_type 及提交预译码位（is_direct_b/is_idle/csr 字段选择等）；
+//        32b inst[] 阵列仅 `ifdef SIMU 保留（difftest/debug 用），
+//        综合网表不含 inst 存储与 inst[head] 读 mux。
+//      动态区（写回写/需冲刷/多写口）：保持 FF：valid、complete、result、
+//        result2、paddr/vaddr、wstrb、size、uncached、br_taken、br_target、
+//        excp 等。
 //
-//TODO: 分配（alloc_en_i）：
+// 分配（alloc_en_i）：
 //      把 a0_* 写入 {1'b0,tail} 项、a1_* 写入 {1'b1,tail} 项；tail++；
-//      complete 初值 = is_nop（NOP 消除：分配即完成）；
+//      complete 初值 = is_nop || (|excp_static)（NOP 与带静态异常项分配即完成）；
 //      a*_valid=0 的槽也要写（valid=0 占位），保证队头判断简单。
 //
-//TODO: FU 写回（4 路并行，互不冲突）：
+// FU 写回（4 路并行，互不冲突）：
 //      alu0/alu1：result<=data；br_taken/br_target 锁存；complete<=1
 //      mem      ：result<=data；paddr/vaddr/wstrb/size/uncached/excp_dynamic 锁存；complete<=1
 //      mdu      ：result<=data；result2<=data2；complete<=1
 //
-//TODO: dispatch 读口（组合 + 同拍写回旁路，mariver 223~259 行）：
+// dispatch 读口（组合 + 同拍写回旁路，mariver 223~259 行）：
 //      rrdy = complete[raddr] | (任一 wb 口本拍 valid 且 robid==raddr)
 //      rdata = 本拍写回旁路优先，否则读 result[raddr]
 //      （旁路必不可少：写回与 dispatch 同拍时，不旁路会让指令在 RS 里
 //        错过唤醒、又读不到 ROB 值，死等。）
 //
-//TODO: 提交口：
+// 提交口：
 //      cmt0_* = 表项 {1'b0,head} 的全部字段；cmt1_* = {1'b1,head}；
 //      cmt*_excp_o = excp_static | excp_dynamic；
-//      head_robid0_o = {1'b0, head}（lsu 的 uncached 许可比较用——
-//        注意 uncached load 在槽 1 时编号是 {1'b1,head}，lsu 侧比较
-//        建议只比对指针部分 robid[`ROB_PAIR_W-1:0]==head 且槽 0 已提交/无效，
-//        细节在 lsu/commit TODO 里再确认）。
+//      head_robid0_o = {1'b0, head}（lsu 的 uncached 许可比较用）。
 //      cmt_clear0/1_i：清对应项 valid（提交完成）；cmt_pop_i：head++。
 //
-//TODO: 冲刷：flush_i 时 head/tail 清 0、valid/complete 全清（一拍完成）。
+// 冲刷：flush_i 时 head/tail 清 0、valid/complete 全清（一拍完成）。
 //
-//TODO: 坑点提示：
+// 坑点提示：
 //      1. 同拍"分配写静态区"与"写回写动态区"作用于不同表项（GUARD 保证），
 //         不会冲突；但代码里要分开两个 always 块写清楚。
-//      2. complete 位在分配时必须清 0（is_nop 除外）——上一轮用过的旧值
-//         残留会导致指令"未执行就提交"，查死人。
+//      2. complete 位在分配时必须清 0（is_nop/静态异常除外）——上一轮用过的
+//         旧值残留会导致指令"未执行就提交"，查死人。
 //      3. 双发射槽 1 无效时照样占位（valid=0），提交仲裁会跳过它。
 
 reg [`ROB_PAIR_W-1:0] head;
 reg [`ROB_PAIR_W-1:0] tail;
 
+// ---------------- 多写口 / 需冲刷字段：保持触发器 ----------------
+// valid/complete：分配+提交+冲刷多点写；动态区：分配清 0 + FU 写回（两写点）。
 reg                       valid [0:`ROB_SIZE-1];
 reg                       complete [0:`ROB_SIZE-1];
-reg [31:0]                pc [0:`ROB_SIZE-1];
-reg [31:0]                inst [0:`ROB_SIZE-1];
-reg                       rf_we [0:`ROB_SIZE-1];
-reg [4:0]                 rd [0:`ROB_SIZE-1];
-reg [`FU_NUM-1:0]         futype [0:`ROB_SIZE-1];
-reg                       is_load [0:`ROB_SIZE-1];
-reg                       is_store [0:`ROB_SIZE-1];
-reg                       is_branch [0:`ROB_SIZE-1];
-reg [`BR_TYPE_W-1:0]      br_type [0:`ROB_SIZE-1];
-reg                       pred_taken [0:`ROB_SIZE-1];
-reg                       is_last [0:`ROB_SIZE-1];
-reg [`FTQ_W-1:0]          ftq_id [0:`ROB_SIZE-1];
-reg [`PRIV_NUM-1:0]       priv_vec [0:`ROB_SIZE-1];
-reg [13:0]                csr_num [0:`ROB_SIZE-1];
-reg [`TLB_OP_NUM-1:0]     tlb_op [0:`ROB_SIZE-1];
-reg [4:0]                 cacop_code [0:`ROB_SIZE-1];
-reg [`EXCP_NUM-1:0]       excp_static [0:`ROB_SIZE-1];
 
 reg [31:0]                result [0:`ROB_SIZE-1];
 reg [31:0]                result2 [0:`ROB_SIZE-1];
@@ -276,6 +262,64 @@ wire [`ROB_W-1:0] alloc0_idx = {1'b0, tail};
 wire [`ROB_W-1:0] alloc1_idx = {1'b1, tail};
 wire [`ROB_W-1:0] head0_idx  = {1'b0, head};
 wire [`ROB_W-1:0] head1_idx  = {1'b1, head};
+
+// ---------------- 静态区：奇偶双体 LUTRAM（写一次读一次） ----------------
+// 分配拍恒成对写（偶体<=槽0、奇体<=槽1，各自单写口 @tail），提交只读 @head，
+// 满足分布式 RAM 1W1R 异步读模型；冲刷无需清内容（valid=0 即屏蔽陈旧值）。
+// futype 字段只写不读，已作为死存储删除（端口保留，入 lint 吸收）。
+// inst 32b 仅 difftest/调试需要：只在仿真视图保留（见下 `ifdef SIMU 段），
+// 综合视图用分配拍预译码的 2 bit（is_b0 / direct_b）替代提交侧全部真实用途，
+// 同时把 inst[head] 的 32b 读 mux 从"提交异常链"关键路径起点上摘除。
+localparam STA_PC_LSB    = 0;
+localparam STA_B0_LSB    = STA_PC_LSB    + 32;             // inst==0x50000000
+localparam STA_DIRB_LSB  = STA_B0_LSB    + 1;              // inst[31:26]==010100
+localparam STA_RFWE_LSB  = STA_DIRB_LSB  + 1;
+localparam STA_RD_LSB    = STA_RFWE_LSB  + 1;
+localparam STA_ISLD_LSB  = STA_RD_LSB    + 5;
+localparam STA_ISST_LSB  = STA_ISLD_LSB  + 1;
+localparam STA_ISBR_LSB  = STA_ISST_LSB  + 1;
+localparam STA_BRT_LSB   = STA_ISBR_LSB  + 1;
+localparam STA_PRDT_LSB  = STA_BRT_LSB   + `BR_TYPE_W;
+localparam STA_LAST_LSB  = STA_PRDT_LSB  + 1;
+localparam STA_FTQ_LSB   = STA_LAST_LSB  + 1;
+localparam STA_PRIV_LSB  = STA_FTQ_LSB   + `FTQ_W;
+localparam STA_CSRN_LSB  = STA_PRIV_LSB  + `PRIV_NUM;
+localparam STA_TLBOP_LSB = STA_CSRN_LSB  + 14;
+localparam STA_CACOP_LSB = STA_TLBOP_LSB + `TLB_OP_NUM;
+localparam STA_EXCP_LSB  = STA_CACOP_LSB + 5;
+localparam STA_W         = STA_EXCP_LSB  + `EXCP_NUM;
+
+(* ram_style = "distributed" *) reg [STA_W-1:0] sta_even [0:`ROB_SIZE/2-1];
+(* ram_style = "distributed" *) reg [STA_W-1:0] sta_odd  [0:`ROB_SIZE/2-1];
+
+wire a0_inst_is_b0  = (a0_inst_i == 32'h50000000);
+wire a1_inst_is_b0  = (a1_inst_i == 32'h50000000);
+wire a0_is_direct_b = (a0_inst_i[31:26] == 6'b010100);
+wire a1_is_direct_b = (a1_inst_i[31:26] == 6'b010100);
+
+wire [STA_W-1:0] sta_pack0 = {a0_excp_i, a0_cacop_code_i, a0_tlb_op_i, a0_csr_num_i,
+                              a0_priv_vec_i, a0_ftq_id_i, a0_is_last_i, a0_pred_taken_i,
+                              a0_br_type_i, a0_is_branch_i, a0_is_store_i, a0_is_load_i,
+                              a0_rd_i, a0_rf_we_i, a0_is_direct_b, a0_inst_is_b0, a0_pc_i};
+wire [STA_W-1:0] sta_pack1 = {a1_excp_i, a1_cacop_code_i, a1_tlb_op_i, a1_csr_num_i,
+                              a1_priv_vec_i, a1_ftq_id_i, a1_is_last_i, a1_pred_taken_i,
+                              a1_br_type_i, a1_is_branch_i, a1_is_store_i, a1_is_load_i,
+                              a1_rd_i, a1_rf_we_i, a1_is_direct_b, a1_inst_is_b0, a1_pc_i};
+
+wire alloc_fire = !reset && !flush_i && alloc_en_i && !rob_full_o;
+
+always @(posedge clk) begin
+    if (alloc_fire) begin
+        sta_even[tail] <= sta_pack0;
+        sta_odd[tail]  <= sta_pack1;
+    end
+end
+
+wire [STA_W-1:0] sta_h0 = sta_even[head];
+wire [STA_W-1:0] sta_h1 = sta_odd[head];
+
+// 死存储 futype 的端口吸收（重排流水不用它，保留接口兼容）
+wire rob_lint_futype = |{a0_futype_i, a1_futype_i};
 
 assign rob_tail_o = tail;
 // 满判据必须按 ROB_PAIR_W 位宽环形加：`ROB_GUARD` 是无宽度十进制字面量，
@@ -315,59 +359,78 @@ assign head_robid0_o = head0_idx;
 
 assign cmt0_valid_o = valid[head0_idx];
 assign cmt0_complete_o = complete[head0_idx];
-assign cmt0_pc_o = pc[head0_idx];
-assign cmt0_inst_o = inst[head0_idx];
-assign cmt0_rf_we_o = rf_we[head0_idx];
-assign cmt0_rd_o = rd[head0_idx];
+assign cmt0_pc_o = sta_h0[STA_PC_LSB +: 32];
+assign cmt0_inst_is_b0_o = sta_h0[STA_B0_LSB];
+assign cmt0_is_direct_b_o = sta_h0[STA_DIRB_LSB];
+assign cmt0_rf_we_o = sta_h0[STA_RFWE_LSB];
+assign cmt0_rd_o = sta_h0[STA_RD_LSB +: 5];
 assign cmt0_result_o = result[head0_idx];
 assign cmt0_result2_o = result2[head0_idx];
-assign cmt0_is_load_o = is_load[head0_idx];
-assign cmt0_is_store_o = is_store[head0_idx];
+assign cmt0_is_load_o = sta_h0[STA_ISLD_LSB];
+assign cmt0_is_store_o = sta_h0[STA_ISST_LSB];
 assign cmt0_paddr_o = paddr[head0_idx];
 assign cmt0_vaddr_o = vaddr[head0_idx];
 assign cmt0_wstrb_o = wstrb[head0_idx];
 assign cmt0_size_o = size[head0_idx];
 assign cmt0_uncached_o = uncached[head0_idx];
-assign cmt0_is_branch_o = is_branch[head0_idx];
-assign cmt0_br_type_o = br_type[head0_idx];
-assign cmt0_pred_taken_o = pred_taken[head0_idx];
+assign cmt0_is_branch_o = sta_h0[STA_ISBR_LSB];
+assign cmt0_br_type_o = sta_h0[STA_BRT_LSB +: `BR_TYPE_W];
+assign cmt0_pred_taken_o = sta_h0[STA_PRDT_LSB];
 assign cmt0_br_taken_o = br_taken[head0_idx];
 assign cmt0_br_target_o = br_target[head0_idx];
-assign cmt0_is_last_o = is_last[head0_idx];
-assign cmt0_ftq_id_o = ftq_id[head0_idx];
-assign cmt0_priv_vec_o = priv_vec[head0_idx];
-assign cmt0_csr_num_o = csr_num[head0_idx];
-assign cmt0_tlb_op_o = tlb_op[head0_idx];
-assign cmt0_cacop_code_o = cacop_code[head0_idx];
-assign cmt0_excp_o = excp_static[head0_idx] | excp_dynamic[head0_idx];
+assign cmt0_is_last_o = sta_h0[STA_LAST_LSB];
+assign cmt0_ftq_id_o = sta_h0[STA_FTQ_LSB +: `FTQ_W];
+assign cmt0_priv_vec_o = sta_h0[STA_PRIV_LSB +: `PRIV_NUM];
+assign cmt0_csr_num_o = sta_h0[STA_CSRN_LSB +: 14];
+assign cmt0_tlb_op_o = sta_h0[STA_TLBOP_LSB +: `TLB_OP_NUM];
+assign cmt0_cacop_code_o = sta_h0[STA_CACOP_LSB +: 5];
+assign cmt0_excp_o = sta_h0[STA_EXCP_LSB +: `EXCP_NUM] | excp_dynamic[head0_idx];
 
 assign cmt1_valid_o = valid[head1_idx];
 assign cmt1_complete_o = complete[head1_idx];
-assign cmt1_pc_o = pc[head1_idx];
-assign cmt1_inst_o = inst[head1_idx];
-assign cmt1_rf_we_o = rf_we[head1_idx];
-assign cmt1_rd_o = rd[head1_idx];
+assign cmt1_pc_o = sta_h1[STA_PC_LSB +: 32];
+assign cmt1_inst_is_b0_o = sta_h1[STA_B0_LSB];
+assign cmt1_is_direct_b_o = sta_h1[STA_DIRB_LSB];
+assign cmt1_rf_we_o = sta_h1[STA_RFWE_LSB];
+assign cmt1_rd_o = sta_h1[STA_RD_LSB +: 5];
 assign cmt1_result_o = result[head1_idx];
 assign cmt1_result2_o = result2[head1_idx];
-assign cmt1_is_load_o = is_load[head1_idx];
-assign cmt1_is_store_o = is_store[head1_idx];
+assign cmt1_is_load_o = sta_h1[STA_ISLD_LSB];
+assign cmt1_is_store_o = sta_h1[STA_ISST_LSB];
 assign cmt1_paddr_o = paddr[head1_idx];
 assign cmt1_vaddr_o = vaddr[head1_idx];
 assign cmt1_wstrb_o = wstrb[head1_idx];
 assign cmt1_size_o = size[head1_idx];
 assign cmt1_uncached_o = uncached[head1_idx];
-assign cmt1_is_branch_o = is_branch[head1_idx];
-assign cmt1_br_type_o = br_type[head1_idx];
-assign cmt1_pred_taken_o = pred_taken[head1_idx];
+assign cmt1_is_branch_o = sta_h1[STA_ISBR_LSB];
+assign cmt1_br_type_o = sta_h1[STA_BRT_LSB +: `BR_TYPE_W];
+assign cmt1_pred_taken_o = sta_h1[STA_PRDT_LSB];
 assign cmt1_br_taken_o = br_taken[head1_idx];
 assign cmt1_br_target_o = br_target[head1_idx];
-assign cmt1_is_last_o = is_last[head1_idx];
-assign cmt1_ftq_id_o = ftq_id[head1_idx];
-assign cmt1_priv_vec_o = priv_vec[head1_idx];
-assign cmt1_csr_num_o = csr_num[head1_idx];
-assign cmt1_tlb_op_o = tlb_op[head1_idx];
-assign cmt1_cacop_code_o = cacop_code[head1_idx];
-assign cmt1_excp_o = excp_static[head1_idx] | excp_dynamic[head1_idx];
+assign cmt1_is_last_o = sta_h1[STA_LAST_LSB];
+assign cmt1_ftq_id_o = sta_h1[STA_FTQ_LSB +: `FTQ_W];
+assign cmt1_priv_vec_o = sta_h1[STA_PRIV_LSB +: `PRIV_NUM];
+assign cmt1_csr_num_o = sta_h1[STA_CSRN_LSB +: 14];
+assign cmt1_tlb_op_o = sta_h1[STA_TLBOP_LSB +: `TLB_OP_NUM];
+assign cmt1_cacop_code_o = sta_h1[STA_CACOP_LSB +: 5];
+assign cmt1_excp_o = sta_h1[STA_EXCP_LSB +: `EXCP_NUM] | excp_dynamic[head1_idx];
+
+// inst 32b 仅仿真视图保留（difftest/调试观测）；综合视图恒 0，
+// 提交侧真实用途（idle `b 0` 判定 / 槽1 直接 B 判定）已由预译码位承担。
+`ifdef SIMU
+reg [31:0] inst [0:`ROB_SIZE-1];
+always @(posedge clk) begin
+    if (alloc_fire) begin
+        inst[alloc0_idx] <= a0_inst_i;
+        inst[alloc1_idx] <= a1_inst_i;
+    end
+end
+assign cmt0_inst_o = inst[head0_idx];
+assign cmt1_inst_o = inst[head1_idx];
+`else
+assign cmt0_inst_o = 32'b0;
+assign cmt1_inst_o = 32'b0;
+`endif
 
 always @(posedge clk) begin
     if (reset || flush_i) begin
@@ -395,28 +458,12 @@ always @(posedge clk) begin
         end
 
         if (alloc_en_i && !rob_full_o) begin
+            // 静态字段写已移至 sta_even/sta_odd LUTRAM（alloc_fire 同拍同条件）
             valid[alloc0_idx] <= a0_valid_i;
             // NOP 或带静态(取指/译码)异常的指令在分配时即置 complete：二者都不会发射到 FU 写回,
             // 取指异常(如 jirl 目标非对齐 ADEF)的"指令"是 inst=0 气泡,若不置 complete 会永远卡在
             // ROB 头(无 FU 写回)→ 死锁。它只需到头抬异常即可。
             complete[alloc0_idx] <= a0_valid_i && (a0_is_nop_i || (|a0_excp_i));
-            pc[alloc0_idx] <= a0_pc_i;
-            inst[alloc0_idx] <= a0_inst_i;
-            rf_we[alloc0_idx] <= a0_rf_we_i;
-            rd[alloc0_idx] <= a0_rd_i;
-            futype[alloc0_idx] <= a0_futype_i;
-            is_load[alloc0_idx] <= a0_is_load_i;
-            is_store[alloc0_idx] <= a0_is_store_i;
-            is_branch[alloc0_idx] <= a0_is_branch_i;
-            br_type[alloc0_idx] <= a0_br_type_i;
-            pred_taken[alloc0_idx] <= a0_pred_taken_i;
-            is_last[alloc0_idx] <= a0_is_last_i;
-            ftq_id[alloc0_idx] <= a0_ftq_id_i;
-            priv_vec[alloc0_idx] <= a0_priv_vec_i;
-            csr_num[alloc0_idx] <= a0_csr_num_i;
-            tlb_op[alloc0_idx] <= a0_tlb_op_i;
-            cacop_code[alloc0_idx] <= a0_cacop_code_i;
-            excp_static[alloc0_idx] <= a0_excp_i;
             result[alloc0_idx] <= 32'b0;
             result2[alloc0_idx] <= 32'b0;
             paddr[alloc0_idx] <= 32'b0;
@@ -430,23 +477,6 @@ always @(posedge clk) begin
 
             valid[alloc1_idx] <= a1_valid_i;
             complete[alloc1_idx] <= a1_valid_i && (a1_is_nop_i || (|a1_excp_i));
-            pc[alloc1_idx] <= a1_pc_i;
-            inst[alloc1_idx] <= a1_inst_i;
-            rf_we[alloc1_idx] <= a1_rf_we_i;
-            rd[alloc1_idx] <= a1_rd_i;
-            futype[alloc1_idx] <= a1_futype_i;
-            is_load[alloc1_idx] <= a1_is_load_i;
-            is_store[alloc1_idx] <= a1_is_store_i;
-            is_branch[alloc1_idx] <= a1_is_branch_i;
-            br_type[alloc1_idx] <= a1_br_type_i;
-            pred_taken[alloc1_idx] <= a1_pred_taken_i;
-            is_last[alloc1_idx] <= a1_is_last_i;
-            ftq_id[alloc1_idx] <= a1_ftq_id_i;
-            priv_vec[alloc1_idx] <= a1_priv_vec_i;
-            csr_num[alloc1_idx] <= a1_csr_num_i;
-            tlb_op[alloc1_idx] <= a1_tlb_op_i;
-            cacop_code[alloc1_idx] <= a1_cacop_code_i;
-            excp_static[alloc1_idx] <= a1_excp_i;
             result[alloc1_idx] <= 32'b0;
             result2[alloc1_idx] <= 32'b0;
             paddr[alloc1_idx] <= 32'b0;

@@ -46,7 +46,9 @@
 `define RS_ALU_SIZE     4   // 每个 ALU 保留站项数（乱序发射）
 `define RS_ALU_IDX_W    2   // $clog2(RS_ALU_SIZE)
 `define RS_ALU_OCC_W    3   // $clog2(RS_ALU_SIZE+1)，occupancy 0..SIZE
-`define RS_MEM_SIZE     4   // 访存保留站项数（FIFO 顺序发射）
+`define RS_MEM_SIZE     4   // 访存保留站项数（FIFO + 有限 load 越过；V2.3 A/B 过 4→8：
+                            //   IPC 0.5700 持平——反压只是转移成 ROB full（9%→22%），
+                            //   真瓶颈在 D$ miss 串行延迟，故保持 4 省资源）
 `define RS_MEM_IDX_W    2   // $clog2(RS_MEM_SIZE)
 `define RS_MEM_OCC_W    3   // $clog2(RS_MEM_SIZE+1)
 `define RS_MDU_SIZE     2   // 乘除保留站项数（FIFO 顺序发射）
@@ -73,10 +75,12 @@
 `define CACHE_LINE_WORDS  8           // 每行 32bit 字数
 
 `define L1_NWAY           4           // L1 I/D cache 路数
-`define L1_NMSHR          2           // L1 D$ MSHR 项数（Phase1b 起参数化）
+`define L1_NMSHR          2           // L1 D$ MSHR 项数（Phase1b 起参数化；V2.3 A/B 过 2→4：
+                                      //   IPC 0.5699 持平（AXI 读通道单 owner，MSHR 数不增并行度），
+                                      //   资源反增（行缓冲/比较器 ×2），故保持 2）
 `define DC_MSHR_DEPTH     `L1_NMSHR   // dcache 后台 MSHR 深度
 `define LSU_MISS_DEPTH    `DC_MSHR_DEPTH // LSU miss 槽深度（与 D$ MSHR 对齐）
-`define STQ_DEPTH         8           // 软门 STQ4 IPC 同 0.570，但 digftest 在 account_user_time 错载；默认 8
+`define STQ_DEPTH         8           // 软门 STQ4 IPC 同 0.570，但 difftest 在 account_user_time 错载；默认 8
 `define L1_NSET           128         // L1 每路组数（16KB/4路/32B）
 `define L1_INDEX_W        7           // $clog2(L1_NSET)
 `define L1_TAG_W          20          // 32 - 7 - 5
@@ -93,8 +97,13 @@
 `define FTB_NWAY          4           // FTB 路数
 `define FTB_NSET          1024        // FTB 每路组数（共 4096 项，BRAM 实现）
 `define FTB_INDEX_W       10          // $clog2(FTB_NSET)
-`define FTB_UPDATE_Q_DEPTH 32          // FTB 训练更新 FIFO 深度（2 的幂；查询优先不偷读口）
-`define TAGE_UPDATE_Q_DEPTH 32          // TAGE 训练更新 FIFO（COND 突发训练更密，需更深）
+`define FTB_UPDATE_Q_DEPTH 32          // FTB 训练更新 FIFO 深度（2 的幂；查询优先不偷读口；
+                                       //   V2.3 A/B 过 32→64：overflow 31万→26万 但 BPU 准确率
+                                       //   与 IPC 均持平——溢出集中在查询独占读口的突发段，
+                                       //   加深只延后丢弃，故保持 32）
+`define TAGE_UPDATE_Q_DEPTH 32          // TAGE 训练更新 FIFO（COND 突发训练更密，需更深；
+                                       //   V2.3 A/B 过 32→64：overflow 16万→14万，准确率/IPC
+                                       //   持平，保持 32）
 
 `define TAGE_BASE_DEPTH   8192        // TAGE 基础表项数（2bit 饱和计数器）
 `define TAGE_TAG_NUM      4           // TAGE 标记表个数

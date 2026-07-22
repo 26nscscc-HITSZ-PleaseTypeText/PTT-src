@@ -79,7 +79,7 @@ module dcache (
     output wire        ld_addr_ok_o,
     output wire        ld_data_ok_o,     // 命中/uncached 完成（快速通道）
     output wire [31:0] ld_rdata_o,
-    input  wire        ld_cancel_i,      // 冲刷：杀在飞 load MSHR / 抑制 mshr_data_ok
+    input  wire        ld_cancel_i,      // 冲刷：在飞 load MSHR 置 killed 记账（data_ok 仍发，LSU m_drop 收槽，见头注契约）
     // ---- 非阻塞 miss 扩展（配合 LSU miss 槽）----
     output wire        ld_miss_o,        // 本 load 已移入 MSHR（LOOKUP 拍一拍脉冲）
     output wire        ld_mshr_data_ok_o,// MSHR load 数据返回（一拍脉冲）
@@ -228,9 +228,11 @@ reg [LINEW-1:0] wb_line;
 wire wb_all_idle = (wb_state == W_IDLE) && !wb_valid;
 
 // ---------------- 存储阵列 ----------------
+// valid/dirty 需复位/一拍失效，保持触发器；tag 拆 per-way 一维阵列（见下 gen_tag）
+// —— 二维 reg 数组 Vivado 推断不出分布式 RAM，会落成 ~10k FF + 巨型读 mux。
 reg [NSET-1:0] valid_arr [0:NWAY-1];
 reg [NSET-1:0] dirty_arr [0:NWAY-1];
-reg [TAGW-1:0] tag_arr   [0:NWAY-1][0:NSET-1];   // LUTRAM（异步读）
+wire [TAGW-1:0] tag_rd [0:NWAY-1];               // 各路 tag 在 req_set 处的异步读值
 
 wire [LINEW-1:0] data_out [0:NWAY-1];
 reg  [IDXW-1:0]  ram_addr;
@@ -280,12 +282,28 @@ wire [IDXW-1:0] req_set = req_paddr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
 wire [TAGW-1:0] req_tag = req_paddr[31:IDXW+`CACHE_LINE_W];
 wire [2:0]      req_word= req_paddr[4:2];
 
+// ---------------- tag 阵列（per-way LUTRAM：1 写口 + req_set 异步读）----------------
+// 写口唯一：MSHR 安装拍写 mshr_inst_set（与原 FSM 内 tag_arr 写同拍同条件）；
+// 读口全部落在 req_set（cac_set 与 req_set 同为 req_paddr 同一切片）。
+// 复位不清 tag（valid=0 即无效），与 LUTRAM 无复位的特性一致。
+genvar gt;
+generate
+for (gt = 0; gt < NWAY; gt = gt + 1) begin : gen_tag
+    (* ram_style = "distributed" *) reg [TAGW-1:0] tag_ram [0:NSET-1];
+    always @(posedge clk) begin
+        if (mshr_install_fire && (mshr_inst_way == gt[1:0]))
+            tag_ram[mshr_inst_set] <= mshr_inst_tag;
+    end
+    assign tag_rd[gt] = tag_ram[req_set];
+end
+endgenerate
+
 // ---------------- 命中判定（LOOKUP 拍，tag LUTRAM 异步读）----------------
 wire [NWAY-1:0] way_hit;
 genvar gw;
 generate
 for (gw = 0; gw < NWAY; gw = gw + 1) begin : gen_hit
-    assign way_hit[gw] = valid_arr[gw][req_set] && (tag_arr[gw][req_set] == req_tag);
+    assign way_hit[gw] = valid_arr[gw][req_set] && (tag_rd[gw] == req_tag);
 end
 endgenerate
 wire        hit_any = |way_hit;
@@ -591,9 +609,8 @@ always @(posedge clk) begin
                 pend_ld_killed <= 1'b1;
         end
 
-        // MSHR 安装：更新 tag/valid/dirty（数据 RAM 写在组合块）
+        // MSHR 安装：更新 valid/dirty（tag 写在 gen_tag，数据 RAM 写在组合块）
         if (mshr_install_fire) begin
-            tag_arr[mshr_inst_way][mshr_inst_set]   <= mshr_inst_tag;
             valid_arr[mshr_inst_way][mshr_inst_set] <= 1'b1;
             dirty_arr[mshr_inst_way][mshr_inst_set] <= mshr_inst_is_st;
         end
@@ -679,7 +696,7 @@ always @(posedge clk) begin
                         `CACOP_OP_HIT_INV: begin
                             // op1 Index 写回无效（way 由 addr[1:0] 指定）
                             if (valid_arr[cac_way][cac_set] && dirty_arr[cac_way][cac_set]) begin
-                                cwb_tag  <= tag_arr[cac_way][cac_set];
+                                cwb_tag  <= tag_rd[cac_way];   // cac_set == req_set
                                 cwb_line <= data_out[cac_way];
                                 valid_arr[cac_way][cac_set] <= 1'b0;
                                 dirty_arr[cac_way][cac_set] <= 1'b0;
@@ -694,7 +711,7 @@ always @(posedge clk) begin
                             // op2 Hit 写回无效（物理地址查命中）
                             if (hit_any) begin
                                 if (dirty_arr[hit_way][req_set]) begin
-                                    cwb_tag  <= tag_arr[hit_way][req_set];
+                                    cwb_tag  <= tag_rd[hit_way];
                                     cwb_line <= data_out[hit_way];
                                     valid_arr[hit_way][req_set] <= 1'b0;
                                     dirty_arr[hit_way][req_set] <= 1'b0;
@@ -907,7 +924,7 @@ always @(posedge clk) begin
         // 与上面清位不可能同拍，写在 case 后无冲突）
         if (mshr_alloc && miss_need_wb) begin
             wb_valid <= 1'b1;
-            wb_addr  <= {tag_arr[pick_way][req_set], req_set, {`CACHE_LINE_W{1'b0}}};
+            wb_addr  <= {tag_rd[pick_way], req_set, {`CACHE_LINE_W{1'b0}}};
             wb_line  <= data_out[pick_way];
         end
     end

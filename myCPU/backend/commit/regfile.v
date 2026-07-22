@@ -102,11 +102,7 @@ initial begin
     end
 end
 
-//TODO: 写口逻辑改造（原单写口代码保留如下，需扩成双写口）：
-//      1) 在 always 里增加 we1 分支；
-//      2) 同拍 waddr0==waddr1 时槽 1（更年轻）优先生效：
-//         if (we1 && waddr1!=0)            rf[waddr1] <= wdata1;
-//         if (we0 && waddr0!=0 && !(we1 && waddr1==waddr0)) rf[waddr0] <= wdata0;
+// 双写口约定（已实现）：同拍 waddr0==waddr1 时槽 1（更年轻）优先生效。
 always @(posedge clk) begin
     if (we1 && (waddr1 != 5'b0)) begin
         rf[waddr1] <= wdata1;
@@ -116,11 +112,8 @@ always @(posedge clk) begin
     end
 end
 
-//TODO: 读口写穿透改造：原实现对单写口做了"写穿透"（同拍写的值直接出现在读口）。
-//      新架构下 rename 读口与 commit 写口同拍同地址时，RAT 的 busy/释放时序
-//      已保证语义正确（提交释放与重命名读在 RAT 中有先后约定），这里建议
-//      仍保留写穿透（双写口都要透，槽 1 优先），与 RAT 行为对齐，避免
-//      "提交拍读到旧值"的窗口。照原样把 we/waddr/wdata 换成两组即可。
+// 读口写穿透（已实现）：同拍写的值直接出现在读口（双写口都透，槽 1 优先），
+//      与 RAT 的提交释放/重命名读时序约定对齐，避免"提交拍读到旧值"的窗口。
 // 用 === 与 we===1'b1：地址或写使能含 X 时勿用 `==`/`&&` 产生 X 污染读口（进而污染 CSR 写回链）。
 assign rdata0 = (raddr0 === 5'b0) ? 32'b0 :
                 (((we1 === 1'b1) && (waddr1 === raddr0) && (waddr1 !== 5'b0)) ? wdata1 :
@@ -166,7 +159,7 @@ assign rdata7 = (raddr7 === 5'b0) ? 32'b0 :
 assign dbg_rdata = (dbg_raddr === 5'b0) ? 32'b0 : rf[dbg_raddr];
 
 `ifdef DIFFTEST_EN
-//TODO: difftest 快照同样要加 we1 写穿透（双口都透，槽 1 优先），
+// difftest 快照同样带 we1 写穿透（双口都透，槽 1 优先），
 //      否则双提交拍 NEMU 对比会差一拍。
 // posedge 快照 + 写穿透，与 cmt_wdata/debug0_wb_rf_wdata 同拍对齐；勿直接组合读 rf
 reg [31:0] diff_gpr_r [1:31];

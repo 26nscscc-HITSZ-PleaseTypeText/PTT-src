@@ -66,7 +66,6 @@ reg [31:0] flush_pc_r;
 reg        ftq_full_r;
 reg        ftq_freeze_r;
 reg        p0_wrote_r;
-reg [31:0] p0_pc_r;
 reg [`BLK_LEN_W-1:0] p0_length_r;
 reg        p0_taken_r;
 reg [31:0] p0_target_r;
@@ -91,7 +90,6 @@ always @(posedge clk) begin
     else
         p0_wrote_r <= p0_valid_o;
     if (p0_valid_o) begin
-        p0_pc_r     <= p0_pc_o;
         p0_length_r <= p0_length_o;
         p0_taken_r  <= p0_taken_o;
         p0_target_r <= p0_target_o;
@@ -476,27 +474,5 @@ always @(posedge clk) begin
     else if (!ftq_freeze)
         pc <= p0_next;
 end
-
-`ifdef SYNTHESIS
-// synthesis translate_off
-// 临时调试：捕获 PC 离开 1c 代码段的时刻（调通后删除）
-always @(posedge clk) begin
-    if (!reset && (pc[31:24] == 8'h1c)) begin
-        if (flush_i && (flush_pc_i[31:24] != 8'h1c))
-            $display("[%0t] BPU_DBG flush -> %h", $time, flush_pc_i);
-        else if (!flush_i && flush_r && (flush_pc_r[31:24] != 8'h1c))
-            $display("[%0t] BPU_DBG flush_r -> %h", $time, flush_pc_r);
-        else if (!flush_i && !flush_r && predec_redirect_i && predec_update_pc_i && (predec_redirect_pc_i[31:24] != 8'h1c))
-            $display("[%0t] BPU_DBG predec -> %h (pc=%h)", $time, predec_redirect_pc_i, pc);
-        else if (!flush_i && !flush_r && !(predec_redirect_i && predec_update_pc_i) && p1_diff && (p1_next[31:24] != 8'h1c))
-            $display("[%0t] BPU_DBG p1 -> %h (pc_r=%h taken=%b tgt=%h fall=%h btype=%b rasE=%b)", $time,
-                     p1_next, pc_r, p1_taken_c, ftb_target, ftb_fall, ftb_btype, ras_empty);
-        else if (!flush_i && !flush_r && !(predec_redirect_i && predec_update_pc_i) && !p1_diff && !ftq_freeze && (p0_next[31:24] != 8'h1c))
-            $display("[%0t] BPU_DBG p0 -> %h (pc=%h ubtb=%b taken=%b tgt=%h)", $time,
-                     p0_next, pc, ubtb_hit, p0_taken_c, p0_target_c);
-    end
-end
-// synthesis translate_on
-`endif
 
 endmodule

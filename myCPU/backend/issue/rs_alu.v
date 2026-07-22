@@ -9,8 +9,8 @@
 // - "唤醒"与"数据"分离的概念（重要！）：
 //   * 唤醒（wakeup）：得知"某 robid 的结果即将/已经可用"，置 ready 位；
 //   * 数据捕获（capture）：从写回总线上把 32bit 数据真正存进本项。
-//   一期两者同拍完成（写回唤醒）；二期提前唤醒时两者分离
-//   （唤醒早 1~2 拍，数据靠发射时旁路网络补）。
+//   写回唤醒两者同拍完成；提前唤醒（early0/1，已接通）两者分离——
+//   唤醒早 1 拍置 ready，数据在下拍生产者写回时由 WB 旁路补齐。
 //
 // 端口：
 // - push_*          ：dispatch 入站口（一拍最多 1 条）
@@ -64,12 +64,12 @@ module rs_alu(
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
 
-    // ---------------- 提前唤醒总线 ×3（无数据，二期接入）----------------
+    // ---------------- 提前唤醒总线 ×3（无数据；early0/1 已接通，early2 预留）----------------
     input  wire                       early0_valid_i,    // fu_alu0 发射拍唤醒
     input  wire [`ROB_W-1:0]          early0_robid_i,
     input  wire                       early1_valid_i,    // fu_alu1 发射拍唤醒
     input  wire [`ROB_W-1:0]          early1_robid_i,
-    input  wire                       early2_valid_i,    // lsu AGU 级投机唤醒
+    input  wire                       early2_valid_i,    // lsu AGU 级投机唤醒（预留未接）
     input  wire [`ROB_W-1:0]          early2_robid_i,
 
     // ---------------- 发射口（到 fu_alu，组合）----------------
@@ -85,34 +85,30 @@ module rs_alu(
     output wire [31:0]                issue_br_offs_o
 );
 
-//TODO: 实现 4 项乱序发射保留站（参考：mariver station.v 的 ALU 保留站部分，
-//      含 prior 时间戳选择逻辑 388~398 行、唤醒 659~666 行、旁路 479~533 行）
+// 设计说明（已实现，参考 mariver station.v 的 ALU 保留站部分：
+//      prior 时间戳选择 388~398 行、唤醒 659~666 行、旁路 479~533 行）
 //
-//TODO: 存储结构（每项，全 reg）：
-//      valid, robid[`ROB_W], pc[32], alu_op[21], br_op[9],
-//      s0_ready, s0_val[32], s0_robid[`ROB_W],
-//      s1_ready, s1_val[32], s1_robid[`ROB_W],
+// 存储结构（每项，全 reg）：
+//      valid, robid[`ROB_W], pc[32], alu_op[`ALU_OP_NUM], br_op[`BR_OP_NUM],
+//      s0_ready/s0_val_valid, s0_val[32], s0_robid[`ROB_W]（s1 同理），
 //      imm[32], use_imm, br_offs[32],
 //      prior[1:0]   // 年龄时间戳：新入站项=3，有项发射后其余项-1（数值小=老）
 //
-//TODO: 入站：
+// 入站：
 //      can_accept_o = 有 valid=0 的空项；occupancy_o = valid 计数。
 //      push 时写第一个空项，prior 置最大（最年轻）。
 //
-//TODO: 唤醒与数据捕获（每项每源监听 4 路 wb 总线）：
-//      if (!sX_ready && wbN_valid && wbN_robid==sX_robid) begin
-//          sX_ready <= 1;  sX_val <= wbN_data;
-//      end
+// 唤醒与数据捕获（每项每源监听 4 路 wb 总线 + early0/1）：
+//      wb 命中：置 sX_ready 并捕获数据；early 命中：只置 ready（val_valid=0），
+//      数据在下拍 WB 旁路补齐。
 //      同拍入站+唤醒：push 数据进来的同拍总线上恰有它等的 robid ——
 //      入站数据要先过一遍同样的旁路比较再写入（mariver 的 bypassin 逻辑），
 //      否则错过唤醒永远等不到（经典死锁坑！）。
 //
-//TODO: 发射选择（组合，oldest-first）：
-//      cand[i] = valid[i] && s0_ready[i] && s1_ready[i];
-//      从 cand 中选 prior 最小（最老）的一项：4 项规模直接两两比较即可。
-//      issue_valid_o = |cand；发射项的字段接到 issue_* 上。
-//      发射成功（ALU 恒接收）当拍清该项 valid；其余项 prior 维护：
-//      比发射项年轻的项 prior-1（或用"发射后全体未满最大值的项-1"的简化策略）。
+// 发射选择（组合，oldest-first）：
+//      cand[i] = valid[i] && s0_ready[i] && s1_ready[i]（发射拍若 val 未捕获，
+//      从 WB 总线旁路取数）；从 cand 中选 prior 最小（最老）的一项发射。
+//      发射成功（ALU 恒接收）当拍清该项 valid；比发射项年轻的项 prior-1。
 //
 reg                     valid [0:`RS_ALU_SIZE-1];
 reg [`ROB_W-1:0]        robid [0:`RS_ALU_SIZE-1];

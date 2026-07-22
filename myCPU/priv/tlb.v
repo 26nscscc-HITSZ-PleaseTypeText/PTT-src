@@ -4,17 +4,22 @@
 // tlb 模块（主 TLB：TLBNUM 项全相联，双查找口 + 读写/无效化口）
 // ------------------------------------------------------------
 // 功能（新架构下完全复用，端口不变，已通过 79 个功能点验证）：
-// - s0 口：取指翻译查询（经 tlb_manager 内 I 侧 l1_tlb 微表转发，
-//   tlbsrch 提交拍被挪用为查 CSR.TLBEHI）
+// - s0 口：取指翻译查询（经 tlb_manager 内 I 侧 l1_tlb 微表转发）
 // - s1 口：访存翻译查询（经 D 侧 l1_tlb 微表转发）
+// - srch 口（V2.3 提频新增）：tlbsrch 专用查找口，输入直接来自
+//   CSR.TLBEHI/CSR.ASID 寄存器，只输出 found/index（体系结构语义，
+//   不读页属性）。tlbsrch 不再挪用 s0 口，commit 提交逻辑从
+//   「s0 mux → 全相联比较 → 翻译 → 取指」关键路径上整体摘除；
 // - 读写口/INVTLB：由 tlb_manager 在 commit 提交 TLB 维护指令时驱动
 //   （提交拍一拍脉冲，伴随 FLUSH_REFETCH 冲刷，无在途查询竞争）
 // - 双页结构（odd/even ppn）：一个表项覆盖相邻两页，写入时同时给出
 //   两页的 {ppn, plv, mat, d, v}，查找按 va 的页内奇偶位选边
 //
-// 二期优化落点说明（本模块保持零改动）：
-// 1) 32 项全相联比较链是时序热点——已按优先方案在 tlb_manager 里加
-//    l1_tlb 微表缓存（8 项组合命中 + fence 整表失效），本模块不动；
+// 参数：TLBNUM 表项数（模块默认 16，顶层 core_top 例化为 32）。
+//
+// 二期优化落点说明：
+// 1) TLBNUM 项全相联比较链是时序热点——已按优先方案在 tlb_manager 里加
+//    l1_tlb 微表缓存（8 项组合命中 + fence 整表失效）；
 //    微表只缓存 4KB 页翻译，大页恒走本模块透传。
 // 2) 大页（PS!=12）匹配完整性（跑 Linux 前已核对）：
 //    - match：PS=12 时全 19 位 vppn 精确比较；PS!=12（4MB 大页）时只比较
@@ -57,6 +62,13 @@ module tlb
     output wire [1:0]                   s1_mat,
     output wire                         s1_d,
     output wire                         s1_v,
+
+    // tlbsrch 专用查找口（输入恒为 CSR.TLBEHI/ASID 寄存器，输出仅 found/index；
+    // 匹配规则与 s0/s1 完全一致：E 有效 + 按 PS 比较 vppn + (ASID 相符或 G)）
+    input  wire [18:0]                  srch_vppn,
+    input  wire [9:0]                   srch_asid,
+    output wire                         srch_found,
+    output wire [$clog2(TLBNUM)-1:0]    srch_index,
 
     // INVTLB 指令接口（用于 TLB 无效化）
     input  wire                         invtlb_valid,
@@ -124,6 +136,7 @@ reg        tlb_v1   [TLBNUM-1:0];
 
 wire [TLBNUM-1:0] match0;
 wire [TLBNUM-1:0] match1;
+wire [TLBNUM-1:0] match_srch;
 wire [TLBNUM-1:0] s0_odd_page_hit;
 wire [TLBNUM-1:0] s1_odd_page_hit;
 
@@ -152,6 +165,9 @@ generate
                            tlb_e[i];
         assign match1[i] = ((tlb_ps[i] == PS_4KB) ? (s1_vppn == tlb_vppn[i]) : (s1_vppn[18:9] == tlb_vppn[i][18:9])) &&
                            ((s1_asid == tlb_asid[i]) || tlb_g[i]) &&
+                           tlb_e[i];
+        assign match_srch[i] = ((tlb_ps[i] == PS_4KB) ? (srch_vppn == tlb_vppn[i]) : (srch_vppn[18:9] == tlb_vppn[i][18:9])) &&
+                           ((srch_asid == tlb_asid[i]) || tlb_g[i]) &&
                            tlb_e[i];
 
         assign inv_cond_nonglobal[i] = ~tlb_g[i];
@@ -197,8 +213,25 @@ always @(*) begin
     end
 end
 
+// srch 口 index 编码（与 s0/s1 相同的最低命中项优先规则）
+reg [IDXW-1:0] srch_index_r;
+reg            srch_index_hit;
+integer idxs;
+always @(*) begin
+    srch_index_r   = {IDXW{1'b0}};
+    srch_index_hit = 1'b0;
+    for (idxs = 0; idxs < TLBNUM; idxs = idxs + 1) begin
+        if (match_srch[idxs] && !srch_index_hit) begin
+            srch_index_r   = idxs[IDXW-1:0];
+            srch_index_hit = 1'b1;
+        end
+    end
+end
+
 assign s0_index = s0_index_r;
 assign s1_index = s1_index_r;
+assign srch_found = |match_srch;
+assign srch_index = srch_index_r;
 
 assign s0_sel_odd = s0_odd_page_hit[s0_index_r];
 assign s1_sel_odd = s1_odd_page_hit[s1_index_r];
