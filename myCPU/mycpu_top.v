@@ -196,6 +196,7 @@ module core_top #(
     wire [1:0]                mmu_i_mat;
     wire                      mmu_i_adef;
     wire [`TLB_EX_NUM-1:0]    mmu_i_tlb_ex;
+    wire                      mmu_i_direct_ok;
     // IFU <-> ICache
     wire                      ifu_ic_req;
     wire [31:0]               ifu_ic_vaddr;
@@ -360,6 +361,7 @@ module core_top #(
         .mmu_i_mat_i          (mmu_i_mat),
         .mmu_i_excp_adef_i    (mmu_i_adef),
         .mmu_i_tlb_ex_i       (mmu_i_tlb_ex),
+        .mmu_i_direct_ok_i    (mmu_i_direct_ok),
         .ic_req_o             (ifu_ic_req),
         .ic_vaddr_o           (ifu_ic_vaddr),
         .ic_paddr_o           (ifu_ic_paddr),
@@ -1046,16 +1048,20 @@ module core_top #(
 // 保留站/执行单元 信号声明（4xRS + 4xFU + 唤醒总线）
 //--------------------------------------------------
     // 写回唤醒总线（4 路：alu0/alu1/lsu/mdu，广播到 4 个 RS + ROB）
-    wire                      alu0_wb_valid, alu1_wb_valid, mem_wb_valid, mdu_wb_valid;
-    wire [`ROB_W-1:0]         alu0_wb_robid, alu1_wb_robid, mem_wb_robid, mdu_wb_robid;
-    wire [31:0]               alu0_wb_data,  alu1_wb_data,  mem_wb_data,  mdu_wb_data;
+    wire                      alu0_wb_valid, alu1_wb_valid, mdu_wb_valid;
+    wire                      mem_wb_valid_raw, mem_wb_valid;
+    wire [`ROB_W-1:0]         alu0_wb_robid, alu1_wb_robid, mdu_wb_robid;
+    wire [`ROB_W-1:0]         mem_wb_robid_raw, mem_wb_robid;
+    wire [31:0]               alu0_wb_data,  alu1_wb_data,  mdu_wb_data;
+    wire [31:0]               mem_wb_data_raw, mem_wb_data;
     wire                      alu0_wb_br_taken, alu1_wb_br_taken;
     wire [31:0]               alu0_wb_br_target, alu1_wb_br_target;
-    wire [31:0]               mem_wb_paddr, mem_wb_vaddr;
-    wire [3:0]                mem_wb_wstrb;
-    wire [2:0]                mem_wb_size;
-    wire                      mem_wb_uncached;
-    wire [`EXCP_NUM-1:0]      mem_wb_excp;
+    wire [31:0]               mem_wb_paddr_raw, mem_wb_paddr;
+    wire [31:0]               mem_wb_vaddr_raw, mem_wb_vaddr;
+    wire [3:0]                mem_wb_wstrb_raw, mem_wb_wstrb;
+    wire [2:0]                mem_wb_size_raw, mem_wb_size;
+    wire                      mem_wb_uncached_raw, mem_wb_uncached;
+    wire [`EXCP_NUM-1:0]      mem_wb_excp_raw, mem_wb_excp;
     wire [31:0]               mdu_wb_data2;
     // 提前唤醒总线（3 路：alu0/alu1 发射拍 + lsu DC 命中限定 early2）
     wire                      alu0_early_valid, alu1_early_valid;
@@ -1653,18 +1659,73 @@ module core_top #(
         .rob_head_robid_i (lsu_rob_head_enc),
         .rob_head_valid_i (~rob_empty),
         .uncached_ld_inflight_o(lsu_unc_inflight),
-        .wb_valid_o       (mem_wb_valid),
-        .wb_robid_o       (mem_wb_robid),
-        .wb_data_o        (mem_wb_data),
-        .wb_paddr_o       (mem_wb_paddr),
-        .wb_vaddr_o       (mem_wb_vaddr),
-        .wb_wstrb_o       (mem_wb_wstrb),
-        .wb_size_o        (mem_wb_size),
-        .wb_uncached_o    (mem_wb_uncached),
-        .wb_excp_o        (mem_wb_excp),
+        .wb_valid_o       (mem_wb_valid_raw),
+        .wb_robid_o       (mem_wb_robid_raw),
+        .wb_data_o        (mem_wb_data_raw),
+        .wb_paddr_o       (mem_wb_paddr_raw),
+        .wb_vaddr_o       (mem_wb_vaddr_raw),
+        .wb_wstrb_o       (mem_wb_wstrb_raw),
+        .wb_size_o        (mem_wb_size_raw),
+        .wb_uncached_o    (mem_wb_uncached_raw),
+        .wb_excp_o        (mem_wb_excp_raw),
         .early_wakeup_valid_o(lsu_early_valid_raw),
         .early_wakeup_robid_o(lsu_early_robid_raw)
     );
+
+    // V3.4@55MHz：`LSU_WB_PIPE` 时 LSU 写回整总线打一拍再进 RS/ROB，
+    // 切断 D$ hit → mem_wb_valid → RS 组合长链（合规 RTL 切割，非改综实参数）。
+    generate if (`LSU_WB_PIPE != 0) begin : g_mem_wb_pipe
+        reg                      mem_wb_valid_r;
+        reg [`ROB_W-1:0]         mem_wb_robid_r;
+        reg [31:0]               mem_wb_data_r;
+        reg [31:0]               mem_wb_paddr_r, mem_wb_vaddr_r;
+        reg [3:0]                mem_wb_wstrb_r;
+        reg [2:0]                mem_wb_size_r;
+        reg                      mem_wb_uncached_r;
+        reg [`EXCP_NUM-1:0]      mem_wb_excp_r;
+        always @(posedge clk) begin
+            if (reset || flush) begin
+                mem_wb_valid_r    <= 1'b0;
+                mem_wb_robid_r    <= {`ROB_W{1'b0}};
+                mem_wb_data_r     <= 32'b0;
+                mem_wb_paddr_r    <= 32'b0;
+                mem_wb_vaddr_r    <= 32'b0;
+                mem_wb_wstrb_r    <= 4'b0;
+                mem_wb_size_r     <= 3'b0;
+                mem_wb_uncached_r <= 1'b0;
+                mem_wb_excp_r     <= {`EXCP_NUM{1'b0}};
+            end else begin
+                mem_wb_valid_r    <= mem_wb_valid_raw;
+                mem_wb_robid_r    <= mem_wb_robid_raw;
+                mem_wb_data_r     <= mem_wb_data_raw;
+                mem_wb_paddr_r    <= mem_wb_paddr_raw;
+                mem_wb_vaddr_r    <= mem_wb_vaddr_raw;
+                mem_wb_wstrb_r    <= mem_wb_wstrb_raw;
+                mem_wb_size_r     <= mem_wb_size_raw;
+                mem_wb_uncached_r <= mem_wb_uncached_raw;
+                mem_wb_excp_r     <= mem_wb_excp_raw;
+            end
+        end
+        assign mem_wb_valid    = mem_wb_valid_r;
+        assign mem_wb_robid    = mem_wb_robid_r;
+        assign mem_wb_data     = mem_wb_data_r;
+        assign mem_wb_paddr    = mem_wb_paddr_r;
+        assign mem_wb_vaddr    = mem_wb_vaddr_r;
+        assign mem_wb_wstrb    = mem_wb_wstrb_r;
+        assign mem_wb_size     = mem_wb_size_r;
+        assign mem_wb_uncached = mem_wb_uncached_r;
+        assign mem_wb_excp     = mem_wb_excp_r;
+    end else begin : g_mem_wb_comb
+        assign mem_wb_valid    = mem_wb_valid_raw;
+        assign mem_wb_robid    = mem_wb_robid_raw;
+        assign mem_wb_data     = mem_wb_data_raw;
+        assign mem_wb_paddr    = mem_wb_paddr_raw;
+        assign mem_wb_vaddr    = mem_wb_vaddr_raw;
+        assign mem_wb_wstrb    = mem_wb_wstrb_raw;
+        assign mem_wb_size     = mem_wb_size_raw;
+        assign mem_wb_uncached = mem_wb_uncached_raw;
+        assign mem_wb_excp     = mem_wb_excp_raw;
+    end endgenerate
 
     // V3.4：`LSU_EARLY2_PIPE` 时 early2 打一拍再进三 RS，切断 D$ hit→RS ready 组合链。
     // 与 hold 写回同拍到达时 early2 退化为与 WB 同位（仍正确）；未打拍则保持同拍早唤醒。
@@ -2129,6 +2190,7 @@ module core_top #(
     wire [1:0]  tlbm_inst_mat;
     wire        tlbm_inst_ex_adef;   // PLV3 取指越界（ADEF 特权子情形）
     wire        tlbm_inst_ex_tlbr, tlbm_inst_ex_pif, tlbm_inst_ex_ppi;
+    wire        tlbm_inst_direct_ok;
     wire [31:0] tlbm_data_paddr;
     wire [1:0]  tlbm_data_mat;
     wire        tlbm_data_ex_adem;   // PLV3 访存越界（ADEM）
@@ -2154,6 +2216,7 @@ module core_top #(
         .i_mat_o           (mmu_i_mat),
         .i_excp_adef_o     (mmu_i_adef),
         .i_tlb_ex_o        (mmu_i_tlb_ex),
+        .i_direct_ok_o     (mmu_i_direct_ok),
         .d_req_i           (lsu_mmu_req),
         .d_is_store_i      (lsu_mmu_is_store),
         .d_vaddr_i         (lsu_mmu_vaddr),
@@ -2172,6 +2235,7 @@ module core_top #(
         .tlbm_inst_ex_tlbr_i(tlbm_inst_ex_tlbr),
         .tlbm_inst_ex_pif_i(tlbm_inst_ex_pif),
         .tlbm_inst_ex_ppi_i(tlbm_inst_ex_ppi),
+        .tlbm_inst_direct_ok_i(tlbm_inst_direct_ok),
         .tlbm_data_paddr_i (tlbm_data_paddr),
         .tlbm_data_mat_i   (tlbm_data_mat),
         .tlbm_data_ex_tlbr_i(tlbm_data_ex_tlbr),
@@ -2214,6 +2278,7 @@ module core_top #(
         .inst_ex_tlbr   (tlbm_inst_ex_tlbr),
         .inst_ex_pif    (tlbm_inst_ex_pif),
         .inst_ex_ppi    (tlbm_inst_ex_ppi),
+        .inst_direct_ok (tlbm_inst_direct_ok),
         .data_paddr     (tlbm_data_paddr),
         .data_mat       (tlbm_data_mat),
         .data_ex_adem   (tlbm_data_ex_adem),

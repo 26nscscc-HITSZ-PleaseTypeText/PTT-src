@@ -475,9 +475,10 @@ assign ld_mshr_rdata_o   = beat_word;
 assign ld_mshr_robid_o   = mshr_robid[axi_mshr_grant];
 
 // MSHR 安装拍：同一拍最多装 1 项（单口 BRAM）
-wire front_ram_busy = (st_take | ld_take | cacop_take)
-                   || (state == S_RELOOK)
-                   || lk_st_hit;
+// 注：accept_ok 已要求 !mshr_any_install，故 st/ld/cacop_take 与 install
+// 互斥；勿再把 take 编入 front_ram_busy，否则 STA 会走出
+// SB.query→ld_req→ld_take→!install_fire→valid_arr 的假路径（55MHz 违约）。
+wire front_ram_busy = (state == S_RELOOK) || lk_st_hit;
 wire [N_MSHR-1:0] mshr_install_fire_oh;
 generate
 for (gm = 0; gm < N_MSHR; gm = gm + 1) begin : gen_mshr_install_fire

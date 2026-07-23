@@ -603,9 +603,10 @@ always @(posedge clk) begin
     end
 end
 
-// DC 级 early2：仅在「本拍/下拍写回有保证」时唤醒——D$ 命中返回或 SB 命中进 hold。
-// 避免 AGU 级投机唤醒（miss 时依赖已发射会错）。MSHR 抢 WB 口时不早唤醒。
-wire d_early_ok = d_valid && d_is_load && !d_excp_any && !d_is_cacop
+// DC 级 early2：仅在 `LSU_EARLY2_ENABLE` 且「写回有保证」时唤醒。
+// bypass=0 时必须关 early2（否则依赖可能在 hold 写回前被唤醒，Linux hang）。
+wire d_early_ok = (`LSU_EARLY2_ENABLE != 0)
+                && d_valid && d_is_load && !d_excp_any && !d_is_cacop
                 && !wb_mshr_case
                 && (dc_return || (sb_ready && !hold_cap_dc));
 assign early_wakeup_valid_o = d_early_ok && !flush_i && !reset;

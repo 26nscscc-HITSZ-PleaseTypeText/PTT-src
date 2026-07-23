@@ -34,6 +34,7 @@ module ifu(
     input  wire [1:0]                 mmu_i_mat_i,
     input  wire                       mmu_i_excp_adef_i,
     input  wire [`TLB_EX_NUM-1:0]     mmu_i_tlb_ex_i,
+    input  wire                       mmu_i_direct_ok_i, // 1: 翻译不依赖主 TLB（DA/DMW/L1 CAM）
 
     output wire                       ic_req_o,
     output wire [31:0]                ic_vaddr_o,
@@ -243,7 +244,11 @@ wire pre_ic_req = (pre_v === 1'b1) && !pre_excp && (pre_ic_sent !== 1'b1)
 // PRE 正在前进（或为空）时，ftq_accept_o 接收的新块可直接发 I$，避免
 // “先写 PRE、下一拍再发请求”的固定气泡。若 cache 当前不能接受，块仍正常
 // 锁存进 PRE，pre_ic_sent=0，之后由 pre_ic_req 保持重试。
-wire ftq_direct_req = (ftq_accept_o === 1'b1) && !pre_excp_now
+// V3.4@55MHz：仅在 mmu_i_direct_ok（DA/DMW/L1 CAM，不吃主 TLB）时同拍开火，
+// 切断 FTQ→主 TLB→ENARDEN 长链；L1 miss 走 PRE→pre_ic_req。
+wire ftq_direct_req = (`IFU_FTQ_DIRECT != 0)
+                   && (ftq_accept_o === 1'b1) && !pre_excp_now
+                   && (mmu_i_direct_ok_i === 1'b1)
                    && ic_slot_free && !if_replay_req
                    && (flush_i !== 1'b1);
 wire ftq_direct_fire = ftq_direct_req && (ic_addr_ok_i === 1'b1);

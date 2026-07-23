@@ -80,9 +80,13 @@
                                       //   资源反增（行缓冲/比较器 ×2），故保持 2）
 `define DC_MSHR_DEPTH     `L1_NMSHR   // dcache 后台 MSHR 深度
 `define LSU_MISS_DEPTH    `DC_MSHR_DEPTH // LSU miss 槽深度（与 D$ MSHR 对齐）
-`define LSU_DC_HIT_BYPASS 1           // V3.4：D$ 命中当拍写回（跳 hold）；=0 恢复一律 hold
-// 注：60MHz 曾试 `LSU_DC_HIT_BYPASS 0` + early2 打拍——OOC 转正但 Linux digftest 错载，已回退；交付 55MHz。
-`define LSU_EARLY2_PIPE   0           // =1 时 early2 打拍；默认 0（与 hit-bypass 同拍早唤醒）
+// V3.4@55MHz 合规：bypass=0 的 hold 路径会 Linux hang（疑 hold 与 V3.4 交互 bug）。
+// 改为保留 hit-bypass，在顶层对 mem_wb 整总线打一拍切断 D$→RS；early2 关闭避免早醒。
+`define LSU_DC_HIT_BYPASS 1           // 保持命中当拍算出 WB 数据
+`define LSU_WB_PIPE       1           // 顶层 mem_wb→RS/ROB 打一拍（55MHz 时序）
+`define LSU_EARLY2_ENABLE 0           // 与 WB_PIPE 配对关闭（否则 T 醒、T+1 数据）
+`define LSU_EARLY2_PIPE   0
+`define IFU_FTQ_DIRECT    1           // 1: 允许同拍 FTQ→I$；仅在 mmu_i_direct_ok（无主 TLB）时开火
 `define STQ_DEPTH         8           // 软门 STQ4 IPC 同 0.570，但 difftest 在 account_user_time 错载；默认 8
 `define L1_NSET           128         // L1 每路组数（16KB/4路/32B）
 `define L1_INDEX_W        7           // $clog2(L1_NSET)

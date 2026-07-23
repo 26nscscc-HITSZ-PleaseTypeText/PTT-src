@@ -73,6 +73,7 @@ module tlb_manager #(
     output wire                         inst_ex_tlbr,
     output wire                         inst_ex_pif,
     output wire                         inst_ex_ppi,
+    output wire                         inst_direct_ok, // 1: 本拍结果不依赖主 TLB（供 IFU 同拍发 I$）
 
     output wire [31:0]                  data_paddr,
     output wire [1:0]                   data_mat,
@@ -205,6 +206,7 @@ wire                        r_d1;
 wire                        r_v1;
 
 // I 侧微表：连主表 s0 口（tlbsrch 已走专用口，s0 恒为真实取指查询）
+wire l1i_cam_hit;
 l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
     .clk            (clk),
     .reset          (reset),
@@ -212,6 +214,7 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
     .req_valid_i    (inst_req),
     .vaddr_i        (inst_vaddr),
     .found_o        (l1i_found),
+    .l1_hit_o       (l1i_cam_hit),
     .ppn_o          (l1i_ppn),
     .ps_o           (l1i_ps),
     .mat_o          (l1i_mat),
@@ -230,6 +233,7 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
 );
 
 // D 侧微表：连主表 s1 口
+wire l1d_cam_hit_unused;
 l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_d (
     .clk            (clk),
     .reset          (reset),
@@ -237,6 +241,7 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_d (
     .req_valid_i    (data_req),
     .vaddr_i        (data_vaddr),
     .found_o        (l1d_found),
+    .l1_hit_o       (l1d_cam_hit_unused),
     .ppn_o          (l1d_ppn),
     .ps_o           (l1d_ps),
     .mat_o          (l1d_mat),
@@ -351,6 +356,10 @@ wire [31:0] data_tlb_paddr = (l1d_ps === PS_4KB) ? {l1d_ppn, data_vaddr[11:0]} :
 // 特权越界（ADEF/ADEM）时地址本身非法，屏蔽 TLB 查表异常
 wire inst_need_tlb = pg_mode && !inst_dmw0_hit && !inst_dmw1_hit && !inst_plv_oob;
 wire data_need_tlb = pg_mode && !data_dmw0_hit && !data_dmw1_hit && !data_plv_oob;
+
+// IFU 同拍发 I$：仅当本拍 paddr/异常判定不需要主 TLB 组合结果
+// （DA / DMW / 不需查表 / L1 CAM 命中）。L1 miss 走 PRE→下一拍 pre_ic_req。
+assign inst_direct_ok = !inst_need_tlb || l1i_cam_hit;
 
 // TLB 查询结果和异常在同一拍组合给出，供后级直接使用。
 assign inst_ex_tlbr = inst_req && inst_need_tlb && !l1i_found;

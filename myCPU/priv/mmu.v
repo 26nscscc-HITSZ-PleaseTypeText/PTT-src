@@ -35,6 +35,7 @@ module mmu (
     output wire [1:0]  i_mat_o,
     output wire        i_excp_adef_o,
     output wire [`TLB_EX_NUM-1:0] i_tlb_ex_o,
+    output wire        i_direct_ok_o,
 
     // ---------------- D 通道（lsu）----------------
     input  wire        d_req_i,
@@ -58,6 +59,7 @@ module mmu (
     input  wire        tlbm_inst_ex_tlbr_i,
     input  wire        tlbm_inst_ex_pif_i,
     input  wire        tlbm_inst_ex_ppi_i,
+    input  wire        tlbm_inst_direct_ok_i,
     input  wire [31:0] tlbm_data_paddr_i,
     input  wire [1:0]  tlbm_data_mat_i,
     input  wire        tlbm_data_ex_tlbr_i,
@@ -80,6 +82,7 @@ assign tlbm_data_vaddr_o    = d_vaddr_i;
 // 不能让 X 渗入异常位（会顺着 ifu/lsu 的异常向量污染 ROB）。
 assign i_paddr_o     = tlbm_inst_paddr_i;
 assign i_mat_o       = tlbm_inst_mat_i;
+assign i_direct_ok_o = tlbm_inst_direct_ok_i;
 // ADEF = 取指非对齐（本地）| PLV3 越界（tlb_manager 检测）
 assign i_excp_adef_o = ((i_req_i === 1'b1) && (i_vaddr_i[1:0] != 2'b00))
                      || ((i_req_i === 1'b1) && (tlbm_inst_ex_adef_i === 1'b1));

@@ -46,6 +46,7 @@ module l1_tlb #(
     input  wire          req_valid_i,
     input  wire [31:0]   vaddr_i,
     output wire          found_o,          // 翻译命中（本表命中 或 主表命中）
+    output wire          l1_hit_o,         // 仅微表 CAM 命中（不含主表透传）
     output wire [19:0]   ppn_o,            // 物理页号（4KB 页：paddr = {ppn, vaddr[11:0]}）
     output wire [5:0]    ps_o,             // 有效页大小（本表命中恒 4KB；透传时跟随主表）
     output wire [1:0]    mat_o,            // 页存储访问类型
@@ -94,6 +95,7 @@ end
 endgenerate
 
 wire l1_hit = (req_valid_i === 1'b1) && (|e_hit);
+assign l1_hit_o = l1_hit;
 
 // 命中项属性选择（独热 hit 向量按位与-或归并；填表逻辑保证同键至多一项）
 integer si;
