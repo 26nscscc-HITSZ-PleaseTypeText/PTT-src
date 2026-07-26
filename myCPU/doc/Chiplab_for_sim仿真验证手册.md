@@ -17,7 +17,7 @@
 |------|------|-------------|
 | Verilator 找 RTL | 递归 find 子目录 + `-y`，不再只用扁平 `*.v` | `sims/verilator/run_prog/Makefile` |
 | timescale | 统一 `` `timescale 1ns / 1ps ``，避免 `TIMESCALEMOD` | `mycpu.h`、`simu_top.v`、`difftest.v`、`soc_top.v` |
-| Cache 几何（核） | L1：4-way × 128-set × 32B = 16KB；L2：2×512×32B=32KB | `IP/myCPU/mycpu.h` |
+| Cache 几何（核） | L1：4-way × 128-set × 32B = 16KB；L2：2×2048×32B=128KB | `IP/myCPU/mycpu.h` |
 | lab19 软件 cacop 宏 | `WAY=4` `OFFSET=5` `INDEX=7`（对齐上面 L1） | `func_lab19/include/test_define.h` |
 | 双提交 / digftest | `CPU_2CMT=n`（不用 SoC `debug1_*`）；双提交走核内 `DIFFTEST_EN` DPI×2 | `chip/config-generator.mak` + `mycpu_top.v` |
 | AXI | 仍 AXI32（`AXI64=n`），配合 32B 行 | `config-generator.mak` |
