@@ -1,6 +1,6 @@
 # Chiplab_for_sim仿真验证手册
 
-> V1.5 2026.7.15 by dogandlamb
+> V2.0 2026.7.26 by dogandlamb
 
 >该手册默认使用环境是在wsl下的chiplab，可以直接使用我打包好的WSL_chiplab_for_sim.tar文件导入到wsl中
 
@@ -10,6 +10,8 @@
 ---
 
 ## 0. 替换 CPU 前检查/WSL_chiplab_for_sim环境简介
+
+注意：我这里是根据我们小组的cpu具体情况而定的。如果你们的cache或其它部分与我们的不一致，那就按你们的来
 
 | 类别 | 改动 | 位置 / 取值 |
 |------|------|-------------|
@@ -23,7 +25,7 @@
 | Linux 停仿 | UART 见 `/ #` → 干净退出打 PERF | `uart.cpp` / `testbench.cpp` |
 | FREQ | SoC 仍 **33 MHz**（勿乱改） | `chip/soc_demo/sim/config.h` |
 
-WSL_chiplab_for_sim环境默认myCPU是Openla500，把基本工具链、vmlinux、run_random都配置好了。同时还有Smartwave工具集成，可以让AI使用Smartwave查波形信号
+WSL_chiplab_for_sim环境默认myCPU是Openla500，把基本工具链、vmlinux、run_random都配置好了。
 
 但我没有配置git，为了方便AI记忆与回退代码，请自行叫AI配置git
 
@@ -40,8 +42,7 @@ export PATH=$CHIPLAB_HOME/toolchains/loongson-gnu-toolchain-8.3-x86_64-loongarch
 # export PATH=$CHIPLAB_HOME/toolchains/nemu:$PATH
 ```
 
-一定要执行以下命令来编译mycpu RTL，你直接用make是不行的！
-而且要注意看有没有编译成功，也就是看有没有ERROR字样（ERROR没有高亮，一定仔细看）！若没成功，那仿真时就仍然是用上次编译成功的结果
+只为了编译mycpu RTL用以下命令，也可直接用make。一定要注意看有没有编译成功，也就是看有没有ERROR字样（ERROR没有高亮，一定仔细看）！若没成功，那仿真时就仍然是用上次编译成功的结果，这样结果就不能反映当前cpu的仿真状况了。
 
 
 ```bash
@@ -52,7 +53,7 @@ make verilator && make testbench
 ```
 弱智问题TM来了（-^-）:
 
-(1)编译时如果报错：%Error-TIMESCALEMOD
+（1）编译时如果报错：%Error-TIMESCALEMOD
 那就在以下 3 个文件开头加入 `timescale 1ns / 1ps：
 ```bash
 sims/verilator/testbench/simu_top.v
@@ -60,12 +61,12 @@ sims/verilator/testbench/difftest.v
 chip/soc_demo/sim/soc_top.v
 ```
 
-(2)如果有提示“Permission denied”或其他与权限有关的问题（大概率是因为AI执行用过终端后，权限是属于root的，要换回dogandlamb）
+（2）如果有提示“Permission denied”或其他与权限有关的问题（大概率是因为AI执行用过终端后，权限是属于root的，要换回dogandlamb）
 ```bash
 sudo chown -R "$USER:$USER" .
 ```
 
-(3)如果执行make run（func_lab19）时，出现
+（3）如果执行make run（func_lab19）时，出现
 ```bash
 [NEMU] ####### INIT HERE ########
 [NEMU] TLB_ENTRY = 32
@@ -84,7 +85,7 @@ make: *** [Makefile:284: simulation_run_prog] Error 2
 make clean
 make soft_compile
 ```
-(4)如果执行soft_compile时出现以下问题：
+（4）如果执行soft_compile时出现以下问题：
 ```bash
 dogandlamb@admin:~/chiplab/sims/verilator/run_prog$ make soft_compile
 ===================================================
@@ -116,20 +117,9 @@ make
 
 ---
 
-## 2. 两种「随机种子」（勿混淆）
+## 2. 改“随机种子”测随机延迟
 
-名字都叫种子，但接的是**两套不同硬件**；在 **Verilator 仿真**里，真正控制 AXI 背压的只有其中一个。
-
-### 2.0 一句话区别
-
-| | `` `define RANDOM_SEED ``（confreg） | `BUS_DELAY_RANDOM_SEED`（Makefile） |
-|---|-------------------------------------|-----------------------------------|
-| **配置位置** | `IP/CONFREG/confreg_sim.v`（仅一行宏） | `sims/verilator/run_prog/Makefile_run` |
-| **Verilator 里是否生效** | **否**（`confreg_sim.v` 未引用该宏） | **是**（默认 `BUS_DELAY=y` 时） |
-
-默认：`BUS_DELAY_RANDOM_SEED=5570815`，即 23 位 `0x5500FF` = `{7'b1010101, 16'h00FF}`。
-
-### 2.1 必测 7 组种子（Verilator：改 `Makefile_run`）
+### 2.1 一般要测 7 组种子（Verilator：改 `Makefile_run`）
 
 | # | 模式 | `` `define RANDOM_SEED `` | `BUS_DELAY_RANDOM_SEED` |
 |---|------|---------------------------|-------------------------|
@@ -160,6 +150,8 @@ make run          # 已编过仿真器时只需 make run；改过 IP/*.v 才需 
 set -e
 export CHIPLAB_HOME=~/chiplab
 export PATH=$CHIPLAB_HOME/toolchains/loongson-gnu-toolchain-8.3-x86_64-loongarch32r-linux-gnusf-v2.0/bin:$PATH
+# difftest（TRACE_COMP，默认开启）需要 NEMU
+export PATH=$CHIPLAB_HOME/toolchains/nemu:$PATH
 RUN=$CHIPLAB_HOME/sims/verilator/run_prog
 MK=$RUN/Makefile_run
 CASE=func/func_lab19
@@ -181,7 +173,8 @@ for item in "${SEEDS[@]}"; do
   seed=${item##*:}
   echo "========== $name BUS_DELAY_RANDOM_SEED=$seed =========="
   sed -i "s/^BUS_DELAY_RANDOM_SEED=.*/BUS_DELAY_RANDOM_SEED=$seed/" "$MK"
-  ./configure.sh --run "$CASE" --disable-trace-comp
+  # 不要加 --disable-trace-comp，否则会关掉 difftest（NEMU 比对）
+  ./configure.sh --run "$CASE"
   make run || { echo "FAIL seed $name ($seed)"; exit 1; }
 done
 echo "All 7 seeds passed."
@@ -193,7 +186,8 @@ echo "All 7 seeds passed."
 cd ~/chiplab/sims/verilator/run_prog
 export CHIPLAB_HOME=~/chiplab
 export PATH=$CHIPLAB_HOME/toolchains/loongson-gnu-toolchain-8.3-x86_64-loongarch32r-linux-gnusf-v2.0/bin:$PATH
-./configure.sh --run func/func_lab19
+export PATH=$CHIPLAB_HOME/toolchains/nemu:$PATH   # difftest 需要
+./configure.sh --run func/func_lab19              # 默认 TRACE_COMP=y（开 difftest）
 make          # 完整 make，生成 output
 ./run_7_seeds.sh
 ```
