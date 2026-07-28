@@ -1,9 +1,12 @@
-# Chiplab_for_vivado启动linux手册
+# Chiplab_for_vivado启动linux与ucore手册
 
 > V1.0 2026.6.8 by dogandlamb
 
 > V2.0 2026.7.8 by whale//sssafridi
+
 > V2.1 2026.7.11 by whale
+
+> V3.0 2026.7.28 by dogandlamb
 
 前置条件：
 
@@ -89,3 +92,50 @@ tftpboot 0xa3000000 vmlinux(vmlinux需要跟文件名字一样，不一样就改
 ```
 bootelf 0xa3000000 bootcmd
 ```
+
+## 5. 启动 ucore
+
+前置：§1–§3 已完成（Flash / PMON 或 u-boot / CPU bit 流），网线与 TFTP 同 §4.1 或 §4.2。串口软件波特率与跑 Linux 相同，用 **115200**（烧完 PMON 之后；烧写 gzrom 阶段仍是 230400）。
+
+内核文件（ELF，入口 `0xa0000000`，已内嵌 initrd）：
+
+```
+$CHIPLAB_HOME/ucore-loongarch32/obj/ucore-kernel-initrd
+```
+
+若尚无该文件：
+
+```bash
+export CHIPLAB_HOME=~/chiplab
+export PATH=$CHIPLAB_HOME/toolchains/loongson-gnu-toolchain-8.3-x86_64-loongarch32r-linux-gnusf-v2.0/bin:$PATH
+cd $CHIPLAB_HOME/ucore-loongarch32 && make -j$(nproc)
+```
+
+### 5.1 串口波特率
+
+主机串口与跑 Linux 相同，用 **115200**。当前 `$CHIPLAB_HOME/ucore-loongarch32` 已按上板配置：内核**不改写**波特率分频，沿用 PMON/u-boot 的 115200。直接使用编好的 `obj/ucore-kernel-initrd` 即可（勿再把 `console.c` 里的 DLL 改成仿真用的 `1`，否则上板会乱码）。
+
+### 5.2 PMON 加载
+
+TFTP 当前目录设为 `ucore-kernel-initrd` 所在目录，开发板侧（IP 按 §4.1）：
+
+```
+ifconfig dmfe0 10.249.10.113
+load tftp://10.249.10.114/ucore-kernel-initrd
+g
+```
+
+无需 Linux 的 `console=... rdinit=...`。成功后串口应出现 ucore 启动日志，最后到用户 shell 提示符 `$ `。
+
+### 5.3 U-boot 加载
+
+网络按 §4.2 配好后：
+
+```
+tftpboot 0xa3000000 ucore-kernel-initrd
+bootelf 0xa3000000
+```
+
+说明：`0xa3000000` 只是 TFTP 暂存地址（与加载 vmlinux 相同）；`bootelf` 会按 ELF 段装到链接地址 `0xa0000000` 并跳转。不需要 `bootcmd` / Linux 启动参数。
+
+可试命令：`ls`、`pwd`、`cat test.txt`、`echo hi`、`hello` 等（见 `ucore-loongarch32/user/`）。
