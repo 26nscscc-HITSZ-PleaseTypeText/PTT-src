@@ -26,12 +26,7 @@
 `include "mycpu.h"
 
 module commit(
-    input  wire                       clk,
-    input  wire                       reset,
-
-    // 100MHz 攻坚:全局 flush 已在 ctrl 打一拍。flush 生效的那一拍(广播拍),
-    // 提交级必须闸住一切退休,否则错误路径的下一条指令会在流水被清空的同拍误提交。
-    // 接 ctrl 的寄存器版 flush(=顶层 flush)。
+    // ctrl 广播 flush 的拍必须禁止全部退休，防止错误路径指令与流水线清空同拍提交。
     input  wire                       flush_pending_i,
 
     // =============== ROB 队头一对（rob.v 提交口直连） ===============
@@ -42,12 +37,10 @@ module commit(
     input  wire [31:0]                cmt0_pc_i,
     input  wire [31:0]                cmt0_inst_i,        // 仅 debug/difftest 观测（综合视图恒 0）
     input  wire                       cmt0_inst_is_b0_i,  // ROB 预译码：inst==0x50000000
-    input  wire                       cmt0_is_direct_b_i, // ROB 预译码：inst[31:26]==010100
     input  wire                       cmt0_rf_we_i,
     input  wire [4:0]                 cmt0_rd_i,
     input  wire [31:0]                cmt0_result_i,
     input  wire [31:0]                cmt0_result2_i,
-    input  wire                       cmt0_is_load_i,
     input  wire                       cmt0_is_store_i,
     input  wire [31:0]                cmt0_paddr_i,
     input  wire [31:0]                cmt0_vaddr_i,
@@ -77,7 +70,6 @@ module commit(
     input  wire [4:0]                 cmt1_rd_i,
     input  wire [31:0]                cmt1_result_i,
     input  wire [31:0]                cmt1_result2_i,
-    input  wire                       cmt1_is_load_i,
     input  wire                       cmt1_is_store_i,
     input  wire [31:0]                cmt1_paddr_i,
     input  wire [31:0]                cmt1_vaddr_i,
@@ -125,6 +117,7 @@ module commit(
     output wire [3:0]                 sb_push_wstrb_o,
     output wire [2:0]                 sb_push_size_o,
     output wire                       sb_push_uncached_o,
+    output wire [`ROB_W-1:0]          sb_push_robid_o,     // 供 LSU STQ 按提交释放
     input  wire                       sb_full_i,
     input  wire                       sb_empty_i,          // 已提交写排空（ibar/cacop）
 
@@ -149,10 +142,8 @@ module commit(
     output wire [31:0]                csr_wvalue_o,        // = result2
     output wire                       ll_set_o,            // ll.w 提交置 LLBIT
     output wire                       sc_set_o,            // sc.w 提交清 LLBIT
-    output wire [27:0]                lladdr_o,            // LL 地址高位
     input  wire                       has_int_i,           // CSR 有待处理中断
     input  wire [31:0]                csr_next_pc_i,       // 异常入口/ERA（handler 算好）
-    input  wire [1:0]                 csr_redirect_i,      // `CSR_REDIRECT_EX / _ERTN
 
     // =============== TLB 维护落地（对接 tlb_manager / csr handler） ===============
     output wire [`TLB_OP_NUM-1:0]     tlb_op_cmt_o,        // 提交拍有效一拍
@@ -170,7 +161,6 @@ module commit(
     // =============== FTQ 训练 / 查询 ===============
     output wire                       ftq_cmt_valid_o,     // 本拍有指令提交（推进 cmt_ptr/产生训练）
     output wire [`FTQ_W-1:0]          ftq_cmt_id_o,
-    output wire                       ftq_cmt_is_last_o,
     output wire [1:0]                 ftq_cmt_release_o,   // 本拍释放 FTQ 块数（0/1/2）
     output wire                       ftq_cmt_is_branch_o,
     output wire                       ftq_cmt_taken_o,
@@ -204,15 +194,14 @@ module commit(
     output wire [31:0]                debug0_inst_o,
     output wire                       debug1_valid_o,
     output wire [31:0]                debug1_pc_o,
-    output wire [3:0]                 debug1_rf_wen_o,
+    output wire                       debug1_rf_we_o,
     output wire [4:0]                 debug1_rf_wnum_o,
     output wire [31:0]                debug1_rf_wdata_o,
     output wire [31:0]                debug1_inst_o
 );
 
-// 设计说明（已实现，参考 mariver commit.v 的 can0/can1/flush 体系 +
-//      团队赛报告 2.4.7 节的单/双提交规则。这是全核逻辑最"杂"的模块，
-//      但每条规则都很直白，逐条写即可）
+// 设计说明（can0/can1/flush 与单/双提交规则）：
+//      提交、冲刷和各外部副作用在本模块统一仲裁。
 //
 // 第一步——基础可提交判定：
 //      can0 = cmt0_valid_i && cmt0_complete_i;
@@ -243,7 +232,7 @@ module commit(
 //                   与 ibar 一样等 sb_empty（D$ 前端 cacop 优先于 SB 写，不排空
 //                   会把尚未写回 D$ 的 dirty 老数据刷出，n78 Hit-WB 会挂）；
 //                   FLUSH_REFETCH pc+4
-//      PRIV_LL    ：ll_set_o=1，lladdr_o=cmt0_paddr_i[31:4]；FLUSH_REFETCH pc+4
+//      PRIV_LL    ：ll_set_o=1；FLUSH_REFETCH pc+4
 //      PRIV_SC    ：sc_set_o=1（清 LLBIT）；若译码期定性为真 store 则照常入 SB；
 //                   FLUSH_REFETCH pc+4
 //      PRIV_IBAR  ：等 sb_empty_i 才提交（不空则本拍不提交，下拍重试）；
@@ -301,8 +290,10 @@ module commit(
 //         这正是 BPU 命中的收益路径，确保比较逻辑别写反。
 
 wire [`ROB_W-1:0] cmt1_robid = {1'b1, head_robid0_i[`ROB_PAIR_W-1:0]};
+wire cmt0_ready;
+wire cmt1_ready;
 
-// flush 广播拍(flush_pending_i=1)闸住全部退休:cmt*_ready/int_take 三个退休根
+// flush 广播拍（flush_pending_i=1）闸住全部退休：cmt*_ready/int_take 三个退休根
 // 全部置 0 → arf/csr 写、rob pop/clear、flush_req、ftq 训练、sb push 全随之为 0。
 // 这样错误路径指令在流水被清空的同拍不会误提交;同时 cmt_flush_req 回 0 保证 flush 单拍。
 assign cmt0_ready = !flush_pending_i && cmt0_valid_i && (cmt0_complete_i === 1'b1);
@@ -315,9 +306,9 @@ wire cmt1_has_priv = |cmt1_priv_vec_i;
 // L0 CSR 写免 FLUSH_REFETCH（Phase A1/A2）。rename 侧已对 L0 串行排空，
 // 保证提交时 ROB 中无更年轻指令，故不会有在途 csrrd 读到旧 CSR。
 wire cmt0_csr_nofush = cmt0_priv_vec_i[`PRIV_CSR_WR]
-                    && `CSR_NUM_IS_L0_NOFLUSH(cmt0_csr_num_i[11:0]);
+                    && `CSR_NUM_IS_L0_NOFLUSH(cmt0_csr_num_i);
 wire cmt1_csr_nofush = cmt1_priv_vec_i[`PRIV_CSR_WR]
-                    && `CSR_NUM_IS_L0_NOFLUSH(cmt1_csr_num_i[11:0]);
+                    && `CSR_NUM_IS_L0_NOFLUSH(cmt1_csr_num_i);
 
 // 真 idle（非套件 `b 0`/0x50000000）：即使已有 has_int 也先退休完成，
 // FLUSH 到 pc+4；中断挂到后继 nop。这样 ERA/s4/NEMU 一致为 idle+4。
@@ -359,7 +350,7 @@ wire cmt1_same_ftq = cmt0_valid_i && (cmt0_ftq_id_i == cmt1_ftq_id_i);
 //   1) decoder 把非 CALL/RET 的 jirl 也标成 BR_TYPE_UNCOND，与直接 B 共用类型；
 //      若只看 br_type 会把间接跳误放进 soft。
 //   2) jirl 目标 = rj+offs，依赖寄存器；现有「方向 + FTQ 目标相等」在同块单口
-//      比对下，间接跳更易“碰巧判对”而不冲刷，错路径可残留（曾卡在异常向量）。
+//      比对下，间接跳可能“碰巧判对”而不冲刷，导致错误路径残留。
 //   3) jirl 的 CALL/RET 变体还要动 RAS，本就约定单提；普通 jirl 与它们仅编码之差。
 //   4) IFU 对 B/cond 有块末截断不变式，jirl 不在同一套预译码截断路径里。
 // 以后若放开：ROB 独立 is_jirl / 间接目标专用校验，再允许 soft，勿仅靠 UNCOND。
@@ -383,11 +374,6 @@ wire cmt1_head_retire = (!cmt0_valid_i) &&
                          (!cmt1_store_block && !cmt1_ibar_block && !cmt1_cacop_block)));
 wire cmt1_head_effect = (!cmt0_valid_i) && cmt1_ready && !cmt1_has_excp &&
                         !cmt1_store_block && !cmt1_ibar_block && !cmt1_cacop_block;
-wire cmt1_head_flush = (!cmt0_valid_i) &&
-                       ((cmt1_ready && cmt1_has_excp) ||
-                        (cmt1_head_effect && cmt1_has_priv && !cmt1_csr_nofush) ||
-                        cmt1_mispred_head);
-
 wire cmt0_taken_br = cmt0_effect && cmt0_is_branch_i && cmt0_br_taken_i && !cmt0_is_last_i;
 
 // cmt1_br_hard：CALL/RET、跨块分支、或误预测；cmt1_mispred：含脏预测（非分支 pred）
@@ -408,7 +394,6 @@ wire br_sel_cmt1 = (cmt1_dual_effect && cmt1_is_branch_i) || take_slot1_for_csr;
 wire [31:0] csr_sel_pc = take_slot1_for_csr ? cmt1_pc_i : cmt0_pc_i;
 wire [31:0] sel_pc = br_sel_cmt1 ? cmt1_pc_i : cmt0_pc_i;
 wire sel_inst_is_b0 = take_slot1_for_csr ? cmt1_inst_is_b0_i : cmt0_inst_is_b0_i;
-wire [31:0] sel_result = take_slot1_for_csr ? cmt1_result_i : cmt0_result_i;
 wire [31:0] sel_result2 = take_slot1_for_csr ? cmt1_result2_i : cmt0_result2_i;
 wire [31:0] sel_paddr = take_slot1_for_csr ? cmt1_paddr_i : cmt0_paddr_i;
 wire [31:0] sel_vaddr = take_slot1_for_csr ? cmt1_vaddr_i : cmt0_vaddr_i;
@@ -418,12 +403,10 @@ wire [`TLB_OP_NUM-1:0] sel_tlb_op = take_slot1_for_csr ? cmt1_tlb_op_i : cmt0_tl
 wire [`PRIV_NUM-1:0] sel_priv = take_slot1_for_csr ? cmt1_priv_vec_i : cmt0_priv_vec_i;
 wire [`EXCP_NUM-1:0] sel_excp = take_slot1_for_csr ? cmt1_excp_i : cmt0_excp_i;
 wire sel_is_branch = br_sel_cmt1 ? cmt1_is_branch_i : cmt0_is_branch_i;
-wire sel_pred_taken = br_sel_cmt1 ? cmt1_pred_taken_i : cmt0_pred_taken_i;
 wire sel_br_taken = br_sel_cmt1 ? cmt1_br_taken_i : cmt0_br_taken_i;
 wire [31:0] sel_br_target = br_sel_cmt1 ? cmt1_br_target_i : cmt0_br_target_i;
 wire [`BR_TYPE_W-1:0] sel_br_type = br_sel_cmt1 ? cmt1_br_type_i : cmt0_br_type_i;
 wire [`FTQ_W-1:0] sel_ftq_id = br_sel_cmt1 ? cmt1_ftq_id_i : cmt0_ftq_id_i;
-wire sel_is_last = take_slot1_for_csr ? cmt1_is_last_i : cmt0_is_last_i;
 
 wire selected_effect = take_slot1_for_csr ? cmt1_head_effect : cmt0_effect;
 wire selected_excp_take = int_take || (take_slot1_for_csr ? (cmt1_ready && cmt1_has_excp)
@@ -470,6 +453,7 @@ assign sb_push_data_o     = cmt0_sb_push ? cmt0_result_i   : cmt1_result_i;
 assign sb_push_wstrb_o    = cmt0_sb_push ? cmt0_wstrb_i    : cmt1_wstrb_i;
 assign sb_push_size_o     = cmt0_sb_push ? cmt0_size_i     : cmt1_size_i;
 assign sb_push_uncached_o = cmt0_sb_push ? cmt0_uncached_i : cmt1_uncached_i;
+assign sb_push_robid_o    = cmt0_sb_push ? head_robid0_i   : cmt1_robid;
 
 assign csr_cmt_valid_o = cmt0_retire || cmt1_retire;
 assign csr_cmt_pc_o = csr_sel_pc;
@@ -501,7 +485,6 @@ assign csr_wmask_o = 32'hffff_ffff;
 assign csr_wvalue_o = sel_result2;
 assign ll_set_o = selected_effect && sel_priv[`PRIV_LL];
 assign sc_set_o = selected_effect && sel_priv[`PRIV_SC];
-assign lladdr_o = sel_paddr[31:4];
 
 assign tlb_op_cmt_o = (selected_effect && sel_priv[`PRIV_TLB]) ? sel_tlb_op : {`TLB_OP_NUM{1'b0}};
 assign invtlb_vpn_o = sel_result2[31:13];
@@ -521,7 +504,6 @@ wire ftq_s1_last = cmt1_effect && (cmt1_is_last_i ||
 
 assign ftq_cmt_valid_o = selected_effect || cmt1_dual_effect;
 assign ftq_cmt_id_o = sel_ftq_id;
-assign ftq_cmt_is_last_o = ftq_s0_last || ftq_s1_last;
 assign ftq_cmt_release_o = {1'b0, ftq_s0_last} + {1'b0, ftq_s1_last};
 assign ftq_cmt_is_branch_o = sel_is_branch;
 assign ftq_cmt_taken_o = sel_br_taken;
@@ -565,7 +547,7 @@ assign debug0_rf_wdata_o = arf_wdata0_o;
 assign debug0_inst_o = cmt0_inst_i;
 assign debug1_valid_o = cmt1_effect;
 assign debug1_pc_o = cmt1_pc_i;
-assign debug1_rf_wen_o = arf_we1_o ? 4'hf : 4'h0;
+assign debug1_rf_we_o = arf_we1_o;
 assign debug1_rf_wnum_o = cmt1_rd_i;
 assign debug1_rf_wdata_o = arf_wdata1_o;
 assign debug1_inst_o = cmt1_inst_i;

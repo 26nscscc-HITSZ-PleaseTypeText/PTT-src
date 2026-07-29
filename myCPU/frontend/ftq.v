@@ -1,14 +1,16 @@
 // ============================================================
 // ftq 模块（Fetch Target Queue，取指目标队列）
 // ------------------------------------------------------------
-// 参考实现说明：
+// 当前结构与约束：
 // - 三指针环形队列（bpu_ptr 写 / ifu_ptr 取 / cmt_ptr 提交释放）；
 // - P0 当拍写 bpu_ptr；P1 次拍覆盖 bpu_ptr-1（含 meta）；
 // - "P1 安定"约定：块写入次拍内不发给 IFU（保证覆盖发生在取走前），
 //   即 ifu_ptr 指向上一拍刚写入的块时 ifu_valid 压低一拍；
 // - 预译码重定向：修正出错块 + bpu_ptr 回退到 id+1（丢弃其后推测块）；
-// - 提交：is_last 推进 cmt_ptr；分支提交产生训练包（寄存一拍送 BPU，
+// - 提交：release 数推进 cmt_ptr；分支提交产生训练包（寄存一拍送 BPU，
 //   flush 不清在途训练包——它来自已提交的正确信息）。
+// - P0 与 P1 同拍时不推进 bpu_ptr，以丢弃错误路径 P0；blk_pc LUTRAM 的
+//   写使能仅跟随 p0_valid，不经过 P1 修正长路径。
 // ============================================================
 `include "mycpu.h"
 
@@ -23,15 +25,12 @@ module ftq(
     input  wire [`BLK_LEN_W-1:0]      p0_length_i,
     input  wire                       p0_taken_i,
     input  wire [31:0]                p0_target_i,
-    input  wire [`BR_TYPE_W-1:0]      p0_br_type_i,
 
     input  wire                       p1_valid_i,          // 覆盖 bpu_ptr-1 处的块（主预测修正）
     input  wire                       p1_meta_valid_i,
-    input  wire [31:0]                p1_pc_i,
     input  wire [`BLK_LEN_W-1:0]      p1_length_i,
     input  wire                       p1_taken_i,
     input  wire [31:0]                p1_target_i,
-    input  wire [`BR_TYPE_W-1:0]      p1_br_type_i,
     input  wire [`BPU_META_W-1:0]     p1_meta_i,           // BPU 训练元数据，存入该块
 
     output wire                       ftq_full_o,          // 满反压 BPU
@@ -52,19 +51,19 @@ module ftq(
     input  wire [`BLK_LEN_W-1:0]      predec_length_i,      // 修正后的块长（截断到跳转指令）
     input  wire                       predec_taken_i,       // 修正后的方向（恒 1）
     input  wire [31:0]                predec_target_i,      // 修正后的目标
-    input  wire [`BR_TYPE_W-1:0]      predec_br_type_i,
 
     // ---------------- 提交信息入口（来自 commit）----------------
     input  wire                       cmt_valid_i,          // 本拍有指令提交
     input  wire [`FTQ_W-1:0]          cmt_ftq_id_i,         // 提交指令所在块编号
-    input  wire                       cmt_is_last_i,        // 是否为块内最后一条（训练/兼容）
     input  wire [1:0]                 cmt_release_i,        // 本拍释放的 FTQ 块数（0/1/2，双提交可结束两块）
     input  wire                       cmt_is_branch_i,      // 提交的是分支
     input  wire                       cmt_taken_i,          // 实际方向
     input  wire                       cmt_mispred_i,        // 是否误预测
     input  wire [31:0]                cmt_target_i,         // 实际跳转目标
     input  wire [`BR_TYPE_W-1:0]      cmt_br_type_i,
-    input  wire [31:0]                cmt_pc_i,             // 分支指令 PC
+    // 区分直接跳转 B 与普通 JIRL，避免 JTC 训练直接跳转目标
+    input  wire                       cmt_is_direct_b_i,
+    input  wire [`BLK_LEN_W+1:2]      cmt_pc_word_i,        // 分支 PC 的块内字偏移
 
     // ---------------- commit 误预测比对查询口（组合）----------------
     input  wire [`FTQ_W-1:0]          cmt_query_id_i,       // commit 用提交分支的块编号查预测目标
@@ -78,21 +77,19 @@ module ftq(
     output wire                       train_mispred_o,
     output wire [31:0]                train_target_o,
     output wire [`BR_TYPE_W-1:0]      train_br_type_o,
-    output wire [31:0]                train_fall_through_o, // 块顺序出口（= 块PC + 4*块长）
+    output wire                       train_is_direct_b_o,
+    output wire [`BLK_LEN_W+1:2]      train_fall_through_o, // 顺序出口的块内字偏移
     output wire [`BPU_META_W-1:0]     train_meta_o          // 暂存的 meta 原样回送
 );
 
 // ---------------- 存储 ----------------
-// 多写口小字段（P0/P1/predec 三写）保持触发器；
-// 宽载荷 blk_pc / blk_meta 改单写口 LUTRAM（见下方专用写块）：
-// - blk_pc 只由 P0 写：P1 覆盖拍的 p1_pc 恒等于上拍 P0 已写的块 PC
-//   （bpu.v：p1_pc_o=pc_r，且 p1 仅在 p0_wrote_r 时有效），原 P1 写是冗余值；
-// - blk_meta 只由 P1 写；原"P0 写 0 清空"改为 meta_set 位图（FF）：
-//   P0 清位、P1 置位，读侧位图为 0 时给全 0，与原语义等价。
+// 多写口小字段（P0/P1/predec 三写）使用触发器；
+// 宽载荷 blk_pc / blk_meta 使用单写口 LUTRAM（见下方专用写块）：
+// - blk_pc 只由 P0 写；P1 仅修正上一拍已写块的预测字段，不改变块起始 PC；
+// - blk_meta 只由 P1 写；P0 清 meta_set，P1 置 meta_set，读侧在位图为 0 时返回 0。
 reg [`BLK_LEN_W-1:0]  blk_len   [0:`FTQ_SIZE-1];
 reg                   blk_taken [0:`FTQ_SIZE-1];
 reg [31:0]            blk_target[0:`FTQ_SIZE-1];
-reg [`BR_TYPE_W-1:0]  blk_btype [0:`FTQ_SIZE-1];
 (* ram_style = "distributed" *) reg [31:0]            blk_pc   [0:`FTQ_SIZE-1];
 (* ram_style = "distributed" *) reg [`BPU_META_W-1:0] blk_meta [0:`FTQ_SIZE-1];
 reg [`FTQ_SIZE-1:0]   blk_meta_set;   // 该槽 meta 已由 P1 写入（读 0 语义门控）
@@ -107,7 +104,6 @@ initial begin
         blk_len[ftq_i]    = 3'd4;
         blk_taken[ftq_i]  = 1'b0;
         blk_target[ftq_i] = 32'b0;
-        blk_btype[ftq_i]  = `BR_TYPE_COND;
         blk_meta[ftq_i]   = {`BPU_META_W{1'b0}};
     end
     blk_meta_set = {`FTQ_SIZE{1'b0}};
@@ -119,18 +115,8 @@ end
 
 wire [`FTQ_W-1:0] bpu_prev = bpu_ptr - {{(`FTQ_W-1){1'b0}}, 1'b1};
 
-function automatic [`FTQ_W-1:0] ftq_ptr_add;
-    input [`FTQ_W-1:0] base;
-    input [`FTQ_W:0]   offset;
-    reg [`FTQ_W:0] sum;
-    begin
-        sum = {1'b0, base} + offset;
-        ftq_ptr_add = sum[`FTQ_W-1:0];
-    end
-endfunction
-
 // ---------------- 满/空 ----------------
-// almost-full（预留 2 槽）：配合 BPU 两拍冻结（满洋式 ftq_full_delay）——
+// almost-full（预留 2 槽）：配合 BPU 的两拍冻结——
 // full 首拍 P0 仍可写最后 1 个可用槽，连续两拍满才真正冻结，
 // 避免满边界抖动吞掉 P1 覆盖/浪费取指拍
 assign ftq_full_o = ((bpu_ptr + {{(`FTQ_W-1){1'b0}}, 1'b1}) == cmt_ptr)
@@ -149,15 +135,15 @@ assign ifu_ftq_id_o = ifu_ptr;
 // ---------------- commit 查询口 ----------------
 assign cmt_blk_target_o = blk_target[cmt_query_id_i];
 
-// cmt_ptr 只随提交释放推进。predec 重定向不动 cmt_ptr：
-// 重定向块 R 的指令本拍才入 IB，提交序上 cmt_ptr 恒 <= R < R+1，
-// 被 squash 的推测块 (R, bpu_ptr) 尚未也永不会被提交侧走到
-// （旧 redir_cmt_skip 的无符号 >= 比较在环形回绕处会误判、假释活块，已移除）
-wire [`FTQ_W:0] cmt_adv = (|cmt_release_i) ? {1'b0, cmt_release_i} : {(`FTQ_W+1){1'b0}};
+// cmt_ptr 只随提交释放推进，predec 重定向不改变它。重定向块 R 的指令
+// 本拍才进入 IB；R 之后被 squash 的推测块尚未提交，也不会再到达提交侧。
+wire [`FTQ_W-1:0] cmt_adv = (|cmt_release_i)
+                          ? {{(`FTQ_W-2){1'b0}}, cmt_release_i}
+                          : {`FTQ_W{1'b0}};
 
 // ---------------- LUTRAM 载荷写口（单写口，与原写入同拍同条件）----------------
 wire ftq_run      = !reset && !flush_i;
-wire blk_pc_wr    = ftq_run && !predec_redirect_i && p0_valid_i;   // 原 P0 写；P1 写为冗余值已删
+wire blk_pc_wr    = ftq_run && !predec_redirect_i && p0_valid_i;   // 块 PC 只随 P0 写入
 wire blk_meta_wr  = ftq_run && p1_meta_valid_i;
 
 always @(posedge clk) begin
@@ -201,7 +187,6 @@ always @(posedge clk) begin
             blk_len[predec_redirect_id_i]    <= predec_length_i;
             blk_taken[predec_redirect_id_i]  <= predec_taken_i;
             blk_target[predec_redirect_id_i] <= predec_target_i;
-            blk_btype[predec_redirect_id_i]  <= predec_br_type_i;
             if (!predec_fixup_only_i) begin
                 bpu_ptr    <= predec_redirect_id_i + 1'b1;
                 // 丢弃 redirect 之后的推测块。IFU 两级流水最多领先 redirect 块
@@ -211,24 +196,25 @@ always @(posedge clk) begin
             end
             p0_wrote_r <= 1'b0;
         end else begin
-            p0_wrote_r <= p0_valid_i;
-
-            // P0 写入（blk_pc/blk_meta 已移至上方 LUTRAM 写块）
-            if (p0_valid_i) begin
+            // P1 同拍纠正时丢弃本拍 P0，不推进 bpu_ptr，也不置 p0_wrote_r。
+            // blk_pc LUTRAM 写使能仍可跟 p0_valid（见上方 blk_pc_wr），
+            // 刻意不含 p1，以切断 TAGE→p1_diff→p0_valid→blk_pc WE 长链。
+            if (p0_valid_i && !p1_valid_i) begin
                 blk_len[bpu_ptr]    <= p0_length_i;
                 blk_taken[bpu_ptr]  <= p0_taken_i;
                 blk_target[bpu_ptr] <= p0_target_i;
-                blk_btype[bpu_ptr]  <= p0_br_type_i;
                 bpu_ptr             <= bpu_ptr + 1'b1;
+                p0_wrote_r          <= 1'b1;
+            end else begin
+                p0_wrote_r <= 1'b0;
             end
         end
 
-        // P1 覆盖（bpu_ptr-1；与 P0 同拍时 P0 写新槽、P1 写旧槽，不冲突）
+        // P1 覆盖（bpu_ptr-1；与 P0 同拍时只修正旧槽，新槽不提交）
         if (p1_valid_i) begin
             blk_len[bpu_prev]    <= p1_length_i;
             blk_taken[bpu_prev]  <= p1_taken_i;
             blk_target[bpu_prev] <= p1_target_i;
-            blk_btype[bpu_prev]  <= p1_br_type_i;
         end
 
         // IFU 取走
@@ -237,7 +223,7 @@ always @(posedge clk) begin
 
         // 提交释放（与 predec 独立，避免 cond 截断同拍吞掉 release）
         if (|cmt_adv)
-            cmt_ptr <= ftq_ptr_add(cmt_ptr, cmt_adv);
+            cmt_ptr <= cmt_ptr + cmt_adv;
     end
 end
 
@@ -247,7 +233,8 @@ reg [31:0]            train_pc_r;
 reg                   train_is_branch_r, train_taken_r, train_mispred_r;
 reg [31:0]            train_target_r;
 reg [`BR_TYPE_W-1:0]  train_btype_r;
-reg [31:0]            train_ft_r;
+reg                   train_is_direct_b_r;
+reg [`BLK_LEN_W+1:2]  train_ft_r;
 reg [`BPU_META_W-1:0] train_meta_r;
 
 always @(posedge clk) begin
@@ -261,7 +248,8 @@ always @(posedge clk) begin
         train_mispred_r   <= cmt_mispred_i;
         train_target_r    <= cmt_target_i;
         train_btype_r     <= cmt_br_type_i;
-        train_ft_r        <= cmt_pc_i + 32'd4;     // 实际块出口 = 分支 PC + 4
+        train_is_direct_b_r <= cmt_is_direct_b_i;
+        train_ft_r        <= cmt_pc_word_i + 1'b1;
         train_meta_r      <= blk_meta_cmt_rd;
     end
 end
@@ -273,13 +261,9 @@ assign train_taken_o        = train_taken_r;
 assign train_mispred_o      = train_mispred_r;
 assign train_target_o       = train_target_r;
 assign train_br_type_o      = train_btype_r;
+assign train_is_direct_b_o  = train_is_direct_b_r;
 assign train_fall_through_o = train_ft_r;
 assign train_meta_o         = train_meta_r;
-
-// lint 吸收（blk_btype 读口暂未对外；p1_pc 因 blk_pc 单写口化不再使用，
-// 端口保留以兼容 BPU 接口）
-wire ftq_lint = (|blk_btype[0]) | (|p1_pc_i);
-
 
 `ifdef SYNTHESIS
 // synthesis translate_off

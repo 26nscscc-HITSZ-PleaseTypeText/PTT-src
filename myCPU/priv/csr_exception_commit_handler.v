@@ -3,24 +3,22 @@
 // ============================================================
 // csr_exception_commit_handler 模块（CSR 寄存器组 + 异常/提交处理，时序+组合）
 // ------------------------------------------------------------
-// 功能（新架构下逻辑整体复用，"WB 提交点"换成"commit 提交点"）：
+// 功能：
 // 1) 时序维护全部 CSR（CRMD/PRMD/ESTAT/ERA/EENTRY/SAVE0~3/ECFG/BADV/TID/
 //    TCFG/TVAL/TICLR/TLB 类/DMW/LLBCTL 等）
 // 2) 组合用 exception_Decoder 把异常 valid 编码成 Ecode/Esubcode
-// 3) 提交接口语义不变：原"WB 级提交"的全部输入（wb_valid/wb_pc/wb_ex/
-//    各异常 valid/wb_tlb_op/ll_set/sc_set/csr_we...）现在由 commit.v 驱动，
-//    信号含义一一对应（commit 的 csr_cmt_* 端口注释里写明了映射）
-// 4) 输出 csr_next_pc/csr_redirect：供 commit 选择冲刷目标
-//    （FLUSH_EXCP 用 csr_next_pc=EENTRY/TLBRENTRY，FLUSH_ERTN 用 ERA），由 ctrl 统一广播
-// 5) csr_rnum/csr_rvalue 读口：新架构由 fu_mdu 的 CSR 读口驱动（执行级读旧值）
+// 3) commit.v 在提交点驱动 wb_valid/wb_pc/wb_ex、各异常位、TLB/LLSC/CSR 写口；
+// 4) 输出 csr_next_pc：异常时选择 EENTRY/TLBRENTRY，ERTN 时选择 ERA，
+//    由 commit 根据提交事件发起对应类型的全局冲刷
+// 5) csr_rnum/csr_rvalue 由 fu_mdu 使用，在执行级读取 CSR 旧值
 //
-// 新架构对接确认结论（原 TODO 四项，均已逐条核实，逻辑保持不动）：
-// 1. csr_we：commit 在 csrwr/csrxchg 单提交拍给出一拍脉冲；csrxchg 的新值
+// 接口契约：
+// 1. csr_we：commit 在 csrwr/csrxchg 单提交拍给出一拍脉冲；csrxchg 新值
 //    已在 fu_mdu 按 (old & ~mask) | (wval & mask) 合成后随 ROB 带到提交级，
 //    到本模块时 csr_wvalue=最终值、csr_wmask=全 1，按普通掩码写正确。
 // 2. has_int：输出给 commit 做"中断附着"（附着在下一条将提交的指令上，
 //    不再附着 ID 级）——ESTAT.IS 与 ECFG.LIE 逐位与后再看 CRMD.IE。
-// 3. 冲刷由 commit -> ctrl 统一广播（本模块不再输出 flush_pipeline）。
+// 3. 冲刷由 commit -> ctrl 统一广播，本模块只输出 csr_next_pc。
 // 4. IPE/ADEM 写入路径：decoder 检测 IPE、tlb_manager/mmu 检测 ADEM，
 //    commit 打包驱动 IPE_valid/ADEM_valid 到本模块——exception_Decoder
 //    的链式优先级含两者，ESTAT.Ecode/Esubcode 与 BADV（wb_ex_addr_err
@@ -29,11 +27,11 @@
 module csr_exception_commit_handler (
     input  wire        clk,
     input  wire        reset,
-    input  wire [11:0] csr_rnum,
+    input  wire [13:0] csr_rnum,   // CSR 读号（14 位；未实现号读 0）
 
 
     // ---------------- CSR 访问（来自 csr 指令，commit 提交拍真正执行） ----------------------------
-    input  wire [11:0] csr_num,    // CSR寄存器号
+    input  wire [13:0] csr_num,    // CSR 写号（14 位；未实现号写忽略）
     input  wire        csr_we,     // CSR寄存器写使能
     input  wire [31:0] csr_wmask,  // CSR寄存器写掩码
     input  wire [31:0] csr_wvalue, // CSR寄存器写值
@@ -42,7 +40,8 @@ module csr_exception_commit_handler (
     // ---------------- 来自 TLB 的相关输入  ----------------------------
     input  wire                   tlbsrch_found,
     input  wire [4:0]             tlbsrch_index,
-    input  wire [31:0]            tlbrd_tlbidx,
+    input  wire                   tlbrd_ne,
+    input  wire [5:0]             tlbrd_ps,
     input  wire [31:0]            tlbrd_tlbehi,
     input  wire [31:0]            tlbrd_tlbelo0,
     input  wire [31:0]            tlbrd_tlbelo1,
@@ -51,7 +50,7 @@ module csr_exception_commit_handler (
 
     // ---------------- 外部中断输入 ----------------------------
     // hw_int_in = hardware interrupt input
-    input  wire [ 7:0] hw_int_in,  // 8位硬中断，在top接线（不过实际未input在top的端口，只是在内部置零，没用到。为什么？仿真也没用好吗-_-）
+    input  wire [ 7:0] hw_int_in,  // 8 位硬件中断；顶层当前接 0
     input  wire        ipi_int_in, // 核间中断
 
 
@@ -60,8 +59,9 @@ module csr_exception_commit_handler (
     input  wire [31:0] wb_pc,
     input  wire        wb_is_ertn,    // ERTN指令要冲刷流水线
     input  wire [31:0] wb_vaddr,      // 用给BADV
-    input  wire        wb_ex,         // 异常处理触发信号（commit 各异常 valid 相或；wb_* 前缀系历史命名）
-    input  wire [`TLB_OP_NUM-1:0] wb_tlb_op,
+    input  wire        wb_ex,         // commit 各异常 valid 的合并触发信号
+    input  wire        wb_tlbsrch,
+    input  wire        wb_tlbrd,
 
     // 注意：有优先级，INT 最高，其余按 exception_Decoder 的链式次序编码
     input  wire        INT_valid,     // 中断是否触发，高电平即为有中断异常
@@ -75,14 +75,12 @@ module csr_exception_commit_handler (
     input  wire        INE_valid,     // 指令不存在异常，特指ID
 
 
-    // ---------------- LL/SC 接口（WB 提交时驱动 LLBIT/LLADDR） ----------------
-    input  wire        ll_set_in,         // 在 WB 提交 ll.w 时为 1（伴随 lladdr_in）
+    // ---------------- LL/SC 接口（提交时维护 LLBIT） ----------------
+    input  wire        ll_set_in,         // 提交 ll.w 时置位 LLBIT
     input  wire        sc_set_in,         // 在 WB 提交 sc.w 时为 1（无论成败均清 LLBIT）
-    input  wire [27:0] lladdr_in,         // ll.w 的物理地址高 28 位
 
     // ---------------- 输出：冲刷目标、中断、csr读返回与域输出 ----------------
-    output wire [31:0] csr_next_pc,     // 异常的EENTRY 或 ERTN的返回地址，判断是这两个的哪个，看csr_redirect
-    output wire [1:0]  csr_redirect,    // 区分csr_next_pc类型的标志位信号，类型有`CSR_REDIRECT_EX、`CSR_REDIRECT_ERTN、`CSR_REDIRECT_NONE
+    output wire [31:0] csr_next_pc,     // 异常入口或 ERTN 返回地址
     output wire        has_int,         // 送往 commit 的中断有效信号
     output wire [31:0] csr_rvalue,      // CSR寄存器读返回值
     output wire [31:0] csr_tid_out,     // csr的tid值，用于RDCNTID指令读取计时器ID号
@@ -90,20 +88,38 @@ module csr_exception_commit_handler (
     output wire        csr_crmd_pg_out,
     output wire [1:0]  csr_crmd_plv_out,
     output wire [9:0]  csr_asid_out,
-    output wire [31:0] csr_tlbidx_out,
-    output wire [31:0] csr_tlbehi_out,
-    output wire [31:0] csr_tlbelo0_out,
-    output wire [31:0] csr_tlbelo1_out,
-    output wire [31:0] csr_dmw0_out,
-    output wire [31:0] csr_dmw1_out,
+    output wire        csr_tlbidx_ne_out,
+    output wire [5:0]  csr_tlbidx_ps_out,
+    output wire [4:0]  csr_tlbidx_index_out,
+    output wire [18:0] csr_tlbehi_vppn_out,
+    output wire [19:0] csr_tlbelo0_ppn_out,
+    output wire [1:0]  csr_tlbelo0_plv_out,
+    output wire [1:0]  csr_tlbelo0_mat_out,
+    output wire        csr_tlbelo0_d_out,
+    output wire        csr_tlbelo0_v_out,
+    output wire        csr_tlbelo0_g_out,
+    output wire [19:0] csr_tlbelo1_ppn_out,
+    output wire [1:0]  csr_tlbelo1_plv_out,
+    output wire [1:0]  csr_tlbelo1_mat_out,
+    output wire        csr_tlbelo1_d_out,
+    output wire        csr_tlbelo1_v_out,
+    output wire        csr_tlbelo1_g_out,
+    output wire [2:0]  csr_dmw0_vseg_out,
+    output wire [2:0]  csr_dmw0_pseg_out,
+    output wire [1:0]  csr_dmw0_mat_out,
+    output wire        csr_dmw0_plv3_out,
+    output wire        csr_dmw0_plv0_out,
+    output wire [2:0]  csr_dmw1_vseg_out,
+    output wire [2:0]  csr_dmw1_pseg_out,
+    output wire [1:0]  csr_dmw1_mat_out,
+    output wire        csr_dmw1_plv3_out,
+    output wire        csr_dmw1_plv0_out,
     output wire [4:0]  csr_rand_index_out,
     output wire [1:0]  csr_crmd_datf_out,
     output wire [1:0]  csr_crmd_datm_out,
     output wire [7:0]  csr_estat_ecode_out,
-    output wire [31:0] csr_crmd_out,
-    // LL/SC 状态向 EXE/MEM 暴露：sc.w 由此判断是否成功；refetch_tag 已保证读到的是最新值
+    // LL/SC 有效位供提交逻辑判断 sc.w 是否成功。
     output wire        csr_llbit_out,
-    output wire [27:0] csr_lladdr_out,
     output wire [63:0] diff_timer_64
 
 `ifdef DIFFTEST_EN
@@ -281,13 +297,12 @@ module csr_exception_commit_handler (
 
 
     // ESTAT 的 IS 域（timer_cnt / timer_en 在本块使用，声明需前置）
-    // 定时器对齐 open-la500（csr.v）：
+    // 定时器语义：
     //   - 独立 timer_en：oneshot 减到 0 时 timer_en<=0；periodic 保持 1
-    //   - TI：timer_en && TVAL==0 时置位（与 open-la500 一致）
+    //   - TI：timer_en && TVAL==0 时置位
     //   - TVAL==0 当拍重装 InitVal（periodic）或 0xFFFFFFFF（oneshot）
-    // 额外：TI 挂起期间暂停倒计时（TICLR 后从已重装值再走完下一周期）。
-    // open-la500 五级流水 handler 极快，周期内不会再次到期；本核 OoO+CSR
-    // 冲刷使 n49 handler 长于 InitVal，若不冻结会在 ertn 前再次置 TI → 230C 级联。
+    // TI 挂起期间暂停倒计时；TICLR 后从已重装值开始下一周期，避免异常处理
+    // 尚未返回时定时器再次到期。
     reg [12:0] csr_estat_is;
     reg [31:0] timer_cnt;
     reg        timer_en;
@@ -314,7 +329,7 @@ module csr_exception_commit_handler (
             if (ticlr_we) begin
                 csr_estat_is[11] <= 1'b0;
             end else if (tcfg_we) begin
-                // 与 open-la500：写 TCFG 时刷新 timer_en（写入后的 En）
+                // 写 TCFG 时按写入后的 En 刷新 timer_en。
                 timer_en <= csr_wmask[`CSR_TCFG_EN] & csr_wvalue[`CSR_TCFG_EN]
                          | ~csr_wmask[`CSR_TCFG_EN] & csr_tcfg_en;
             end else if (timer_ti_set) begin
@@ -334,7 +349,7 @@ module csr_exception_commit_handler (
             csr_estat_esubcode <= 1'b0;
         end
         else if (wb_csr_ex) begin
-            csr_estat_ecode <= Ecode[5:0];
+            csr_estat_ecode <= {2'b0, Ecode[5:0]};
             csr_estat_esubcode <= Esubcode;
         end
     end
@@ -400,7 +415,7 @@ module csr_exception_commit_handler (
             csr_tlbehi   <= 32'h0000_0000;
             csr_tlbelo0  <= 32'h0000_0000;
             csr_tlbelo1  <= 32'h0000_0000;
-            // ASID CSR：低 10 位为 ASID；高位为只读/保留域，复位后与 open-la500 一致（读回 0x000a0000）。
+            // ASID CSR：低 10 位为 ASID；高位为只读/保留域，复位读回 0x000a0000。
             csr_asid[31:10] <= 22'h280;
             csr_asid[9:0]   <= 10'h0;
             csr_tlbrentry<= 32'h0000_0000;
@@ -419,29 +434,29 @@ module csr_exception_commit_handler (
             end
 
             if (csr_we && csr_num == `CSR_TLBIDX)
-                csr_tlbidx <= (csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbidx);
+                csr_tlbidx <= ((csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbidx)) & 32'hbf00_001f;
             if (csr_we && csr_num == `CSR_TLBEHI)
                 // TLBEHI 仅 VPPN[31:13] 可写，低 13 位读作 0；否则会在 csrwr/tlbwr 序列中把页内偏移误带入。
                 csr_tlbehi <= ((csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbehi)) & 32'hffff_e000;
             if (csr_we && csr_num == `CSR_TLBELO0)
-                // TLBELO0 保留 [31:28] 与 [7] 读 0、写忽略（与 NEMU/手册一致）；否则 csrwr 页表项时
-                // 会把软件构造值中的 bit7 带入 CSR（708M @0xa021047c：REF=0xede1f，DUT=0xede9f）。
+                // TLBELO0 保留 [31:28] 与 [7] 读 0、写忽略，防止软件构造值的
+                // 保留位进入 CSR 状态。
                 csr_tlbelo0 <= ((csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbelo0)) & 32'h0fffff7f;
             if (csr_we && csr_num == `CSR_TLBELO1)
                 csr_tlbelo1 <= ((csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbelo1)) & 32'h0fffff7f;
             if (csr_we && csr_num == `CSR_TLBRENTRY)
-                csr_tlbrentry <= (csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbrentry);
+                csr_tlbrentry <= ((csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbrentry)) & 32'hffff_ffc0;
             if (csr_we && csr_num == `CSR_DMW0)
-                csr_dmw0 <= (csr_wmask & csr_wvalue) | (~csr_wmask & csr_dmw0);
+                csr_dmw0 <= ((csr_wmask & csr_wvalue) | (~csr_wmask & csr_dmw0)) & 32'hee00_0039;
             if (csr_we && csr_num == `CSR_DMW1)
-                csr_dmw1 <= (csr_wmask & csr_wvalue) | (~csr_wmask & csr_dmw1);
+                csr_dmw1 <= ((csr_wmask & csr_wvalue) | (~csr_wmask & csr_dmw1)) & 32'hee00_0039;
             if (csr_we && csr_num == `CSR_PGDL)
                 csr_pgdl <= (((csr_wmask & csr_wvalue) | (~csr_wmask & csr_pgdl)) & 32'hffff_f000);
             if (csr_we && csr_num == `CSR_PGDH)
                 csr_pgdh <= (((csr_wmask & csr_wvalue) | (~csr_wmask & csr_pgdh)) & 32'hffff_f000);
 
             // 这里是 WB 提交点：tlbsrch/tlbrd 结果写入 CSR（4.2.3.2 + CSR.ASID 7.5.4：TLBRD 将表项 ASID 写入 CSR.ASID；无效项时 tlbrd_asid=0）。
-            if (wb_valid && wb_tlb_op[`TLB_OP_TLBSRCH]) begin
+            if (wb_valid && wb_tlbsrch) begin
                 if (tlbsrch_found) begin
                     csr_tlbidx[4:0] <= tlbsrch_index;
                     csr_tlbidx[31]  <= 1'b0;
@@ -451,15 +466,15 @@ module csr_exception_commit_handler (
             end
 
             // tlbrd 也是 WB 提交后立即把 tlb_manager 的读回结果写回 CSR 影子寄存器。
-            // 与参考实现对齐：TLBRD 只更新 TLBIDX 的 NE/PS，不修改 INDEX 域。
-            if (wb_valid && wb_tlb_op[`TLB_OP_TLBRD]) begin
-                csr_tlbidx[31]    <= tlbrd_tlbidx[31];
-                csr_tlbidx[29:24] <= tlbrd_tlbidx[29:24];
+            // TLBRD 只更新 TLBIDX 的 NE/PS，不修改 INDEX 域。
+            if (wb_valid && wb_tlbrd) begin
+                csr_tlbidx[31]    <= tlbrd_ne;
+                csr_tlbidx[29:24] <= tlbrd_ps;
                 csr_tlbehi  <= tlbrd_tlbehi;
                 csr_tlbelo0 <= tlbrd_tlbelo0;
                 csr_tlbelo1 <= tlbrd_tlbelo1;
-                // 无效项（NE=1）不回写 ASID，保留原值（与 golden trace 一致；open-la 写 0 会导致后续 CSRXCHG 偏差）。
-                if (~tlbrd_tlbidx[31])
+                // 无效项（NE=1）不回写 ASID，保留原值，供后续 CSRXCHG 使用。
+                if (!tlbrd_ne)
                     csr_asid[9:0] <= tlbrd_asid;
                 else
                     csr_asid[9:0] <= 10'h0;
@@ -534,20 +549,20 @@ module csr_exception_commit_handler (
     end
 
 
-    // TVAL 的 TimerVal 域（对齐 open-la500；TI 挂起时冻结倒计时）
-    wire [31:0] tcfg_next_value;
+    // TVAL 的 TimerVal 域；TI 挂起时冻结倒计时。
+    wire [31:2] tcfg_next_value;
     wire [31:0] csr_tval;
 
-    assign tcfg_next_value = csr_wmask[31:0] & csr_wvalue[31:0] 
-                           | ~csr_wmask[31:0] & {csr_tcfg_initval, csr_tcfg_periodic, csr_tcfg_en};
+    assign tcfg_next_value = csr_wmask[31:2] & csr_wvalue[31:2]
+                           | ~csr_wmask[31:2] & csr_tcfg_initval;
 
     always @(posedge clk) begin
         if (reset) begin
             timer_cnt <= 32'hffffffff;
         end
         else if (tcfg_we) begin
-            // open-la500：任意 TCFG 写入都装载 InitVal<<2
-            timer_cnt <= {tcfg_next_value[`CSR_TCFG_INITVAL], 2'b0};
+            // 任意 TCFG 写入都装载 InitVal<<2。
+            timer_cnt <= {tcfg_next_value, 2'b0};
         end
         else if (timer_en && !csr_estat_is[11]) begin
             if (timer_cnt != 32'b0) begin
@@ -563,10 +578,9 @@ module csr_exception_commit_handler (
 
 
     // ------------------------------------------------------------------
-    // LLBCTL：维护 LLBIT、LLADDR、KLO
+    // LLBCTL：维护 LLBIT、KLO
     // ------------------------------------------------------------------
     reg        llbit;          // ROLLB 域读出
-    reg [27:0] lladdr;         // 与 ll.w 一同锁存的物理地址高 28 位
     reg        csr_llbctl_klo; // KLO 位（ertn 时不清 LLBIT 的一次性开关）
     wire csr_we_llbctl = csr_we && (csr_num == `CSR_LLBCTL);
     // csrwr LLBCTL：WCLLB=1 清 LLBIT；KLO 按 mask/wvalue 写入
@@ -591,7 +605,7 @@ module csr_exception_commit_handler (
             csr_llbctl_klo <= csr_wmask[`KLO] & csr_wvalue[`KLO]
                             | ~csr_wmask[`KLO] & csr_llbctl_klo;
         end
-        // ll.w 提交：置 LLBIT=1，同时 lladdr 在下面块里锁存
+        // ll.w 提交：置 LLBIT=1。
         else if (ll_set_in) begin
             llbit <= 1'b1;
         end
@@ -600,15 +614,6 @@ module csr_exception_commit_handler (
             llbit <= 1'b0;
         end
     end
-
-    always @(posedge clk) begin
-        if (reset) begin
-            lladdr <= 28'b0;
-        end else if (ll_set_in) begin
-            lladdr <= lladdr_in;
-        end
-    end
-
 
     // csr处理类型的标志信号
     wire csr_take_ex   = wb_csr_ex; // 异常/中断提交
@@ -621,7 +626,6 @@ module csr_exception_commit_handler (
     wire [31:0] csr_ecfg_rvalue = {19'b0, 13'h1bff & csr_ecfg_lie};
     // ESTAT 读值：{[31]=0, ESUBCODE[30:22], ECODE[21:16], [15:13]=0, IS[12:0]}
     wire [31:0] csr_estat_rvalue = {1'b0, 8'b0, csr_estat_esubcode, csr_estat_ecode[5:0], 3'b0, csr_estat_is};
-    wire [31:0] csr_estat_commit = {1'b0, 8'b0, Esubcode, Ecode[5:0], 3'b0, csr_estat_is};
     wire [31:0] csr_era_rvalue = csr_era_pc;
     wire [31:0] csr_badv_rvalue = csr_badv_vaddr;
     wire [31:0] csr_eentry_rvalue = {csr_eentry_va, 6'b0};
@@ -633,13 +637,13 @@ module csr_exception_commit_handler (
     wire [31:0] csr_tcfg_rvalue = {csr_tcfg_initval, csr_tcfg_periodic, csr_tcfg_en};
     wire [31:0] csr_tval_rvalue = csr_tval;
     wire [31:0] csr_ticlr_rvalue = 32'b0;
-    wire [31:0] csr_tlbidx_rvalue = csr_tlbidx;
+    wire [31:0] csr_tlbidx_rvalue = csr_tlbidx & 32'hbf00_001f;
     wire [31:0] csr_tlbehi_rvalue = csr_tlbehi;
     wire [31:0] csr_tlbelo0_rvalue = csr_tlbelo0 & 32'h0fffff7f;
     wire [31:0] csr_tlbelo1_rvalue = csr_tlbelo1 & 32'h0fffff7f;
     // WB 同拍：显式 CSR 写 ASID 优先于 TLBRD 回写（与下方时序块顺序一致）
-    wire          wb_tlbrd_commit = (wb_valid === 1'b1) && wb_tlb_op[`TLB_OP_TLBRD];
-    wire          wb_tlbrd_valid   = wb_tlbrd_commit && (tlbrd_tlbidx[31] === 1'b0);
+    wire          wb_tlbrd_commit = (wb_valid === 1'b1) && wb_tlbrd;
+    wire          wb_tlbrd_valid   = wb_tlbrd_commit && (tlbrd_ne === 1'b0);
     wire [9:0]    csr_asid_low_rdata =
           wb_tlbrd_commit ? (wb_tlbrd_valid ? tlbrd_asid[9:0] : 10'h0)
         : csr_asid[9:0];
@@ -693,11 +697,6 @@ module csr_exception_commit_handler (
     // has_int
     assign has_int = (((csr_estat_is[12:0] & csr_ecfg_lie[12:0]) != 13'b0) === 1'b1) && (csr_crmd_ie === 1'b1);
 
-    // csr_redirect
-    assign csr_redirect = csr_take_ex   ? `CSR_REDIRECT_EX
-                        : csr_take_ertn ? `CSR_REDIRECT_ERTN
-                        : `CSR_REDIRECT_NONE;
-
     // csr_next_pc
     assign csr_next_pc = csr_take_ex   ? ((Ecode == `TLBR_ECODE) ? csr_tlbrentry_rvalue : csr_eentry_rvalue)
                         : csr_take_ertn ? csr_era_rvalue
@@ -709,21 +708,39 @@ module csr_exception_commit_handler (
     assign csr_crmd_pg_out = csr_crmd_pg;
     assign csr_crmd_plv_out = csr_crmd_plv;
     assign csr_asid_out = csr_asid[9:0];
-    assign csr_tlbidx_out = csr_tlbidx;
-    assign csr_tlbehi_out = csr_tlbehi;
-    assign csr_tlbelo0_out = csr_tlbelo0;
-    assign csr_tlbelo1_out = csr_tlbelo1;
-    assign csr_dmw0_out = csr_dmw0;
-    assign csr_dmw1_out = csr_dmw1;
+    assign csr_tlbidx_ne_out    = csr_tlbidx[31];
+    assign csr_tlbidx_ps_out    = csr_tlbidx[29:24];
+    assign csr_tlbidx_index_out = csr_tlbidx[4:0];
+    assign csr_tlbehi_vppn_out  = csr_tlbehi[31:13];
+    assign csr_tlbelo0_ppn_out  = csr_tlbelo0[27:8];
+    assign csr_tlbelo0_plv_out  = csr_tlbelo0[3:2];
+    assign csr_tlbelo0_mat_out  = csr_tlbelo0[5:4];
+    assign csr_tlbelo0_d_out    = csr_tlbelo0[1];
+    assign csr_tlbelo0_v_out    = csr_tlbelo0[0];
+    assign csr_tlbelo0_g_out    = csr_tlbelo0[6];
+    assign csr_tlbelo1_ppn_out  = csr_tlbelo1[27:8];
+    assign csr_tlbelo1_plv_out  = csr_tlbelo1[3:2];
+    assign csr_tlbelo1_mat_out  = csr_tlbelo1[5:4];
+    assign csr_tlbelo1_d_out    = csr_tlbelo1[1];
+    assign csr_tlbelo1_v_out    = csr_tlbelo1[0];
+    assign csr_tlbelo1_g_out    = csr_tlbelo1[6];
+    assign csr_dmw0_vseg_out    = csr_dmw0[31:29];
+    assign csr_dmw0_pseg_out    = csr_dmw0[27:25];
+    assign csr_dmw0_mat_out     = csr_dmw0[5:4];
+    assign csr_dmw0_plv3_out    = csr_dmw0[3];
+    assign csr_dmw0_plv0_out    = csr_dmw0[0];
+    assign csr_dmw1_vseg_out    = csr_dmw1[31:29];
+    assign csr_dmw1_pseg_out    = csr_dmw1[27:25];
+    assign csr_dmw1_mat_out     = csr_dmw1[5:4];
+    assign csr_dmw1_plv3_out    = csr_dmw1[3];
+    assign csr_dmw1_plv0_out    = csr_dmw1[0];
     assign csr_rand_index_out = timer_64[4:0];
     assign csr_crmd_datf_out = csr_crmd_datf;
     assign csr_crmd_datm_out = csr_crmd_datm;
     assign csr_estat_ecode_out = csr_estat_ecode;
-    assign csr_crmd_out = csr_crmd_rvalue;
 
-    // LL/SC：暴露 LLBIT/LLADDR 给 EXE/MEM；sc.w 用 (llbit & addr_match) 决定是否真发起 store
+    // LL/SC：提交逻辑使用 LLBIT 决定 sc.w 是否真正发起 store。
     assign csr_llbit_out  = llbit;
-    assign csr_lladdr_out = lladdr;
     assign diff_timer_64  = timer_64;
 
 `ifdef DIFFTEST_EN

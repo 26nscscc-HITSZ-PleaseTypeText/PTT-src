@@ -3,10 +3,9 @@
 // ============================================================
 // op_dec 模块（操作码生成：inst_* 独热 -> alu_op/br_op/mem_op/csr_op 等）
 // ------------------------------------------------------------
-// 被 decoder.v 内部例化复用，操作码编码体系（mycpu.h 独热宏）
-// 不变，零改动。decoder.v 在其输出之上补充 futype 分类与 priv_vec 标记。
-// 注意 inst_known（指令识别有效）输出供 decoder 生成 INE 异常，确认
-//      新增指令时同步维护。
+// 根据 inst_dec 的指令识别结果生成 mycpu.h 定义的独热操作码。
+// decoder 在这些操作码之上补充 futype 和 priv_vec；inst_known 用于产生 INE。
+// 添加指令时必须同步维护对应操作码和 inst_known 判定。
 // ============================================================
 module op_dec(
     input  wire        inst_add_w,
@@ -92,7 +91,6 @@ module op_dec(
     output wire [`CSR_OP_NUM-1:0] csr_op,
     output wire [`WB_SRC_NUM-1:0] wb_src_op,
     output wire [`TLB_OP_NUM-1:0] tlb_op,
-    output wire [`CACHE_OP_NUM-1:0] cache_op,
     output wire        inst_known
 );
 
@@ -157,19 +155,13 @@ module op_dec(
     assign csr_op[`CSR_OP_CSRRD] = inst_csrrd;
     assign csr_op[`CSR_OP_CSRWR] = inst_csrwr;
     assign csr_op[`CSR_OP_CSRXCHG] = inst_csrxchg;
-// rdcnt_op操作码生成
-    // assign rdcnt_op[`RDCNT_OP_RDCNTVL] = inst_rdcntvl_w;
-    // assign rdcnt_op[`RDCNT_OP_RDCNTVH] = inst_rdcntvh_w;
-    // assign rdcnt_op[`RDCNT_OP_RDCNTID] = inst_rdcntid;
-// wb_src_op操作码生成
+// 写回源只区分 MDU 内部实际需要的 ALU/CPUCFG 与三类计数器结果。
     assign wb_src_op[`WB_SRC_ALU] = inst_add_w | inst_addi_w | inst_slti | inst_sltui | inst_andi | inst_ori | inst_xori 
                                 | inst_sub_w | inst_slli_w | inst_srli_w | inst_srai_w | inst_sll_w | inst_srl_w | inst_sra_w
                                 | inst_lu12i_w | inst_pcaddu12i | inst_pcaddi
                                 | inst_andn | inst_orn
                                 | inst_mul_w | inst_mulh_w | inst_mulh_wu | inst_div_w | inst_div_wu | inst_mod_w | inst_mod_wu
                                 | inst_sc_w  | inst_cpucfg;
-    assign wb_src_op[`WB_SRC_MEM] = inst_ld_w | inst_ld_h | inst_ld_b | inst_ld_hu | inst_ld_bu | inst_ll_w;
-    assign wb_src_op[`WB_SRC_CSR] = inst_csrrd | inst_csrwr | inst_csrxchg;
     assign wb_src_op[`WB_SRC_CNTVL] = inst_rdcntvl_w;
     assign wb_src_op[`WB_SRC_CNTVH] = inst_rdcntvh_w;
     assign wb_src_op[`WB_SRC_TID] = inst_rdcntid;
@@ -185,7 +177,8 @@ module op_dec(
     assign tlb_op[`TLB_OP_INVTLB_4] = inst_invtlb_4;
     assign tlb_op[`TLB_OP_INVTLB_5] = inst_invtlb_5;
     assign tlb_op[`TLB_OP_INVTLB_6] = inst_invtlb_6;
-//cache_op
+    // Cache 维护操作仅参与已知指令判定，不进入后端 uop。
+    wire [`CACHE_OP_NUM-1:0] cache_op;
     assign cache_op[`CACHE_OP_CACOP] = inst_cacop;
     assign cache_op[`CACHE_OP_IBAR] = inst_ibar;
 // inst_known：指令识别信号，必须输出稳定 0/1（避免 reduction OR 遇到 X 传播，导致异常不触发）

@@ -2,7 +2,7 @@
 // fu_mdu 模块（乘除/CSR读/rdcnt/TLB维护打包 杂项执行单元，多周期非流水）
 // ------------------------------------------------------------
 // 功能：
-// - 处理低频/多周期/需要特殊端口的指令（mariver 哲学："脏活累活都给 MDU 干"）：
+// - 处理低频、多周期或需要特殊端口的指令：
 //   * 乘法 mul/mulh/mulh_u    ：例化 mul.v（DSP 流水，固定 3 拍）
 //   * 除法 div/div_u/mod/mod_u：例化 div.v（CLZ 快速除法，常见 5~10 拍）
 //   * CSR 类 csrrd/csrwr/csrxchg：读 CSR 旧值作为写回结果（rd <- old CSR）；
@@ -30,11 +30,11 @@ module fu_mdu(
     // ---------------- 发射入口（来自 rs_mdu）----------------
     input  wire                       issue_valid_i,
     input  wire [`ROB_W-1:0]          issue_robid_i,
-    input  wire [`ALU_OP_NUM-1:0]     issue_alu_op_i,     // 乘除位有效
+    input  wire [18:12]               issue_alu_op_i,     // 全局操作码中的乘除位
     input  wire [`CSR_OP_NUM-1:0]     issue_csr_op_i,
     input  wire [13:0]                issue_csr_num_i,
     input  wire [`TLB_OP_NUM-1:0]     issue_tlb_op_i,
-    input  wire [`WB_SRC_NUM-1:0]     issue_wb_src_op_i,  // rdcnt 类选择
+    input  wire [`WB_SRC_NUM-1:0]     issue_wb_src_op_i,  // {TID,CNTVH,CNTVL,ALU}
     input  wire [31:0]                issue_src0_i,       // rj 值
     input  wire [31:0]                issue_src1_i,       // rk/rd 值
     output wire                       mdu_ready_o,        // 空闲（rs_mdu 发射条件）
@@ -60,7 +60,7 @@ localparam S_WB   = 2'd2;
 
 reg [1:0]              state;
 reg [`ROB_W-1:0]       r_robid;
-reg [`ALU_OP_NUM-1:0]  r_alu_op;
+reg                    r_mul_low;
 reg                    r_result_is_quotient;
 reg [13:0]             r_csr_num;
 reg [31:0]             r_data;
@@ -76,9 +76,11 @@ wire issue_is_div = issue_alu_op_i[`ALU_OP_DIV_W]
                   | issue_alu_op_i[`ALU_OP_MOD_W]
                   | issue_alu_op_i[`ALU_OP_MOD_WU];
 wire issue_is_csr = |issue_csr_op_i;
-wire issue_is_rdcnt = issue_wb_src_op_i[`WB_SRC_CNTVL]
-                    | issue_wb_src_op_i[`WB_SRC_CNTVH]
-                    | issue_wb_src_op_i[`WB_SRC_TID];
+wire issue_wb_tid   = issue_wb_src_op_i[`WB_SRC_TID];
+wire issue_wb_cntvh = issue_wb_src_op_i[`WB_SRC_CNTVH];
+wire issue_wb_cntvl = issue_wb_src_op_i[`WB_SRC_CNTVL];
+wire issue_wb_alu   = issue_wb_src_op_i[`WB_SRC_ALU];
+wire issue_is_rdcnt = |issue_wb_src_op_i[`WB_SRC_TID:`WB_SRC_CNTVL];
 wire issue_is_invtlb = issue_tlb_op_i[`TLB_OP_INVTLB_0]
                      | issue_tlb_op_i[`TLB_OP_INVTLB_1]
                      | issue_tlb_op_i[`TLB_OP_INVTLB_2]
@@ -87,7 +89,7 @@ wire issue_is_invtlb = issue_tlb_op_i[`TLB_OP_INVTLB_0]
                      | issue_tlb_op_i[`TLB_OP_INVTLB_5]
                      | issue_tlb_op_i[`TLB_OP_INVTLB_6];
 wire issue_is_tlb = |issue_tlb_op_i;
-wire issue_is_cpucfg = issue_wb_src_op_i[`WB_SRC_ALU]
+wire issue_is_cpucfg = issue_wb_alu
                      & ~issue_is_mul & ~issue_is_div
                      & ~issue_is_csr & ~issue_is_rdcnt & ~issue_is_tlb;
 
@@ -97,9 +99,9 @@ wire accept = (state == S_IDLE) && (mul_flush_wait == 2'b0)
 assign mdu_ready_o = (state == S_IDLE) && (mul_flush_wait == 2'b0) && !flush_i;
 
 function [31:0] cpucfg_value;
-    input [31:0] index;
+    input [13:0] index;
     begin
-        case (index[13:0])
+        case (index)
             14'h0001: cpucfg_value = 32'h0001_f1f4;
             14'h0002: cpucfg_value = 32'h0000_0000;
             14'h000a: cpucfg_value = 32'h0000_0005;
@@ -130,7 +132,6 @@ wire        div_start = accept && issue_is_div;
 wire [31:0] div_quotient;
 wire [31:0] div_remainder;
 wire        div_done;
-wire        div_busy;
 
 div u_div(
     .clk        (clk),
@@ -142,18 +143,17 @@ div u_div(
     .is_signed_i(issue_alu_op_i[`ALU_OP_DIV_W] | issue_alu_op_i[`ALU_OP_MOD_W]),
     .quotient_o (div_quotient),
     .remainder_o(div_remainder),
-    .done_o     (div_done),
-    .busy_o     (div_busy)
+    .done_o     (div_done)
 );
 
 assign csr_raddr_o = (state == S_IDLE) ? issue_csr_num_i : r_csr_num;
 
 wire [31:0] csr_old = csr_rdata_i;
-wire [31:0] fast_data = issue_is_csr                  ? csr_old
-                      : issue_wb_src_op_i[`WB_SRC_CNTVL] ? timer_64_i[31:0]
-                      : issue_wb_src_op_i[`WB_SRC_CNTVH] ? timer_64_i[63:32]
-                      : issue_wb_src_op_i[`WB_SRC_TID]   ? csr_tid_i
-                      : issue_is_cpucfg               ? cpucfg_value(issue_src0_i)
+wire [31:0] fast_data = issue_is_csr                         ? csr_old
+                      : issue_wb_cntvl                       ? timer_64_i[31:0]
+                      : issue_wb_cntvh                       ? timer_64_i[63:32]
+                      : issue_wb_tid                         ? csr_tid_i
+                      : issue_is_cpucfg                      ? cpucfg_value(issue_src0_i[13:0])
                       : 32'b0;
 wire [31:0] fast_data2 = issue_csr_op_i[`CSR_OP_CSRWR]   ? issue_src1_i
                        : issue_csr_op_i[`CSR_OP_CSRXCHG] ? ((csr_old & ~issue_src0_i) | (issue_src1_i & issue_src0_i))
@@ -181,7 +181,7 @@ always @(posedge clk) begin
             S_IDLE: begin
                 if (accept) begin
                     r_robid   <= issue_robid_i;
-                    r_alu_op  <= issue_alu_op_i;
+                    r_mul_low <= issue_alu_op_i[`ALU_OP_MUL_W];
                     r_csr_num <= issue_csr_num_i;
                     r_is_mul  <= issue_is_mul;
                     r_result_is_quotient <= issue_alu_op_i[`ALU_OP_DIV_W]
@@ -197,7 +197,7 @@ always @(posedge clk) begin
             end
             S_BUSY: begin
                 if (mul_done && r_is_mul) begin
-                    r_data  <= r_alu_op[`ALU_OP_MUL_W] ? mul_result[31:0] : mul_result[63:32];
+                    r_data  <= r_mul_low ? mul_result[31:0] : mul_result[63:32];
                     r_data2 <= 32'b0;
                     state   <= S_WB;
                 end else if (div_done && !r_is_mul) begin
@@ -222,7 +222,5 @@ assign wb_valid_o = (state == S_WB) && !flush_i;
 assign wb_robid_o = r_robid;
 assign wb_data_o  = r_data;
 assign wb_data2_o = r_data2;
-
-wire fu_mdu_lint = div_busy;
 
 endmodule

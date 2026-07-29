@@ -49,7 +49,7 @@
         <mxCell id="ib" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#ffffff;strokeColor=#333333;" value="inst_buffer.v&lt;br&gt;指令缓冲（16 项，4 进 2 出）" vertex="1">
           <mxGeometry height="54" width="250" x="80" y="650" as="geometry" />
         </mxCell>
-        <mxCell id="dec" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#ffffff;strokeColor=#333333;" value="decoder.v ×2（复用 inst_dec / op_dec / imm_generator / get_reg_read_addr / decode_tools）" vertex="1">
+        <mxCell id="dec" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#ffffff;strokeColor=#333333;" value="decoder.v ×2（复用 inst_dec / op_dec / imm_generator / get_reg_read_addr）" vertex="1">
           <mxGeometry height="50" width="300" x="450" y="110" as="geometry" />
         </mxCell>
         <mxCell id="rat" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#ffffff;strokeColor=#333333;" value="rat.v&lt;br&gt;RAT 32×{busy,robid}" vertex="1">

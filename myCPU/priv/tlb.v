@@ -3,13 +3,11 @@
 // ============================================================
 // tlb 模块（主 TLB：TLBNUM 项全相联，双查找口 + 读写/无效化口）
 // ------------------------------------------------------------
-// 功能（新架构下完全复用，端口不变，已通过 79 个功能点验证）：
+// 功能：
 // - s0 口：取指翻译查询（经 tlb_manager 内 I 侧 l1_tlb 微表转发）
 // - s1 口：访存翻译查询（经 D 侧 l1_tlb 微表转发）
-// - srch 口（V2.3 提频新增）：tlbsrch 专用查找口，输入直接来自
-//   CSR.TLBEHI/CSR.ASID 寄存器，只输出 found/index（体系结构语义，
-//   不读页属性）。tlbsrch 不再挪用 s0 口，commit 提交逻辑从
-//   「s0 mux → 全相联比较 → 翻译 → 取指」关键路径上整体摘除；
+// - srch 口：tlbsrch 专用查找口，输入来自 CSR.TLBEHI/CSR.ASID，只输出
+//   found/index，不读取页属性，也不占用 s0 取指查询口；
 // - 读写口/INVTLB：由 tlb_manager 在 commit 提交 TLB 维护指令时驱动
 //   （提交拍一拍脉冲，伴随 FLUSH_REFETCH 冲刷，无在途查询竞争）
 // - 双页结构（odd/even ppn）：一个表项覆盖相邻两页，写入时同时给出
@@ -17,11 +15,9 @@
 //
 // 参数：TLBNUM 表项数（模块默认 16，顶层 core_top 例化为 32）。
 //
-// 二期优化落点说明：
-// 1) TLBNUM 项全相联比较链是时序热点——已按优先方案在 tlb_manager 里加
-//    l1_tlb 微表缓存（8 项组合命中 + fence 整表失效）；
-//    微表只缓存 4KB 页翻译，大页恒走本模块透传。
-// 2) 大页（PS!=12）匹配完整性（跑 Linux 前已核对）：
+// 大页规则：
+// - tlb_manager 中的 I/D L1 微表只缓存 4KB 页，大页始终查询本模块；
+// - PS!=12 时按 4MB 页处理：
 //    - match：PS=12 时全 19 位 vppn 精确比较；PS!=12（4MB 大页）时只比较
 //      vppn[18:9]（即 va[31:22]），低位属于大页页内偏移，正确；
 //    - 奇偶页选择：PS=12 用 va_bit12（va[12]），大页用 vppn[8]（va[21]），
@@ -42,7 +38,6 @@ module tlb
     input  wire                         s0_va_bit12,
     input  wire [9:0]                   s0_asid,
     output wire                         s0_found,
-    output wire [$clog2(TLBNUM)-1:0]    s0_index,
     output wire [19:0]                  s0_ppn,
     output wire [5:0]                   s0_ps,
     output wire [1:0]                   s0_plv,
@@ -55,7 +50,6 @@ module tlb
     input  wire                         s1_va_bit12,
     input  wire [9:0]                   s1_asid,
     output wire                         s1_found,
-    output wire [$clog2(TLBNUM)-1:0]    s1_index,
     output wire [19:0]                  s1_ppn,
     output wire [5:0]                   s1_ps,
     output wire [1:0]                   s1_plv,
@@ -73,8 +67,8 @@ module tlb
     // INVTLB 指令接口（用于 TLB 无效化）
     input  wire                         invtlb_valid,
     input  wire [4:0]                   invtlb_op,
-    input  wire [9:0]                   invtlb_asid,      // 【新增】独立ASID参数
-    input  wire [18:0]                  invtlb_vpn,       // 【新增】独立VPN参数
+    input  wire [9:0]                   invtlb_asid,
+    input  wire [18:0]                  invtlb_vpn,
 
     // 写端口
     input  wire                         we,
@@ -228,8 +222,6 @@ always @(*) begin
     end
 end
 
-assign s0_index = s0_index_r;
-assign s1_index = s1_index_r;
 assign srch_found = |match_srch;
 assign srch_index = srch_index_r;
 
@@ -270,21 +262,21 @@ integer widx;
 always @(posedge clk) begin
     if (reset) begin
         for (widx = 0; widx < TLBNUM; widx = widx + 1) begin
-            tlb_vppn[widx] = 19'b0;
-            tlb_e[widx]    = 1'b0;
-            tlb_asid[widx] = 10'b0;
-            tlb_g[widx]    = 1'b0;
-            tlb_ps[widx]   = PS_4KB;
-            tlb_ppn0[widx] = 20'b0;
-            tlb_plv0[widx] = 2'b0;
-            tlb_mat0[widx] = 2'b0;
-            tlb_d0[widx]   = 1'b0;
-            tlb_v0[widx]   = 1'b0;
-            tlb_ppn1[widx] = 20'b0;
-            tlb_plv1[widx] = 2'b0;
-            tlb_mat1[widx] = 2'b0;
-            tlb_d1[widx]   = 1'b0;
-            tlb_v1[widx]   = 1'b0;
+            tlb_vppn[widx] <= 19'b0;
+            tlb_e[widx]    <= 1'b0;
+            tlb_asid[widx] <= 10'b0;
+            tlb_g[widx]    <= 1'b0;
+            tlb_ps[widx]   <= PS_4KB;
+            tlb_ppn0[widx] <= 20'b0;
+            tlb_plv0[widx] <= 2'b0;
+            tlb_mat0[widx] <= 2'b0;
+            tlb_d0[widx]   <= 1'b0;
+            tlb_v0[widx]   <= 1'b0;
+            tlb_ppn1[widx] <= 20'b0;
+            tlb_plv1[widx] <= 2'b0;
+            tlb_mat1[widx] <= 2'b0;
+            tlb_d1[widx]   <= 1'b0;
+            tlb_v1[widx]   <= 1'b0;
         end
     end else begin
         if (we) begin
@@ -308,7 +300,7 @@ always @(posedge clk) begin
         if (invtlb_valid) begin
             for (widx = 0; widx < TLBNUM; widx = widx + 1) begin
                 if (!((we == 1'b1) && (w_index == widx[IDXW-1:0])) && inv_match[widx]) begin
-                    tlb_e[widx] = 1'b0;
+                    tlb_e[widx] <= 1'b0;
                 end
             end
         end

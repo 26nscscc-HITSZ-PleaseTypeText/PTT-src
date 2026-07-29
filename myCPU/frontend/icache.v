@@ -15,9 +15,8 @@
 //   稳态命中时 LOOKUP 返回旧请求的同拍可接受下一请求，达到 1 请求/拍；
 //   IFU 按块偏移自行切指令；
 // - miss：整行读 L2（2 拍 128b，ret_last 末拍），重填后 RESP 拍出行；
-// - 前端 IFU 用"在途请求配对 + drop 标志"自行
-//   丢弃过期返回（见 ifu.v），本模块的返回与请求严格一一配对，
-//   ifu_cancel_i 恒 0（保留端口以兼容接口约定）。
+// - 前端 IFU 用在途行地址配对应答并自然丢弃过期返回；本模块的返回与
+//   请求严格一一配对，不提供独立 cancel 口。
 //
 // uncached 取指：
 // - 从块起始字逐字单拍读到行末（设备取指/未开 cache 阶段），拼成
@@ -31,16 +30,14 @@
 // - ibar 语义不需要 I$ 全失效：LA32R 自修改代码由软件 cacop 逐行维护 +
 //   ibar 屏障（commit 等 SB 排空 + FLUSH_REFETCH）保证，硬件无额外动作。
 //
-// - 双 outstanding：已在 L2 + axi_line_bridge 落地（I-miss 引擎走
+// - 双 outstanding 位于 L2 + axi_line_bridge（I-miss 引擎走
 //   ARID=0 读通道，与 D 侧 ARID=1 并行在飞），本模块无需感知；
-// - 取指预取：L2 的 next-line I 侧预取已覆盖顺序取指流（本模块 demand
-//   命中/重填后 L2 自动预取下一行）；FTQ 引导预取需 FTQ 提供跨块目标，
-//   留待前端改造时在本模块加预取口；
+// - L2 的 next-line I 侧预取覆盖顺序取指流，本模块只发送 demand 请求；
 // - critical-word-first 对本模块无意义：IFU 需要整行切指令，首字提前
 //   返回并不能提前解除 IFU 等待，故不做（D 侧 CWF-lite 见 dcache.v）。
 //
 // 端口：
-// - ifu_*   ：取指口（请求/整行返回/取消——取消恒 0 被忽略）
+// - ifu_*   ：取指口（请求/整行返回）
 // - cacop_* ：cache 维护口（commit）
 // - axi_*   ：下层 L2 接口（128bit/拍、行 2 拍，ret_last 标末拍）
 // ============================================================
@@ -50,13 +47,12 @@ module icache (
 
     // ---------------- IFU 取指口 ----------------
     input  wire        ifu_req_i,        // 取指请求（保持至 addr_ok）
-    input  wire [31:0] ifu_vaddr_i,      // 虚地址（VIPT 索引）
+    input  wire [11:5] ifu_vindex_i,     // 虚地址页内 index（VIPT 索引）
     input  wire [31:0] ifu_paddr_i,      // 物理地址（tag 比对）
     input  wire        ifu_uncached_i,   // 非缓存取指
     output wire        ifu_addr_ok_o,    // 请求被接收
     output wire        ifu_data_ok_o,    // 整行数据有效（一拍）
     output wire [`CACHE_LINE_BITS-1:0] ifu_rline_o, // 整行指令数据
-    input  wire        ifu_cancel_i,     // 冲刷作废在途（IFU 恒 0，本实现忽略）
 
     // ---------------- cache 维护口（commit 提交级驱动）----------------
     input  wire        cacop_en_i,
@@ -187,7 +183,7 @@ assign axi_rd_addr = (state == S_RREQ) ? {req_paddr[31:`CACHE_LINE_W], {`CACHE_L
 // ---------------- BRAM 控制 ----------------
 // 读：IDLE 接受拍（VIPT：index 取自 vaddr）；写：refill 末拍整行安装
 wire [IDXW-1:0] rd_set_idle = cacop_take ? cacop_pend_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]
-                                         : ifu_vaddr_i[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
+                                         : ifu_vindex_i;
 assign ram_re = cacop_take || req_take;
 
 wire [LINEW-1:0] refill_line = {axi_ret_data, refill_b0};
@@ -330,9 +326,6 @@ initial begin
     for (ri = 0; ri < NSET; ri = ri + 1) rr_ptr[ri] = 2'b0;
 end
 
-// lint 吸收（cancel 端口按约定忽略：IFU 自行配对丢弃过期返回）
-wire icache_lint = ifu_cancel_i;
-
 `ifdef SYNTHESIS
 // synthesis translate_off
 // 仿真性能统计：cached LOOKUP 访问 / 命中（不含 uncached/cacop）
@@ -342,6 +335,12 @@ reg [63:0] ic_lookup_total;
 reg [63:0] ic_lookup_cached_total;
 reg [63:0] ic_lookup_uncached_total;
 reg [63:0] ic_lookup_cacop_total;
+// I$ miss 服务延迟（进 S_RREQ → 进 S_RESP）
+reg [15:0] ic_miss_age;
+reg [63:0] ic_miss_lat_sum;
+reg [63:0] ic_miss_n;
+reg [15:0] ic_miss_lat_max;
+reg [2:0]  ic_state_r;
 always @(posedge clk) begin
     if (!resetn) begin
         ic_access_total <= 64'd0;
@@ -350,18 +349,37 @@ always @(posedge clk) begin
         ic_lookup_cached_total <= 64'd0;
         ic_lookup_uncached_total <= 64'd0;
         ic_lookup_cacop_total <= 64'd0;
-    end else if ((state == S_LOOKUP) && !req_is_cacop && !req_uncached) begin
-        ic_access_total <= ic_access_total + 64'd1;
-        ic_lookup_total <= ic_lookup_total + 64'd1;
-        ic_lookup_cached_total <= ic_lookup_cached_total + 64'd1;
-        if (hit_any)
-            ic_hit_total <= ic_hit_total + 64'd1;
-    end else if (state == S_LOOKUP) begin
-        ic_lookup_total <= ic_lookup_total + 64'd1;
-        if (req_is_cacop)
-            ic_lookup_cacop_total <= ic_lookup_cacop_total + 64'd1;
-        else if (req_uncached)
-            ic_lookup_uncached_total <= ic_lookup_uncached_total + 64'd1;
+        ic_miss_age     <= 16'd0;
+        ic_miss_lat_sum <= 64'd0;
+        ic_miss_n       <= 64'd0;
+        ic_miss_lat_max <= 16'd0;
+        ic_state_r      <= S_IDLE;
+    end else begin
+        ic_state_r <= state;
+        if ((state == S_LOOKUP) && !req_is_cacop && !req_uncached) begin
+            ic_access_total <= ic_access_total + 64'd1;
+            ic_lookup_total <= ic_lookup_total + 64'd1;
+            ic_lookup_cached_total <= ic_lookup_cached_total + 64'd1;
+            if (hit_any)
+                ic_hit_total <= ic_hit_total + 64'd1;
+        end else if (state == S_LOOKUP) begin
+            ic_lookup_total <= ic_lookup_total + 64'd1;
+            if (req_is_cacop)
+                ic_lookup_cacop_total <= ic_lookup_cacop_total + 64'd1;
+            else if (req_uncached)
+                ic_lookup_uncached_total <= ic_lookup_uncached_total + 64'd1;
+        end
+        // miss latency：LOOKUP→RREQ 启动计时，RDATA→RESP 结算
+        if ((state == S_RREQ) && (ic_state_r != S_RREQ))
+            ic_miss_age <= 16'd0;
+        else if (((state == S_RREQ) || (state == S_RDATA)) && (ic_miss_age != 16'hffff))
+            ic_miss_age <= ic_miss_age + 16'd1;
+        if ((state == S_RESP) && (ic_state_r == S_RDATA)) begin
+            ic_miss_n       <= ic_miss_n + 64'd1;
+            ic_miss_lat_sum <= ic_miss_lat_sum + {48'd0, ic_miss_age};
+            if (ic_miss_age > ic_miss_lat_max)
+                ic_miss_lat_max <= ic_miss_age;
+        end
     end
 end
 // synthesis translate_on

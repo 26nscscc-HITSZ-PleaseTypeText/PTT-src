@@ -3,12 +3,13 @@
 // ============================================================
 // exception_Decoder 模块（异常优先级编码器，纯组合）
 // ------------------------------------------------------------
-// 功能（新架构下角色不变，作为 csr_exception_commit_handler 的内部工具）：
+// 功能（csr_exception_commit_handler 的内部组合编码器）：
 // - 把 commit 提交级送来的各异常 valid 信号按优先级编码成 8 位 Ecode 与
 //   Esubcode，供 CSR 写 ESTAT/选择异常入口使用。
-// - 优先级（高 -> 低，与下方链式选择一致）：INT > ADEF > TLBR/PIF/PPI
-//   （TLBR/PPI 位取指访存共用，见尾注）> INE > IPE > SYS/BRK > ALE/ADEM
+// - 优先级（高 -> 低，与下方链式选择一致）：INT > ADEF > ALE > TLBR/PIF/PPI
+//   （TLBR/PPI 位取指访存共用，见尾注）> INE > IPE > SYS/BRK > ADEM
 //   > 访存页异常（PIL/PIS/PME）。
+//   ALE 置于 TLBR 之前：与 LSU「ALE 不发翻译」配套，防止同拍漏网时报成 TLBR。
 //   注意：commit 每次只会送一条指令的异常（双提交时异常指令必单提交），
 //   同一条指令多个异常位同时有效时按上述优先级取最高者。
 // ============================================================
@@ -30,6 +31,7 @@ module exception_Decoder (
     assign Ecode =
         INT_valid                      ? `INT_ECODE  :
         ADEF_valid                     ? `ADEF_ECODE :
+        ALE_valid                      ? `ALE_ECODE  :
         TLB_EX_valid[`TLB_EX_TLBR]     ? `TLBR_ECODE :
         TLB_EX_valid[`TLB_EX_PIF]      ? `PIF_ECODE  :
         TLB_EX_valid[`TLB_EX_PPI]      ? `PPI_ECODE  :
@@ -37,7 +39,6 @@ module exception_Decoder (
         IPE_valid                      ? `IPE_ECODE  :
         SYS_valid                      ? `SYS_ECODE  :
         BRK_valid                      ? `BRK_ECODE  :
-        ALE_valid                      ? `ALE_ECODE  :
         ADEM_valid                     ? `ADEM_ECODE :
         TLB_EX_valid[`TLB_EX_PIL]      ? `PIL_ECODE  :
         TLB_EX_valid[`TLB_EX_PIS]      ? `PIS_ECODE  :
@@ -46,12 +47,12 @@ module exception_Decoder (
 
     // 仅 ADEM 需要 ESUBCODE=1（与 ADEF 同 ECODE=0x8 靠子码区分）
     assign Esubcode =
-        ADEM_valid && !INT_valid && !ADEF_valid
+        ADEM_valid && !INT_valid && !ADEF_valid && !ALE_valid
                    && !TLB_EX_valid[`TLB_EX_TLBR]
                    && !TLB_EX_valid[`TLB_EX_PIF]
                    && !TLB_EX_valid[`TLB_EX_PPI]
                    && !INE_valid && !IPE_valid
-                   && !SYS_valid && !BRK_valid && !ALE_valid
+                   && !SYS_valid && !BRK_valid
                    ? `ADEM_ESUBCODE : 1'b0;
 
 // ------------------------------------------------------------

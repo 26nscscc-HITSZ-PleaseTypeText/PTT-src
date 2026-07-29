@@ -3,8 +3,8 @@
 // ============================================================
 // l2cache 模块（L2 统一缓存：I$/D$ 共享的第二级缓存）
 // ------------------------------------------------------------
-// 几何与协议（原 TODO 1，按 32B 行全量重写）：
-// - `L2_NWAY(2) 路 × `L2_NSET(2048) 组 × 32B 行 = 128KB（V3.4；原 512→32KB），写回法 + 脏位；
+// 几何与协议：
+// - `L2_NWAY(2) 路 × `L2_NSET(2048) 组 × 32B 行 = 128KB，写回法并记录脏位；
 // - 行协议（与 L1/axi_line_bridge 一致）：
 //   * 读 type=100：rd_rdy 接受后 2 拍 128b 返回（ret_last 末拍）；
 //   * 写 type=100：beat0 持 req 等 wr_rdy（接受拍 ack），beat1 次拍直推；
@@ -19,7 +19,7 @@
 //   D 侧 miss 走主 FSM 内联重填（victim 脏先写回）；I 侧 miss 移交
 //   "I-miss 引擎"后主 FSM 立即空闲（见下），实现 I/D 重填并行。
 //
-// 【二期】I-miss 引擎 + 双 outstanding（原 TODO 4）：
+// I-miss 引擎与双 outstanding：
 // - 本模块有两个下游读口：mem_rd_*（D 侧/旁路，接桥 dc 通道，ARID=1）、
 //   mem2_rd_*（I 侧引擎专用，接桥 ic 通道，ARID=0）；
 // - I 行读 LOOKUP miss（victim 干净或先经主 FSM 写回脏 victim）后，
@@ -32,26 +32,27 @@
 //   再进 LOOKUP 即命中）；I 读 miss 撞上引擎在飞（不同组）时不给 rdy，
 //   上游保持请求自动重试（无等待状态，绝不阻塞 D 流量）。
 //
-// 【二期】next-line I 侧预取（原 TODO 2，修复旧竞态后重启）：
+// next-line I 侧预取：
 // - I 侧 demand（命中/重填完成）后武装"下一行"预取（不跨 4KB 页）；
 // - 预取只在【完全空闲拍】进入主 FSM 查表（优先级最低），命中/VB 命中/
-//   victim 脏/引擎忙 一律丢弃——查表后最多占引擎做一次干净重填，
-//   绝不做写回、绝不占用等待状态，从结构上消除了旧实现
-//   "S_WAIT_MSHR 饿死 D$ 写回"的竞态（旧 bug：pf_can_start=0 的原因）；
+//   victim 脏/引擎忙一律丢弃；查表后最多占引擎做一次干净重填，
+//   绝不做写回，也不占用等待状态，避免预取阻塞 D$ 写回；
 // - 顺序取指流中，下一行 demand 到来时若其预取仍在飞（同组被拦在授予级），
 //   等待安装完成后进 LOOKUP 直接命中——预取的访存延迟已被重叠掉。
 //
-// 【三期】victim buffer（原 TODO 3）：
+// victim buffer：
 // - 4 项全相联，存"L1 换出且 L2 未命中"的整行（行写 miss 直通内存的
 //   同时旁挂一份）；行读 miss 先查 VB，命中当拍锁存、2 拍回行；
 // - 不变量：VB 与 L2 主体不同时持有同一行（安装/重填时清对应 VB 项），
-//   避免"L2 干净换出后读到 VB 陈旧副本"；
-// - uncached 写命中 L2 行或 VB 行时失效对应副本（防混用 cached/uncached
-//   造成陈旧数据，与旧实现 bypass_line_inval 同语义）。
+//   避免 L2 干净换出后读到 VB 陈旧副本；
+// - uncached 写命中 L2 行或 VB 行时失效对应副本，防止 cached/uncached
+//   混用时读到陈旧数据。
 //
 // cacop 写回（dc_wr_cacop=1 的行写）：写穿语义——L2 命中则更新数据并
 // 清脏位，且无论命中与否都直通写到内存（Linux 下 DMA/外设一致性要求
-// 脏行真正落到 RAM，而不是停在 L2）。
+// 脏行真正落到 RAM，而不是停在 L2）。随后 D$ 通过 dc_cacop_* 发起同一
+// 物理行的地址型维护：L2 命中脏行则先写回，命中干净行直接无效，同时
+// 清除 victim buffer 同行；done 仅在维护全部完成后返回。
 // ============================================================
 module l2cache (
     input  wire         clk,
@@ -76,10 +77,15 @@ module l2cache (
     input  wire         dc_wr_req,
     input  wire [2:0]   dc_wr_type,
     input  wire [31:0]  dc_wr_addr,
-    input  wire [15:0]  dc_wr_strb,
+    input  wire [3:0]   dc_wr_strb,   // 仅 uncached 单拍写使用；行写为整行
     input  wire [127:0] dc_wr_data,
     input  wire         dc_wr_cacop,
     output wire         dc_wr_rdy,
+
+    // ---------------- D$ 地址型维护口（Hit Writeback + Invalidate）----------------
+    input  wire         dc_cacop_req,
+    input  wire [31:0]  dc_cacop_addr,
+    output wire         dc_cacop_done,
 
     // ---------------- 下游读口 0（D 侧/旁路，接桥 dc 通道 ARID=1）----------------
     output wire         mem_rd_req,
@@ -103,13 +109,13 @@ module l2cache (
     output wire         mem_wr_req,
     output wire [2:0]   mem_wr_type,
     output wire [31:0]  mem_wr_addr,
-    output wire [15:0]  mem_wr_strb,
+    output wire [3:0]   mem_wr_strb,
     output wire [127:0] mem_wr_data,
     input  wire         mem_wr_rdy
 );
 
 localparam NWAY  = `L2_NWAY;     // 2
-localparam NSET  = `L2_NSET;     // 2048（V3.4）
+localparam NSET  = `L2_NSET;     // 2048
 localparam IDXW  = `L2_INDEX_W;
 localparam TAGW  = `L2_TAG_W;
 localparam LINEW = `CACHE_LINE_BITS;
@@ -131,6 +137,7 @@ localparam S_BYP_RREQ = 4'd11;   // uncached 读旁路
 localparam S_BYP_RDATA= 4'd12;
 localparam S_BYP_RET  = 4'd13;
 localparam S_BYP_WREQ = 4'd14;   // uncached 写旁路（rdy=完成）
+localparam S_CAC_DONE = 4'd15;   // 地址型维护完成脉冲
 
 reg [3:0] state;
 
@@ -144,14 +151,14 @@ localparam IM_RET1    = 3'd5;
 
 reg [2:0]       im_state;
 reg             im_attach;       // 1=有上游取指在等（demand），0=纯预取
-reg [31:0]      im_addr;         // 行对齐地址
-reg [1:0]       im_way_r;        // NWAY=2 实际只用 [0]
+reg [31:5]      im_line_addr;    // 行地址
+reg             im_way_r;        // NWAY=2，0/1 选择安装路
 reg [127:0]     im_b0;
 reg [LINEW-1:0] im_line;
 
 wire im_busy = (im_state != IM_IDLE);
-wire [IDXW-1:0] im_set = im_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
-wire [TAGW-1:0] im_tag = im_addr[31:IDXW+`CACHE_LINE_W];
+wire [IDXW-1:0] im_set = im_line_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
+wire [TAGW-1:0] im_tag = im_line_addr[31:IDXW+`CACHE_LINE_W];
 
 // ---------------- 存储（推断 BRAM：每路 tag + data）----------------
 // tag 条目：{valid, dirty, tag[TAGW-1:0]}
@@ -187,6 +194,7 @@ reg        req_is_rd;       // 1=读 0=写
 reg        req_is_line;
 reg        req_is_pf;       // 预取查表（丢结果，不回上游）
 reg        req_cacop;       // cacop 写回（写穿语义）
+reg        req_is_maint;    // D$ 下传的 L2 地址型写回/无效
 reg [31:0] req_addr;
 reg [2:0]  req_type;
 reg [255:0] req_wline;      // 行写数据（2 拍拼）
@@ -250,8 +258,9 @@ reg [31:0] pf_addr;
 // 只在 4KB 页内预取（跨页物理地址不连续，且可能触碰未映射区域）
 wire [31:0] req_next_line = {req_addr[31:5], 5'b0} + 32'h20;
 wire        req_pf_ok     = (req_addr[11:5] != 7'h7f);
-wire [31:0] im_next_line  = {im_addr[31:5], 5'b0} + 32'h20;
-wire        im_pf_ok      = (im_addr[11:5] != 7'h7f);
+wire [31:5] im_next_line_addr = im_line_addr + 27'd1;
+wire [31:0] im_next_line  = {im_next_line_addr, 5'b0};
+wire        im_pf_ok      = (im_line_addr[11:5] != 7'h7f);
 
 // ---------------- 仲裁（IDLE 拍）----------------
 // 同组冲突：引擎在飞期间同 index 请求不接受（防安装/替换互踩）
@@ -266,11 +275,15 @@ wire grant_base  = (state == S_IDLE) && !initing && !ram_port_busy;
 wire wr_want     = dc_wr_req && !wr_set_conf;
 wire dcrd_want   = dc_rd_req && !dcrd_set_conf;
 wire icrd_want   = ic_rd_req && !icrd_set_conf;
-wire grant_wr    = grant_base && wr_want;
-wire grant_dc_rd = grant_base && !wr_want && dcrd_want && (!icrd_want ||  rr_rd_dc);
-wire grant_ic_rd = grant_base && !wr_want && icrd_want && (!dcrd_want || !rr_rd_dc);
+// 维护等待 I-miss 引擎完全静默，防止同行在无效后又被后台安装。
+wire grant_cacop = grant_base && dc_cacop_req && !im_busy;
+wire grant_wr    = grant_base && !dc_cacop_req && wr_want;
+wire grant_dc_rd = grant_base && !dc_cacop_req && !wr_want
+                 && dcrd_want && (!icrd_want ||  rr_rd_dc);
+wire grant_ic_rd = grant_base && !dc_cacop_req && !wr_want
+                 && icrd_want && (!dcrd_want || !rr_rd_dc);
 // 预取最低优先：任何上游请求（含被同组冲突压住的）在场都不进
-wire grant_pf    = grant_base && !dc_wr_req && !dc_rd_req && !ic_rd_req
+wire grant_pf    = grant_base && !dc_cacop_req && !dc_wr_req && !dc_rd_req && !ic_rd_req
                 && pf_armed && !im_busy;
 
 // ---------------- 上行握手 ----------------
@@ -278,6 +291,7 @@ wire grant_pf    = grant_base && !dc_wr_req && !dc_rd_req && !ic_rd_req
 assign dc_wr_rdy = (grant_wr && (dc_wr_type == 3'b100))
                  | ((state == S_BYP_WREQ) && mem_wr_rdy);
 assign dc_rd_rdy = grant_dc_rd;
+assign dc_cacop_done = (state == S_CAC_DONE);
 
 // ic 读的 rdy 推迟到 LOOKUP 拍（mealy）——只有当拍能"定去向"才接受：
 // 命中/VB 命中/移交引擎/uncached 旁路；引擎忙（必为不同组，同组请求
@@ -314,7 +328,7 @@ assign mem_rd_addr = (state == S_MRREQ) ? {req_addr[31:`CACHE_LINE_W], {`CACHE_L
 
 assign mem2_rd_req  = (im_state == IM_RREQ);
 assign mem2_rd_type = 3'b100;
-assign mem2_rd_addr = {im_addr[31:`CACHE_LINE_W], {`CACHE_LINE_W{1'b0}}};
+assign mem2_rd_addr = {im_line_addr, {`CACHE_LINE_W{1'b0}}};
 
 assign mem_wr_req  = (state == S_MWB0) || (state == S_MWB1)
                    || (state == S_WFWD0) || (state == S_WFWD1)
@@ -328,10 +342,11 @@ assign mem_wr_data = (state == S_MWB0)  ? victim_line_r[127:0]
                    : (state == S_WFWD0) ? req_wline[127:0]
                    : (state == S_WFWD1) ? req_wline[255:128]
                    : uc_wdata;
-assign mem_wr_strb = (state == S_BYP_WREQ) ? {12'b0, uc_strb} : 16'hffff;
+assign mem_wr_strb = (state == S_BYP_WREQ) ? uc_strb : 4'hf;
 
 // ---------------- BRAM 控制 ----------------
-wire [IDXW-1:0] idle_set = grant_wr    ? dc_wr_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]
+wire [IDXW-1:0] idle_set = grant_cacop ? dc_cacop_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]
+                         : grant_wr    ? dc_wr_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]
                          : grant_dc_rd ? dc_rd_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]
                          : grant_ic_rd ? ic_rd_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]
                                        : pf_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
@@ -340,10 +355,12 @@ wire [IDXW-1:0] idle_set = grant_wr    ? dc_wr_addr[IDXW+`CACHE_LINE_W-1:`CACHE_
 wire refill_wr_en = (state == S_MRDATA) && mem_ret_valid && mem_ret_last;
 wire whit_wr_en   = (state == S_LOOKUP) && !req_is_rd && req_is_line && hit_any;
 // uncached 写命中 L2 行：失效（防 cached/uncached 混用读到陈旧行）
-wire ucw_inval_en = (state == S_LOOKUP) && !req_is_rd && !req_is_line && hit_any;
+wire ucw_inval_en = (state == S_LOOKUP) && !req_is_maint
+                  && !req_is_rd && !req_is_line && hit_any;
+wire maint_inval_en = (state == S_LOOKUP) && req_is_maint && hit_any;
 // 引擎安装拍：主 FSM 无任何 RAM 活动时插队
 wire im_install_fire = (im_state == IM_INSTALL) && !initing
-                    && !refill_wr_en && !whit_wr_en && !ucw_inval_en
+                    && !refill_wr_en && !whit_wr_en && !ucw_inval_en && !maint_inval_en
                     && (state != S_WCAP)
                     && !(grant_wr || grant_dc_rd || grant_ic_rd || grant_pf);
 
@@ -361,10 +378,15 @@ always @(*) begin
     end else if (im_install_fire) begin
         // I-miss 引擎安装（干净行）
         ram_addr             = im_set;
-        data_we[im_way_r[0]] = 1'b1;
+        data_we[im_way_r]    = 1'b1;
         data_wdata           = im_line;
-        tag_we[im_way_r[0]]  = 1'b1;
+        tag_we[im_way_r]     = 1'b1;
         tag_wdata            = {1'b1, 1'b0, im_tag};
+    end else if (maint_inval_en) begin
+        // DMA 地址型维护：数据若为脏已在 FSM 捕获，tag 当拍先无效。
+        ram_addr            = req_set;
+        tag_we[hit_way]     = 1'b1;
+        tag_wdata           = {(TAGW+2){1'b0}};
     end else if (whit_wr_en) begin
         // 行写命中：整行更新；普通写置脏，cacop 写穿保持干净（数据同时直通内存）
         ram_addr            = req_set;
@@ -383,7 +405,8 @@ always @(*) begin
         data_wdata           = {mem_ret_data, refill_b0};
         tag_we[victim_way_r] = 1'b1;
         tag_wdata            = {1'b1, 1'b0, req_tag};
-    end else if ((grant_wr && (dc_wr_type == 3'b100)) || grant_dc_rd || grant_ic_rd || grant_pf) begin
+    end else if (grant_cacop || (grant_wr && (dc_wr_type == 3'b100))
+              || grant_dc_rd || grant_ic_rd || grant_pf) begin
         // 接受新请求拍发读（uncached 写也查表：为的是命中失效）
         ram_re   = 1'b1;
         ram_addr = idle_set;
@@ -402,16 +425,19 @@ end
 // 安装：行写 LOOKUP miss（普通写回/无 cacop 皆存；数据为完整新行）
 wire vb_install_en = (state == S_LOOKUP) && !req_is_rd && req_is_line && !hit_any;
 // 失效：行安装进 L2（引擎安装 / D 重填）、uncached 写命中 VB 行
-wire [26:0] im_line_key     = im_addr[31:5];
+wire [26:0] im_line_key     = im_line_addr;
 wire [26:0] refill_line_key = req_addr[31:5];
 wire [VB_N-1:0] vb_clr_im;
 wire [VB_N-1:0] vb_clr_refill;
 wire [VB_N-1:0] vb_clr_ucw;
+wire [VB_N-1:0] vb_clr_maint;
 generate
 for (gv = 0; gv < VB_N; gv = gv + 1) begin : gen_vb_clr
     assign vb_clr_im[gv]     = im_install_fire && vb_valid[gv] && (vb_addr[gv] == im_line_key);
     assign vb_clr_refill[gv] = refill_wr_en    && vb_valid[gv] && (vb_addr[gv] == refill_line_key);
     assign vb_clr_ucw[gv]    = (state == S_LOOKUP) && !req_is_rd && !req_is_line
+                             && vb_valid[gv] && (vb_addr[gv] == req_line_key);
+    assign vb_clr_maint[gv]  = (state == S_LOOKUP) && req_is_maint
                              && vb_valid[gv] && (vb_addr[gv] == req_line_key);
 end
 endgenerate
@@ -422,7 +448,7 @@ always @(posedge clk) begin
         vb_valid <= {VB_N{1'b0}};
         vb_ptr   <= 2'b0;
     end else begin
-        vb_valid <= vb_valid & ~(vb_clr_im | vb_clr_refill | vb_clr_ucw);
+        vb_valid <= vb_valid & ~(vb_clr_im | vb_clr_refill | vb_clr_ucw | vb_clr_maint);
         if (vb_install_en) begin
             // 同行已有则原位覆盖（保持最新数据），否则 FIFO 替换
             if (vb_hit) begin
@@ -453,17 +479,27 @@ always @(posedge clk) begin
         req_is_line <= 1'b0;
         req_is_pf <= 1'b0;
         req_cacop <= 1'b0;
+        req_is_maint <= 1'b0;
     end else if (initing) begin
         init_set <= init_set + 1'b1;
         if (init_set == {IDXW{1'b1}}) initing <= 1'b0;
     end else begin
         case (state)
             S_IDLE: begin
-                if (grant_wr) begin
+                if (grant_cacop) begin
+                    req_is_rd    <= 1'b0;
+                    req_is_pf    <= 1'b0;
+                    req_is_line  <= 1'b0;
+                    req_cacop    <= 1'b0;
+                    req_is_maint <= 1'b1;
+                    req_addr     <= dc_cacop_addr;
+                    state        <= S_LOOKUP;
+                end else if (grant_wr) begin
                     req_is_rd   <= 1'b0;
                     req_is_pf   <= 1'b0;
                     req_is_line <= (dc_wr_type == 3'b100);
                     req_cacop   <= dc_wr_cacop;
+                    req_is_maint <= 1'b0;
                     req_addr    <= dc_wr_addr;
                     req_type    <= dc_wr_type;
                     if (dc_wr_type == 3'b100) begin
@@ -471,13 +507,14 @@ always @(posedge clk) begin
                         state            <= S_WCAP;
                     end else begin
                         uc_wdata <= dc_wr_data;
-                        uc_strb  <= dc_wr_strb[3:0];
+                        uc_strb  <= dc_wr_strb;
                         state    <= S_LOOKUP;   // 先查表做命中失效，再旁路写
                     end
                 end else if (grant_dc_rd || grant_ic_rd) begin
                     req_is_rd   <= 1'b1;
                     req_is_pf   <= 1'b0;
                     req_cacop   <= 1'b0;
+                    req_is_maint <= 1'b0;
                     req_is_ic   <= grant_ic_rd;
                     rr_rd_dc    <= grant_ic_rd;       // 轮转
                     req_is_line <= grant_ic_rd ? (ic_rd_type == 3'b100) : (dc_rd_type == 3'b100);
@@ -488,6 +525,7 @@ always @(posedge clk) begin
                     req_is_rd   <= 1'b1;
                     req_is_pf   <= 1'b1;
                     req_cacop   <= 1'b0;
+                    req_is_maint <= 1'b0;
                     req_is_ic   <= 1'b1;
                     req_is_line <= 1'b1;
                     req_addr    <= pf_addr;
@@ -503,7 +541,16 @@ always @(posedge clk) begin
             end
 
             S_LOOKUP: begin
-                if (!req_is_rd) begin
+                if (req_is_maint) begin
+                    // tag 已在组合块无效；脏行复用 victim 写回状态落到 RAM。
+                    if (hit_any && tag_out[hit_way][TAGW]) begin
+                        victim_tag_r  <= req_tag;
+                        victim_line_r <= data_out[hit_way];
+                        state         <= S_MWB0;
+                    end else begin
+                        state <= S_CAC_DONE;
+                    end
+                end else if (!req_is_rd) begin
                     if (!req_is_line) begin
                         // uncached 写：命中失效已在组合块完成，转旁路写
                         state <= S_BYP_WREQ;
@@ -570,7 +617,8 @@ always @(posedge clk) begin
             S_MWB0: if (mem_wr_rdy) state <= S_MWB1;
             S_MWB1: begin
                 // I 侧：写回完成拍移交引擎回 IDLE；D 侧：继续内联重填
-                state <= (req_is_ic && req_is_rd) ? S_IDLE : S_MRREQ;
+                state <= req_is_maint ? S_CAC_DONE
+                     : (req_is_ic && req_is_rd) ? S_IDLE : S_MRREQ;
             end
 
             S_MRREQ: if (mem_rd_rdy) state <= S_MRDATA;
@@ -602,6 +650,8 @@ always @(posedge clk) begin
 
             S_BYP_WREQ: if (mem_wr_rdy) state <= S_IDLE;
 
+            S_CAC_DONE: state <= S_IDLE;
+
             default: state <= S_IDLE;
         endcase
 
@@ -631,14 +681,14 @@ always @(posedge clk) begin
     if (!resetn) begin
         im_state  <= IM_IDLE;
         im_attach <= 1'b0;
-        im_addr   <= 32'b0;
-        im_way_r  <= 2'b0;
+        im_line_addr <= 27'b0;
+        im_way_r     <= 1'b0;
     end else begin
         case (im_state)
             IM_IDLE: begin
                 if (im_alloc) begin
-                    im_addr   <= {req_addr[31:5], 5'b0};
-                    im_way_r  <= {1'b0, im_alloc_demand_wb ? victim_way_r : pick_way};
+                    im_line_addr <= req_addr[31:5];
+                    im_way_r     <= im_alloc_demand_wb ? victim_way_r : pick_way;
                     im_attach <= !im_alloc_pf;   // demand 要回数，纯预取只装表
                     im_state  <= IM_RREQ;
                 end
@@ -669,8 +719,28 @@ always @(posedge clk) begin
     end
 end
 
-// lint 吸收
-wire l2_lint = (|dc_wr_strb[15:4]) | im_way_r[1];
+`ifdef SYNTHESIS
+// synthesis translate_off
+// 性能计数：L2 LOOKUP 行读命中和缺失，VB 命中计为 hit。
+reg [63:0] l2_rd_access_total;
+reg [63:0] l2_rd_hit_total;
+reg [63:0] l2_rd_miss_total;
+always @(posedge clk) begin
+    if (!resetn) begin
+        l2_rd_access_total <= 64'd0;
+        l2_rd_hit_total    <= 64'd0;
+        l2_rd_miss_total   <= 64'd0;
+    end else if ((state == S_LOOKUP) && req_is_rd && req_is_line) begin
+        // LOOKUP 单拍决策：行读 hit（含 VB）/ miss
+        l2_rd_access_total <= l2_rd_access_total + 64'd1;
+        if (hit_any || vb_hit)
+            l2_rd_hit_total <= l2_rd_hit_total + 64'd1;
+        else
+            l2_rd_miss_total <= l2_rd_miss_total + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
 
 endmodule
 

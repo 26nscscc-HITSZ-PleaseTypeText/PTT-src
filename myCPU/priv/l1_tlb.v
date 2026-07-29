@@ -4,9 +4,7 @@
 // 功能：
 // - 主 TLB（tlb.v，TLBNUM 项全相联，顶层例化 32 项）的小容量缓存
 //   （ENTRY_NUM=8 项），目的：
-//   主 TLB 全相联比较链很长，是取指/访存关键路径的时序瓶颈；
-//   L1 微表只比较 8 项，命中时组合路径显著缩短（mariver 实证：L1 仅 3 项
-//   已有可观收益）。
+//   主 TLB 全相联比较链较长；L1 微表只比较 8 项，命中时缩短翻译组合路径。
 // - 对软件完全透明（体系结构只看得到主 TLB）；本表只是"翻译结果缓存"。
 // - 工作方式：
 //   * 查询：组合比较 vaddr[31:12]（4KB 页号粒度，含 va_bit12 奇偶页）与各
@@ -17,8 +15,7 @@
 //     变化，缓存展开不值得（Linux 大页占比极低）；
 //   * fence_i：整表一拍失效（TLB 写/无效化/ASID 切换后旧翻译可能失效，
 //     一刀切最简单且绝对安全——失效频率极低，性能无损）。
-//     （V2.3 起 tlbsrch 走主表专用 srch 口，s0/s1 口不再被挪用，
-//      原 dis_refill 屏蔽机制随之删除。）
+//     tlbsrch 使用主表专用 srch 口，s0/s1 始终服务取指和访存查询。
 //
 // 坑点（保留框架提示，均已按此实现）：
 // 1. 本表只是缓存，任何"主表内容可能变化"的时刻（fence_i）必须失效，
@@ -44,7 +41,7 @@ module l1_tlb #(
 
     // ---------------- 上游查询口（tlb_manager，组合）----------------
     input  wire          req_valid_i,
-    input  wire [31:0]   vaddr_i,
+    input  wire [31:12]  vaddr_i,
     output wire          found_o,          // 翻译命中（本表命中 或 主表命中）
     output wire          l1_hit_o,         // 仅微表 CAM 命中（不含主表透传）
     output wire [19:0]   ppn_o,            // 物理页号（4KB 页：paddr = {ppn, vaddr[11:0]}）
@@ -53,6 +50,10 @@ module l1_tlb #(
     output wire          v_o,              // 页有效位
     output wire          d_o,              // 页脏位
     output wire [1:0]    plv_o,            // 页特权等级
+    // 直发专用纯 CAM 锥：仅命中项缓存副本，不含主表透传腿。
+    // 仅 CAM 命中时有意义；供 IFU ftq_direct_req 异常门控摘除主 TLB 归约。
+    output wire          cam_v_o,
+    output wire [1:0]    cam_plv_o,
 
     // ---------------- 下游主 TLB 查询口（连 tlb.v 的 s0 或 s1 口）----------------
     output wire [18:0]   tlb_vppn_o,       // 主表查询 vppn（vaddr[31:13]）
@@ -83,7 +84,7 @@ reg                 e_d    [0:ENTRY_NUM-1];
 reg [1:0]           e_plv  [0:ENTRY_NUM-1];
 reg [PTR_W-1:0]     fifo_ptr;                 // FIFO 替换指针
 
-wire [19:0] q_key = vaddr_i[31:12];
+wire [19:0] q_key = vaddr_i;
 
 // ---------------- 查询（组合，8 项并行比较）----------------
 wire [ENTRY_NUM-1:0] e_hit;
@@ -133,6 +134,9 @@ assign mat_o   = l1_hit ? hit_mat : tlb_mat_i;
 assign v_o     = l1_hit ? hit_v   : tlb_v_i;
 assign d_o     = l1_hit ? hit_d   : tlb_d_i;
 assign plv_o   = l1_hit ? hit_plv : tlb_plv_i;
+// 纯 CAM 锥输出：直接引出命中项缓存，综合器不会把主表 s0_v 独热 mux 算进此锥。
+assign cam_v_o   = hit_v;
+assign cam_plv_o = hit_plv;
 
 // ---------------- 回填（FIFO 替换）----------------
 // 条件：真实查询 miss + 主表命中 + 4KB 页 + 未被 fence 屏蔽。

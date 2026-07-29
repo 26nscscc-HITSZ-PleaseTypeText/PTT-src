@@ -4,16 +4,16 @@
 // 功能：
 // - 把一条 32bit 指令译成乱序后端所需的统一 uop 信息：
 //   * FU 类型（决定进哪个保留站）：FU_ALU / FU_MEM / FU_MDU
-//   * 各类操作码（alu_op/br_op/mem_op/csr_op/tlb_op/wb_src_op，沿用原独热体系）
+//   * 各类操作码（alu_op/br_op/mem_op/csr_op/tlb_op 为独热，wb_src_op 为紧凑独热）
 //   * 源/目的寄存器（src0=rj 类，src1=rk/rd 类）、是否使用、是否写回
 //   * 立即数与分支偏移
 //   * 特权/特殊提交类标记 priv_vec（csr写/ertn/tlb维护/cacop/idle/ll/sc/ibar）
 //   * 译码异常（INE/SYS/BRK/IPE）
-// - 内部例化并复用旧五级流水的译码工具（inst_dec / op_dec /
-//   imm_generator / get_reg_read_addr），这些模块的指令识别逻辑可整体复用。
+// - inst_dec 识别指令，op_dec 生成独热操作码，imm_generator 生成立即数；
+// - 源寄存器地址在本模块根据 rj/rk/rd 字段直接选择。
 //
 // 端口：
-// - inst_i / pc_i      ：指令与 PC
+// - inst_i             ：待译码指令
 // - csr_plv_i          ：当前特权级（检测 IPE：用户态执行特权指令）
 // - csr_llbit_i        ：LLBIT 当前值（sc.w 译码期按其选择「真写/假写」路径）
 // - 输出 uop 各字段（全组合）
@@ -22,7 +22,6 @@
 
 module decoder(
     input  wire [31:0]                inst_i,
-    input  wire [31:0]                pc_i,
     input  wire [1:0]                 csr_plv_i,         // 当前特权级（CRMD.PLV）
     input  wire                       csr_llbit_i,       // 当前 LLBIT（sc.w 行为选择）
 
@@ -182,7 +181,6 @@ wire [`MEM_OP_NUM-1:0]   mem_op_raw;
 wire [`CSR_OP_NUM-1:0]   csr_op_raw;
 wire [`TLB_OP_NUM-1:0]   tlb_op_raw;
 wire [`WB_SRC_NUM-1:0]   wb_src_op_raw;
-wire [`CACHE_OP_NUM-1:0] cache_op_raw;
 wire                     inst_known;
 
 op_dec u_op_dec(
@@ -217,65 +215,37 @@ op_dec u_op_dec(
     .inst_preld(inst_preld), .inst_cpucfg(inst_cpucfg),
     .alu_op(alu_op_raw), .br_op(br_op_raw), .mem_op(mem_op_raw),
     .csr_op(csr_op_raw), .wb_src_op(wb_src_op_raw), .tlb_op(tlb_op_raw),
-    .cache_op(cache_op_raw), .inst_known(inst_known)
+    .inst_known(inst_known)
 );
 
 wire [31:0] imm_raw;
 wire [31:0] br_offs_raw;
 
 imm_generator u_imm_generator(
-    .inst(inst_i),
-    .inst_add_w(inst_add_w), .inst_addi_w(inst_addi_w), .inst_slti(inst_slti),
+    .inst(inst_i[25:0]),
+    .inst_addi_w(inst_addi_w), .inst_slti(inst_slti),
     .inst_sltui(inst_sltui), .inst_andi(inst_andi), .inst_ori(inst_ori),
-    .inst_xori(inst_xori), .inst_sub_w(inst_sub_w), .inst_ld_w(inst_ld_w),
+    .inst_xori(inst_xori), .inst_ld_w(inst_ld_w),
     .inst_ld_h(inst_ld_h), .inst_ld_b(inst_ld_b), .inst_ld_hu(inst_ld_hu),
     .inst_ld_bu(inst_ld_bu), .inst_st_w(inst_st_w), .inst_st_b(inst_st_b),
-    .inst_st_h(inst_st_h), .inst_bne(inst_bne), .inst_slt(inst_slt),
-    .inst_sltu(inst_sltu), .inst_and(inst_and), .inst_or(inst_or),
-    .inst_nor(inst_nor), .inst_xor(inst_xor), .inst_slli_w(inst_slli_w),
+    .inst_st_h(inst_st_h), .inst_bne(inst_bne), .inst_slli_w(inst_slli_w),
     .inst_srli_w(inst_srli_w), .inst_srai_w(inst_srai_w), .inst_b(inst_b),
     .inst_bl(inst_bl), .inst_beq(inst_beq), .inst_blt(inst_blt),
     .inst_bge(inst_bge), .inst_bltu(inst_bltu), .inst_bgeu(inst_bgeu),
     .inst_jirl(inst_jirl), .inst_lu12i_w(inst_lu12i_w),
     .inst_pcaddu12i(inst_pcaddu12i), .inst_ll_w(inst_ll_w), .inst_sc_w(inst_sc_w),
-    .inst_pcaddi(inst_pcaddi), .inst_preld(inst_preld),
+    .inst_pcaddi(inst_pcaddi), .inst_preld(inst_preld), .inst_cacop(inst_cacop),
     .alu_imm(imm_raw), .br_imm(br_offs_raw)
 );
 
 wire [4:0] src0_addr_raw;
 wire [4:0] src1_addr_raw;
 
-get_reg_read_addr u_get_reg_read_addr(
-    .reset(1'b0), .inst(inst_i),
-    .inst_add_w(inst_add_w), .inst_addi_w(inst_addi_w), .inst_slti(inst_slti),
-    .inst_sltui(inst_sltui), .inst_andi(inst_andi), .inst_ori(inst_ori),
-    .inst_xori(inst_xori), .inst_sub_w(inst_sub_w), .inst_ld_w(inst_ld_w),
-    .inst_ld_h(inst_ld_h), .inst_ld_b(inst_ld_b), .inst_ld_hu(inst_ld_hu),
-    .inst_ld_bu(inst_ld_bu), .inst_st_w(inst_st_w), .inst_st_b(inst_st_b),
-    .inst_st_h(inst_st_h), .inst_bne(inst_bne), .inst_slt(inst_slt),
-    .inst_sltu(inst_sltu), .inst_and(inst_and), .inst_or(inst_or),
-    .inst_nor(inst_nor), .inst_xor(inst_xor), .inst_slli_w(inst_slli_w),
-    .inst_srli_w(inst_srli_w), .inst_srai_w(inst_srai_w), .inst_sll_w(inst_sll_w),
-    .inst_srl_w(inst_srl_w), .inst_sra_w(inst_sra_w), .inst_b(inst_b),
-    .inst_bl(inst_bl), .inst_beq(inst_beq), .inst_blt(inst_blt),
-    .inst_bge(inst_bge), .inst_bltu(inst_bltu), .inst_bgeu(inst_bgeu),
-    .inst_jirl(inst_jirl), .inst_lu12i_w(inst_lu12i_w),
-    .inst_pcaddu12i(inst_pcaddu12i), .inst_mul_w(inst_mul_w),
-    .inst_mulh_w(inst_mulh_w), .inst_mulh_wu(inst_mulh_wu),
-    .inst_div_w(inst_div_w), .inst_div_wu(inst_div_wu), .inst_mod_w(inst_mod_w),
-    .inst_mod_wu(inst_mod_wu), .inst_ertn(inst_ertn), .inst_syscall(inst_syscall),
-    .inst_break(inst_break), .inst_rdcntvl_w(inst_rdcntvl_w),
-    .inst_rdcntvh_w(inst_rdcntvh_w), .inst_rdcntid(inst_rdcntid),
-    .inst_csrrd(inst_csrrd), .inst_csrwr(inst_csrwr), .inst_csrxchg(inst_csrxchg),
-    .inst_tlbsrch(inst_tlbsrch), .inst_tlbrd(inst_tlbrd), .inst_tlbwr(inst_tlbwr),
-    .inst_tlbfill(inst_tlbfill), .inst_invtlb_0(inst_invtlb_0),
-    .inst_invtlb_1(inst_invtlb_1), .inst_invtlb_2(inst_invtlb_2),
-    .inst_invtlb_3(inst_invtlb_3), .inst_invtlb_4(inst_invtlb_4),
-    .inst_invtlb_5(inst_invtlb_5), .inst_invtlb_6(inst_invtlb_6),
-    .inst_cacop(inst_cacop), .inst_ll_w(inst_ll_w), .inst_sc_w(inst_sc_w),
-    .inst_andn(inst_andn), .inst_orn(inst_orn), .inst_preld(inst_preld),
-    .inst_cpucfg(inst_cpucfg), .rf_raddr1(src0_addr_raw), .rf_raddr2(src1_addr_raw)
-);
+wire src1_reg_is_rd = inst_st_w | inst_beq | inst_bne | inst_st_b | inst_st_h |
+                      inst_blt | inst_bge | inst_bltu | inst_bgeu |
+                      inst_csrwr | inst_csrxchg | inst_sc_w;
+assign src0_addr_raw = inst_i[9:5];
+assign src1_addr_raw = src1_reg_is_rd ? inst_i[4:0] : inst_i[14:10];
 
 wire [4:0] rd = inst_i[4:0];
 wire [4:0] rj = inst_i[9:5];
@@ -308,7 +278,7 @@ assign futype_o[`FU_ALU] = ~(fu_mdu | fu_mem);
 assign futype_o[`FU_MEM] = fu_mem;
 assign futype_o[`FU_MDU] = fu_mdu;
 
-assign csr_num_o = {2'b00, inst_i[23:10]};
+assign csr_num_o = inst_i[23:10];
 assign cacop_code_o = inst_i[4:0];
 // 源寄存器地址透传；是否真正使用由下方 use_src*_o 决定（rename 据此查 RAT/等操作数）。
 assign src0_addr_o = src0_addr_raw;
@@ -379,10 +349,11 @@ assign is_nop_o = (inst_andi && (rd == 5'd0) && (rj == 5'd0) && (inst_i[21:10] =
 assign is_load_o = is_load_raw;
 assign is_store_o = is_store_raw;
 
-// IPE 特权指令集合。cacop 在手册上属特权，但 chiplab NEMU/func_lab19 n52
-// TEST9 在 PLV3 下执行 cacop 且不注入 IPE（仅测「不应 ADEF」）；列入会导致
-// ecode=IPE vs REF 无异常。仍经 priv_vec PRIV_CACOP 走单提交/落地。
-wire privileged_inst = inst_csr_any | inst_tlb_any | inst_ertn | inst_idle;
+// IPE：与 chiplab NEMU exec_cacop 对齐——
+//   Index/StoreTag（inst[4:3]=00/01）在 PLV3 → IPE；
+//   Hit 类（10/11，lab19 n52 TEST9）→ 不注入 IPE。
+wire cacop_ipe = inst_cacop && ~inst_i[4]; // [4:3] 为 0x / 即 00 或 01
+wire privileged_inst = inst_csr_any | inst_tlb_any | inst_ertn | inst_idle | cacop_ipe;
 //异常输出，不认识的指令：INE其他 TLB/访存异常现在 decode 阶段先置 0，后面 IFU/MMU/LSU 再产生。
 assign excp_o[`EXCP_ADEF]   = 1'b0;
 assign excp_o[`EXCP_TLBR_F] = 1'b0;
@@ -399,7 +370,5 @@ assign excp_o[`EXCP_PIL]    = 1'b0;
 assign excp_o[`EXCP_PIS]    = 1'b0;
 assign excp_o[`EXCP_PPI_M]  = 1'b0;
 assign excp_o[`EXCP_PME]    = 1'b0;
-
-wire decoder_unused = |{pc_i, cache_op_raw};
 
 endmodule

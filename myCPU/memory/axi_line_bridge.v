@@ -3,7 +3,7 @@
 // ============================================================
 // axi_line_bridge 模块（cache 行请求 <-> 32bit AXI burst 转换桥）
 // ------------------------------------------------------------
-// 功能（按 32B 行 + AXI 优化全量实现，原 TODO 1~5 均已落地）：
+// 功能（32 B Cache 行与 AXI 事务转换）：
 // - 行读（rd_type=100）：ARLEN=7（8 拍 32bit INCR 突发），每凑满 16B 即向
 //   上游回一拍 128b（第 4 拍 ret_last=0、第 8 拍 ret_last=1，共 2 拍）；
 // - 行写（wr_type=100）：上游 2 拍 128b 进（beat0 在 WR_IDLE 接受拍 ack，
@@ -51,13 +51,12 @@ module axi_line_bridge (
     input  wire        dc_wr_req,
     input  wire [2:0]  dc_wr_type,
     input  wire [31:0] dc_wr_addr,
-    input  wire [15:0] dc_wr_strb,
+    input  wire [3:0]  dc_wr_strb,
     input  wire [127:0] dc_wr_data,
     output wire        dc_wr_rdy,
 
     output wire        axi_awvalid,
     output wire [31:0] axi_awaddr,
-    output wire [2:0]  axi_awburst,
     output wire [3:0]  axi_awlen,
     output wire [2:0]  axi_awsize,
     input  wire        axi_awready,
@@ -69,13 +68,12 @@ module axi_line_bridge (
     input  wire        axi_wready,
 
     input  wire        axi_bvalid,
-    input  wire [1:0]  axi_bresp,
+    input  wire [1:0]  axi_bresp_unused, // 当前不生成 AXI 写错误异常。
     output wire        axi_bready,
 
     output wire        axi_arvalid,
     output wire [3:0]  axi_arid,        // 0=取指(ic) 1=数据(dc)
     output wire [31:0] axi_araddr,
-    output wire [2:0]  axi_arburst,
     output wire [3:0]  axi_arlen,
     output wire [2:0]  axi_arsize,
     input  wire        axi_arready,
@@ -83,7 +81,7 @@ module axi_line_bridge (
     input  wire        axi_rvalid,
     input  wire [3:0]  axi_rid,         // R 返回按 rid 路由到 ic/dc 引擎
     input  wire [31:0] axi_rdata,
-    input  wire [1:0]  axi_rresp,
+    input  wire [1:0]  axi_rresp_unused, // 当前不生成 AXI 读错误异常。
     input  wire        axi_rlast,
     output wire        axi_rready
 );
@@ -373,7 +371,6 @@ assign dc_wr_rdy = wr_take_line
 // ------------------------------------------------------------
 assign axi_awvalid = (wr_state == WR_ISSUE) && aw_pend;
 assign axi_awaddr  = wr_is_line ? {wr_addr_buf[31:`CACHE_LINE_W], {`CACHE_LINE_W{1'b0}}} : wr_addr_buf;
-assign axi_awburst = 3'b001;
 assign axi_awlen   = wr_is_line ? 4'd7 : 4'd0;
 assign axi_awsize  = wr_is_line ? 3'b010 : wr_axsize_buf;
 
@@ -390,7 +387,6 @@ assign axi_arid    = ar_grant_dc ? ARID_DC : ARID_IC;
 assign axi_araddr  = ar_grant_dc
                    ? (dc_is_line ? {dc_addr_buf[31:`CACHE_LINE_W], {`CACHE_LINE_W{1'b0}}} : dc_addr_buf)
                    : (ic_is_line ? {ic_addr_buf[31:`CACHE_LINE_W], {`CACHE_LINE_W{1'b0}}} : ic_addr_buf);
-assign axi_arburst = 3'b001;
 assign axi_arlen   = ar_grant_dc ? (dc_is_line ? 4'd7 : 4'd0)
                                  : (ic_is_line ? 4'd7 : 4'd0);
 assign axi_arsize  = ar_grant_dc ? (dc_is_line ? 3'b010 : dc_axsize_buf)
@@ -399,8 +395,5 @@ assign axi_arsize  = ar_grant_dc ? (dc_is_line ? 3'b010 : dc_axsize_buf)
 // R 接收：按 rid 找到目标引擎，其在收数状态即接收
 assign axi_rready = (r_to_ic && (ic_state == RD_RDATA))
                   | (r_to_dc && (dc_state == RD_RDATA));
-
-// lint 吸收
-wire bridge_lint = (|axi_rresp) | (|axi_bresp);
 
 endmodule

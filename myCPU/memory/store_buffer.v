@@ -15,7 +15,7 @@
 //   * difftest 的 StoreEvent 在 commit 提交点报告（不等本缓冲排空），
 //     与 NEMU 的提交序一致；本缓冲只是写出延迟，软件不可见。
 //
-// 排空规则（V3.4 行合并）：
+// 排空规则（行合并）：
 // - 项内仍保持字粒度（前递不变）；泄流口对 D$ 升为整行
 //   （`CACHE_LINE_BITS` 数据 + `CACHE_LINE_BYTES` 字节使能）。
 // - head 为 cached 时：自 head 向年轻方向连续聚合「同 cache 行、cached」项，
@@ -24,7 +24,12 @@
 // - 严格按程序序写出，绝不乱序（TSO + 设备写序）；
 // - sb_empty："队列空"（done 才清项，inflight 期间项仍 valid）。
 //
-// 前递查询（纯组合，逐字节合并）：同 V2.x —— 字地址匹配、年轻覆盖年老。
+// D$ 的 st_done_o 与 LOOKUP hit/alloc/merge 同拍组合产生，以保持 posted 语义；
+// 本模块将 dc_wr_done_i 寄存一拍后再驱动 pop、inflight 清除和 count，切断路径
+//   req_paddr → miss_need_wb → dc_sb_done → push_fire → data_reg CE。
+// 代价：SB 腾槽/解满晚 1 拍；done 延迟期间 inflight 仍为 1，不会抢发下一笔。
+//
+// 前递查询为纯组合逐字节合并：字地址匹配，年轻项覆盖年老项。
 //
 // 端口：
 // - push_*      ：commit 提交 store 入队（一拍最多 1 条）
@@ -59,7 +64,7 @@ module store_buffer(
     input  wire                dc_wr_done_i,      // 写完成（与一次行写一一配对）
 
     // ---------------- load 前递查询口（LSU，组合）----------------
-    input  wire [31:0]         query_paddr_i,
+    input  wire [31:2]         query_paddr_i,
     input  wire                query_uncached_i,  // 本次查询来自 uncached load
     output wire                query_hit_o,       // 整字（4 字节）可由 SB 合并提供
     output wire [31:0]         query_data_o,      // 前递数据（逐字节取最年轻）
@@ -82,14 +87,22 @@ module store_buffer(
     // addr_ok 时锁存本次弹出项数（防 done 拍组合聚合抖动）
     reg [`SB_W:0]      inflight_n;
 
+    // 完成信号在消费侧打一拍；pop/inflight/count 必须使用同一拍信号。
+    reg                dc_wr_done_r;
+    always @(posedge clk) begin
+        if (reset)
+            dc_wr_done_r <= 1'b0;
+        else
+            dc_wr_done_r <= dc_wr_done_i;
+    end
+
     wire [`SB_W:0]     count_zero = {(`SB_W + 1){1'b0}};
-    wire pop_fire = (count != count_zero) && dc_wr_done_i;
+    wire pop_fire = (count != count_zero) && dc_wr_done_r;
     wire push_fire = push_valid_i && (!sb_full_o || pop_fire);
 
     // ------------------------------------------------------------
     // 泄流行聚合（组合）：自 head 连续同 cache 行、cached 项
     // ------------------------------------------------------------
-    reg [`SB_SIZE-1:0]          merge_oh;
     reg [`SB_W:0]               merge_n;
     reg [`CACHE_LINE_BITS-1:0]  merge_data;
     reg [`CACHE_LINE_BYTES-1:0] merge_strb;
@@ -103,7 +116,6 @@ module store_buffer(
     reg             m_cont;
 
     always @(*) begin
-        merge_oh       = {`SB_SIZE{1'b0}};
         merge_n        = count_zero;
         merge_data     = {`CACHE_LINE_BITS{1'b0}};
         merge_strb     = {`CACHE_LINE_BYTES{1'b0}};
@@ -124,7 +136,6 @@ module store_buffer(
 
             if (uncached[head]) begin
                 // 单字：放在行内对应字槽，D$ UC 路径按 req_word 抽取
-                merge_oh[0] = 1'b1;
                 merge_n     = {{`SB_W{1'b0}}, 1'b1};
                 m_word      = paddr[head][4:2];
                 merge_strb[4*m_word +: 4] = strb[head];
@@ -136,7 +147,6 @@ module store_buffer(
                     m_idx = head + mi[`SB_W-1:0];
                     if (m_cont && valid[m_idx] && !uncached[m_idx]
                      && (paddr[m_idx][31:`CACHE_LINE_W] == paddr[head][31:`CACHE_LINE_W])) begin
-                        merge_oh[mi] = 1'b1;
                         merge_n      = merge_n + {{`SB_W{1'b0}}, 1'b1};
                         m_word       = paddr[m_idx][4:2];
                         for (mb = 0; mb < 4; mb = mb + 1) begin
@@ -156,7 +166,6 @@ module store_buffer(
 
     integer idx;
     integer pi;
-    reg [`SB_W-1:0] pop_idx;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -175,7 +184,8 @@ module store_buffer(
             end
         end else begin
             // flush 不清：缓冲内都是已提交 store
-            if (dc_wr_done_i) begin
+            // 用 dc_wr_done_r（非组合 dc_wr_done_i），与 pop_fire 同拍
+            if (dc_wr_done_r) begin
                 inflight   <= 1'b0;
                 inflight_n <= count_zero;
             end else if (dc_wr_addr_ok_i) begin
@@ -186,8 +196,7 @@ module store_buffer(
             if (pop_fire) begin
                 for (pi = 0; pi < `SB_SIZE; pi = pi + 1) begin
                     if (pi < inflight_n) begin
-                        pop_idx = head + pi[`SB_W-1:0];
-                        valid[pop_idx] <= 1'b0;
+                        valid[head + pi[`SB_W-1:0]] <= 1'b0;
                     end
                 end
                 head <= head + inflight_n[`SB_W-1:0];
@@ -251,7 +260,7 @@ module store_buffer(
                 if (uncached[q_idx]) begin
                     any_unc_r = 1'b1;
                 end
-                if (mem_same_word(paddr[q_idx], query_paddr_i)) begin
+                if (mem_same_word(paddr[q_idx][31:2], query_paddr_i)) begin
                     any_match_r = 1'b1;
                     for (b = 0; b < 4; b = b + 1) begin
                         if (!byte_found[b] && !byte_block[b] && strb[q_idx][b]) begin
@@ -273,5 +282,23 @@ module store_buffer(
     assign query_hit_o     = (&byte_found) && !unc_order_block;
     assign query_data_o    = merge_data_r;
     assign query_partial_o = (any_match_r && !(&byte_found)) || unc_order_block;
+
+`ifdef SYNTHESIS
+// synthesis translate_off
+reg [63:0] sb_nonempty_cyc;
+reg [63:0] sb_wr_req_cyc;
+always @(posedge clk) begin
+    if (reset) begin
+        sb_nonempty_cyc <= 64'd0;
+        sb_wr_req_cyc   <= 64'd0;
+    end else begin
+        if (!sb_empty_o)
+            sb_nonempty_cyc <= sb_nonempty_cyc + 64'd1;
+        if (dc_wr_req_o)
+            sb_wr_req_cyc <= sb_wr_req_cyc + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
 
 endmodule

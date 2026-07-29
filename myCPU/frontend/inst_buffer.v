@@ -1,22 +1,5 @@
 `include "mycpu.h"
 
-// ============================================================
-// inst_buffer 模块（指令缓冲，`IB_SIZE=16 项环形 FIFO）
-// ------------------------------------------------------------
-// 功能：
-// - 前端（IFU 切割后的指令流）与后端（decoder×2/rename）的解耦缓冲：
-//   入口一拍最多 4 条（push0~3，同拍连续写 tail~tail+3），
-//   出口一拍最多 2 条（pop0/1，组合读 head/head+1，槽 0 先消费）；
-// - 载荷每项 {excp, ftq_id, is_last, pred_taken, inst, pc} 打包存储；
-// - can_push_o 只看寄存器 count（留足 4 空位才放行），与 push_n 解耦断
-//   组合环（详见下方注释）；
-// - flush_i 一拍清空（head/tail/count 归零，载荷无需清）。
-//
-// 端口：
-// - push0~3_*：IFU 推入口（valid 独立，数据同拍写入）
-// - pop0/1_* ：rename/decoder 弹出口（valid/ready 握手）
-// - can_push_o：入口反压（保守判定，见正文）
-// ============================================================
 module inst_buffer(
     input  wire                       clk,
     input  wire                       reset,
@@ -75,9 +58,16 @@ module inst_buffer(
     input  wire                       pop1_ready_i
 );
 
-localparam ENTRY_W = `EXCP_NUM + `FTQ_W + 1 + 1 + 32 + 32;
+localparam integer ENTRY_W = `EXCP_NUM + `FTQ_W + 1 + 1 + 32 + 32;
+localparam integer BANK_NUM   = 4;
+localparam integer BANK_SEL_W = 2;
+localparam integer BANK_DEPTH = `IB_SIZE / BANK_NUM;
+localparam integer ROW_W      = `IB_W - BANK_SEL_W;
 
-reg [ENTRY_W-1:0] mem [0:`IB_SIZE-1];
+(* ram_style = "distributed" *) reg [ENTRY_W-1:0] bank0 [0:BANK_DEPTH-1];
+(* ram_style = "distributed" *) reg [ENTRY_W-1:0] bank1 [0:BANK_DEPTH-1];
+(* ram_style = "distributed" *) reg [ENTRY_W-1:0] bank2 [0:BANK_DEPTH-1];
+(* ram_style = "distributed" *) reg [ENTRY_W-1:0] bank3 [0:BANK_DEPTH-1];
 reg [`IB_W-1:0]   head;
 reg [`IB_W-1:0]   tail;
 reg [`IB_W:0]     count;
@@ -93,38 +83,94 @@ wire [ENTRY_W-1:0] push3_entry = {push3_excp_i, push3_ftq_id_i, push3_is_last_i,
 
 wire [2:0] push_n = {2'b0, push0_valid_i} + {2'b0, push1_valid_i}
                   + {2'b0, push2_valid_i} + {2'b0, push3_valid_i};
-wire pop0_valid_c = (count != {(`IB_W+1){1'b0}});
-wire pop1_valid_c = (count >= {{(`IB_W-1){1'b0}}, 2'd2});
+`ifdef IB_DISABLE_EMPTY_FALLTHROUGH
+wire ib_empty_fwft_en = 1'b0;
+`else
+wire ib_empty_fwft_en = 1'b1;
+`endif
+wire stored_pop0_valid_c = (count != {(`IB_W+1){1'b0}});
+wire stored_pop1_valid_c = (count >= {{(`IB_W-1){1'b0}}, 2'd2});
+wire ft_active = ib_empty_fwft_en && (count == {(`IB_W+1){1'b0}})
+              && (push_n != 3'd0) && can_push_o && !flush_i;
+wire pop0_valid_c = ft_active ? (push_n >= 3'd1) : stored_pop0_valid_c;
+wire pop1_valid_c = ft_active ? (push_n >= 3'd2) : stored_pop1_valid_c;
 wire pop0_fire = (pop0_ready_i === 1'b1) && pop0_valid_c;
 wire pop1_fire = pop0_fire && (pop1_ready_i === 1'b1) && pop1_valid_c;
 wire [1:0] pop_n = {1'b0, pop0_fire} + {1'b0, pop1_fire};
 
-wire [`IB_W:0] push_cnt_n = can_push_o ? {2'b0, push_n} : {(`IB_W+1){1'b0}};
-wire [`IB_W:0] count_next   = count + push_cnt_n - {{(`IB_W-1){1'b0}}, pop_n};
+wire [1:0] ft_consume_count = {1'b0, ft_active && pop0_fire}
+                            + {1'b0, ft_active && pop1_fire};
+wire [1:0] stored_pop_count = ft_active ? 2'd0 : pop_n;
+wire [2:0] residual_push_count = ft_active ? (push_n - {1'b0, ft_consume_count}) : push_n;
+wire [`IB_W:0] residual_push_count_ext = {{(`IB_W-2){1'b0}}, residual_push_count};
+wire [`IB_W:0] stored_pop_count_ext    = {{(`IB_W-1){1'b0}}, stored_pop_count};
+wire [`IB_W-1:0] push_inc              = {{(`IB_W-3){1'b0}}, push_n};
+wire [`IB_W-1:0] ft_consume_inc        = {{(`IB_W-2){1'b0}}, ft_consume_count};
+wire [`IB_W-1:0] stored_pop_inc        = {{(`IB_W-2){1'b0}}, stored_pop_count};
+wire [`IB_W:0] push_cnt_n = can_push_o ? residual_push_count_ext : {(`IB_W+1){1'b0}};
+wire [`IB_W:0] count_next = ft_active
+                          ? residual_push_count_ext
+                          : (count + push_cnt_n - stored_pop_count_ext);
 wire           ib_empty_next = (count_next == {(`IB_W+1){1'b0}});
 
-// 断组合环:原式 can_push_o 依赖 push_n,而 push_n 来自 ifu 的 pushN_valid,
-// ifu 的 push 又依赖 can_push_o(ib_can_push_i),构成纯组合闭环 → 综合被迫加
-// false_path、phys_opt 崩溃、时序分析失效。改为仅依据寄存器 count 与最大推入
-// 宽度(4条/拍)判断:留够 4 个空位就允许推,与 push_n 解耦。count 更新已由
-// line85 push_cnt_n 的 can_push_o 门控保证正确,溢出不可能。代价:count∈{13..16}
-// 时略保守(偶发 1 拍前端气泡),IPC 影响可忽略(IB 出口 2 条/拍,极少贴满)。
+// can_push_o 只能依赖寄存器 count，不能依赖 IFU 的 push valid，否则会与
+// ib_can_push_i 构成组合环。预留每拍最大 4 条的空间；count 为 13..16 时会
+// 保守反压，push_cnt_n 仍负责门控计数更新，保证不会溢出。
 assign can_push_o = (count <= (`IB_SIZE - 4));
 
-wire [`IB_W-1:0] head_plus1 = head + {{(`IB_W-1){1'b0}}, 1'b1};
-wire [`IB_W-1:0] tail_plus1 = tail + {{(`IB_W-1){1'b0}}, 1'b1};
-wire [`IB_W-1:0] tail_plus2 = tail + {{(`IB_W-2){1'b0}}, 2'd2};
-wire [`IB_W-1:0] tail_plus3 = tail + {{(`IB_W-2){1'b0}}, 2'd3};
+wire [ROW_W-1:0]  head_row = head[`IB_W-1:BANK_SEL_W];
+wire [ROW_W-1:0]  head_row_plus1 = head_row + {{(ROW_W-1){1'b0}}, 1'b1};
+wire [ROW_W-1:0]  tail_row = tail[`IB_W-1:BANK_SEL_W];
+wire [ROW_W-1:0]  tail_row_plus1 = tail_row + {{(ROW_W-1){1'b0}}, 1'b1};
+wire [ROW_W-1:0]  bank0_raddr = (head[1:0] == 2'd3) ? head_row_plus1 : head_row;
+wire [ROW_W-1:0]  bank1_raddr = head_row;
+wire [ROW_W-1:0]  bank2_raddr = head_row;
+wire [ROW_W-1:0]  bank3_raddr = head_row;
+wire [ENTRY_W-1:0] bank0_rdata = bank0[bank0_raddr];
+wire [ENTRY_W-1:0] bank1_rdata = bank1[bank1_raddr];
+wire [ENTRY_W-1:0] bank2_rdata = bank2[bank2_raddr];
+wire [ENTRY_W-1:0] bank3_rdata = bank3[bank3_raddr];
 
-// 出队数据必须与 head 同拍组合读出。原实现将 mem[head] 打一拍进
-// pop0_entry_r，但 valid（count!=0）是组合的：push 当拍 count 已非 0、
-// 而 entry_r 里还是旧数据 —— rename 会拿着"旧 PC/旧指令"配上"新 valid"
-// 消费一条幽灵指令，真正的新指令则被 head+1 静默丢弃（曾表现为
-// idle_1s 入口 lu12i/addi 对被吞、ld.w 用到陈旧 ARF 基址 -> 假 ALE）。
+reg [ENTRY_W-1:0] stored_pop0_entry_c;
+reg [ENTRY_W-1:0] stored_pop1_entry_c;
+always @(*) begin
+    case (head[1:0])
+        2'd0: begin
+            stored_pop0_entry_c = bank0_rdata;
+            stored_pop1_entry_c = bank1_rdata;
+        end
+        2'd1: begin
+            stored_pop0_entry_c = bank1_rdata;
+            stored_pop1_entry_c = bank2_rdata;
+        end
+        2'd2: begin
+            stored_pop0_entry_c = bank2_rdata;
+            stored_pop1_entry_c = bank3_rdata;
+        end
+        default: begin
+            stored_pop0_entry_c = bank3_rdata;
+            stored_pop1_entry_c = bank0_rdata;
+        end
+    endcase
+end
+
+wire [ENTRY_W-1:0] pop0_entry_c = ft_active ? push0_entry : stored_pop0_entry_c;
+wire [ENTRY_W-1:0] pop1_entry_c = ft_active ? push1_entry : stored_pop1_entry_c;
+
+// 空队列直通时仍把全部入口按原顺序写入 RAM，再由 head 跳过同拍已消费项。
+// RAM 写数据和写使能因此只依赖 IFU，不经过 decoder/rename ready 反馈；既保留
+// 冷启动零气泡，也切断 IFU→IB→decoder→rename→IB 写口的长组合路径。
+wire wr0_valid = push0_valid_i;
+wire wr1_valid = push1_valid_i;
+wire wr2_valid = push2_valid_i;
+wire wr3_valid = push3_valid_i;
+
+// 出队数据与 valid 必须使用同一拍的 head 组合读结果；若数据额外打一拍，
+// push 后首个 valid 会与上一拍旧数据错配，并导致真正的首条指令被跳过。
 assign {pop0_excp_o, pop0_ftq_id_o, pop0_is_last_o, pop0_pred_taken_o,
-        pop0_inst_o, pop0_pc_o} = mem[head];
+        pop0_inst_o, pop0_pc_o} = pop0_entry_c;
 assign {pop1_excp_o, pop1_ftq_id_o, pop1_is_last_o, pop1_pred_taken_o,
-        pop1_inst_o, pop1_pc_o} = mem[head_plus1];
+        pop1_inst_o, pop1_pc_o} = pop1_entry_c;
 assign pop0_valid_o = pop0_valid_c;
 assign pop1_valid_o = pop1_valid_c;
 
@@ -133,9 +179,15 @@ initial begin
     head = {`IB_W{1'b0}};
     tail = {`IB_W{1'b0}};
     count = {(`IB_W+1){1'b0}};
-    for (i = 0; i < `IB_SIZE; i = i + 1)
-        mem[i] = {ENTRY_W{1'b0}};
+    for (i = 0; i < BANK_DEPTH; i = i + 1) begin
+        bank0[i] = {ENTRY_W{1'b0}};
+        bank1[i] = {ENTRY_W{1'b0}};
+        bank2[i] = {ENTRY_W{1'b0}};
+        bank3[i] = {ENTRY_W{1'b0}};
+    end
 end
+
+
 
 always @(posedge clk) begin
     if (reset || flush_i) begin
@@ -144,22 +196,44 @@ always @(posedge clk) begin
         count <= {(`IB_W+1){1'b0}};
     end else begin
         if (can_push_o) begin
-            if (push0_valid_i) mem[tail]      <= push0_entry;
-            if (push1_valid_i) mem[tail_plus1] <= push1_entry;
-            if (push2_valid_i) mem[tail_plus2] <= push2_entry;
-            if (push3_valid_i) mem[tail_plus3] <= push3_entry;
+            case (tail[1:0])
+                2'd0: begin
+                    if (wr0_valid) bank0[tail_row]       <= push0_entry;
+                    if (wr1_valid) bank1[tail_row]       <= push1_entry;
+                    if (wr2_valid) bank2[tail_row]       <= push2_entry;
+                    if (wr3_valid) bank3[tail_row]       <= push3_entry;
+                end
+                2'd1: begin
+                    if (wr0_valid) bank1[tail_row]       <= push0_entry;
+                    if (wr1_valid) bank2[tail_row]       <= push1_entry;
+                    if (wr2_valid) bank3[tail_row]       <= push2_entry;
+                    if (wr3_valid) bank0[tail_row_plus1] <= push3_entry;
+                end
+                2'd2: begin
+                    if (wr0_valid) bank2[tail_row]       <= push0_entry;
+                    if (wr1_valid) bank3[tail_row]       <= push1_entry;
+                    if (wr2_valid) bank0[tail_row_plus1] <= push2_entry;
+                    if (wr3_valid) bank1[tail_row_plus1] <= push3_entry;
+                end
+                default: begin
+                    if (wr0_valid) bank3[tail_row]       <= push0_entry;
+                    if (wr1_valid) bank0[tail_row_plus1] <= push1_entry;
+                    if (wr2_valid) bank1[tail_row_plus1] <= push2_entry;
+                    if (wr3_valid) bank2[tail_row_plus1] <= push3_entry;
+                end
+            endcase
         end
 
         if (ib_empty_next) begin
             head <= {`IB_W{1'b0}};
-            if (can_push_o)
-                tail <= {1'b0, push_n[`IB_W-2:0]};
-            else
-                tail <= {`IB_W{1'b0}};
+            tail <= {`IB_W{1'b0}};
+        end else if (ft_active) begin
+            head <= head + ft_consume_inc;
+            tail <= tail + push_inc;
         end else begin
-            head <= head + {{(`IB_W-2){1'b0}}, pop_n};
+            head <= head + stored_pop_inc;
             if (can_push_o)
-                tail <= tail + {1'b0, push_n[`IB_W-2:0]};
+                tail <= tail + push_inc;
         end
         count <= count_next;
     end

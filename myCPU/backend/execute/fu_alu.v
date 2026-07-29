@@ -8,13 +8,11 @@
 //     （条件分支/B/BL: pc+offs；jirl: src0+offs）、算链接值（pc+4）
 // - 写回 ROB：结果 + 分支实际方向/实际目标（提交级据此判误预测）。
 // - 发射拍对外广播提前唤醒（robid），缩短背靠背 RAW 延迟（已接通各 RS）。
-// - 二期预留执行级重定向输出（误预测当拍冲前端，配合 RAT 检查点）。
 //
 // 端口：
 // - issue_*     ：rs_alu 发射口直连（组合进入，本模块内部锁存一拍执行）
 // - wb_*        ：写回 ROB（含分支实际行为）
 // - early_wakeup_* ：发射拍唤醒广播（已接到各 RS 的 early0/1）
-// - ex_redirect_*  ：执行级重定向（二期，一期恒 0）
 // ============================================================
 `include "mycpu.h"
 
@@ -27,7 +25,7 @@ module fu_alu(
     input  wire                       issue_valid_i,
     input  wire [`ROB_W-1:0]          issue_robid_i,
     input  wire [31:0]                issue_pc_i,
-    input  wire [`ALU_OP_NUM-1:0]     issue_alu_op_i,
+    input  wire [14:0]                issue_alu_op_i,
     input  wire [`BR_OP_NUM-1:0]      issue_br_op_i,
     input  wire [31:0]                issue_src0_i,
     input  wire [31:0]                issue_src1_i,
@@ -44,17 +42,13 @@ module fu_alu(
 
     // ---------------- 提前唤醒广播（发射拍，已接入各 RS 的 early0/1）----------------
     output wire                       early_wakeup_valid_o,
-    output wire [`ROB_W-1:0]          early_wakeup_robid_o,
-
-    // ---------------- 二期：执行级重定向（一期输出恒 0）----------------
-    output wire                       ex_redirect_valid_o,
-    output wire [31:0]                ex_redirect_pc_o
+    output wire [`ROB_W-1:0]          early_wakeup_robid_o
 );
 
 reg                        ex_valid;
 reg [`ROB_W-1:0]           ex_robid;
 reg [31:0]                 ex_pc;
-reg [`ALU_OP_NUM-1:0]      ex_alu_op;
+reg [14:0]                 ex_alu_op;
 reg [`BR_OP_NUM-1:0]       ex_br_op;
 reg [31:0]                 ex_src0;
 reg [31:0]                 ex_src1;
@@ -88,14 +82,11 @@ always @(posedge clk) begin
 end
 
 alu u_alu(
-    .clk(clk),
-    .reset(reset),
     .alu_op(ex_alu_op),
     .alu_src1(ex_src0),
     .alu_src2(ex_use_imm ? ex_imm : ex_src1),
     .exe_pc(ex_pc),
-    .alu_result(alu_result),
-    .alu_result_valid()
+    .alu_result(alu_result)
 );
 
 assign is_link = ex_br_op[`BR_OP_BL] | ex_br_op[`BR_OP_JIRL];  // 链接类（bl/jirl 写 rd = pc+4）
@@ -121,8 +112,7 @@ wire br_taken = (ex_br_op[`BR_OP_BEQ]  &  br_eq)
               |  ex_br_op[`BR_OP_BL]
               |  ex_br_op[`BR_OP_JIRL];
 
-// n52 ADEF(jirl 目标非对齐)取指侧修法:jirl 目标 = rj+offs 原值(不掩码),链接 rd=pc+4 照写,
-// 由目标取指(mmu i_vaddr[1:0]!=0)抬 ADEF、ERA=非对齐目标。前端需能承受非对齐 fetch PC(见探针)。
+// JIRL 目标保留 rj+offs 原值；非对齐由目标取指抬 ADEF，链接值仍为 pc+4。
 wire [31:0] br_target = ex_br_op[`BR_OP_JIRL]
                       ? (ex_src0 + ex_br_offs)
                       :  (ex_pc   + ex_br_offs);
@@ -132,8 +122,5 @@ assign wb_br_target_o = (ex_valid && is_branch) ? br_target : 32'b0;
 
 assign early_wakeup_valid_o = issue_valid_i && !flush_i && !reset;
 assign early_wakeup_robid_o = issue_robid_i;
-
-assign ex_redirect_valid_o  = 1'b0;
-assign ex_redirect_pc_o     = 32'b0;
 
 endmodule

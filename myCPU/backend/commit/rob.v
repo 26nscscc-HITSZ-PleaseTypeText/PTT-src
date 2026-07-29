@@ -1,7 +1,7 @@
 // ============================================================
 // rob 模块（重排序缓冲：奇偶双体环形队列，队列式重命名的核心）
 // ------------------------------------------------------------
-// 功能（mariver 同款设计，本架构的灵魂部件）：
+// 功能：
 // - `ROB_SIZE=32 项 = 16 个"槽位对" × 2 路（奇偶分体）：
 //   每拍恒分配一对（槽 0 -> {1'b0,tail}，槽 1 -> {1'b1,tail}），
 //   ROB 编号同时承担三重角色：重命名标签 + 程序序 + 结果存储索引。
@@ -37,7 +37,6 @@ module rob(
     input  wire [31:0]                a0_inst_i,
     input  wire                       a0_rf_we_i,
     input  wire [4:0]                 a0_rd_i,
-    input  wire [`FU_NUM-1:0]         a0_futype_i,
     input  wire                       a0_is_load_i,
     input  wire                       a0_is_store_i,
     input  wire                       a0_is_branch_i,
@@ -58,7 +57,6 @@ module rob(
     input  wire [31:0]                a1_inst_i,
     input  wire                       a1_rf_we_i,
     input  wire [4:0]                 a1_rd_i,
-    input  wire [`FU_NUM-1:0]         a1_futype_i,
     input  wire                       a1_is_load_i,
     input  wire                       a1_is_store_i,
     input  wire                       a1_is_branch_i,
@@ -185,18 +183,18 @@ module rob(
     input  wire                       cmt_clear1_i        // 槽 1 已提交
 );
 
-// 设计说明（已实现，参考 mariver rob.v，结构一一对应）
+// 设计说明：
 //
-// 指针与满判据（mariver 137~142 行的精髓）：
+// 指针与满判据：
 //      reg [`ROB_PAIR_W-1:0] head, tail;
 //      rob_full_o  = (head == trunc(tail + ROB_GUARD)); // 保留安全间距，环形截断
 //      rob_empty_o = (head == tail);
 //      为什么留间距：提交后（clear/pop）该表项的 result 仍可能在同拍/下拍被
 //      dispatch 读口用旧编号读取（rename 在它提交前一拍刚查到这个标签）；
 //      留 GUARD 对间距保证新分配不会立即覆盖刚提交项的结果。删掉间距会出现
-//      "偶发读到新指令结果"的恶性随机错误，几乎无法调试——千万别省。
+//      “读到新指令结果”的错误，因此该安全间距属于接口不变式。
 //
-// 存储结构（V2.3 版，编号={奇偶,对指针}）：
+// 存储结构（编号={奇偶,对指针}）：
 //      静态区（分配写、提交读一次）：按【奇偶双体 LUTRAM】存放（sta0_*/sta1_*，
 //        每体 dispatch 单写口）：pc、csr_num、tlb_op、cacop_code、ftq_id、
 //        br_type 及提交预译码位（is_direct_b/is_idle/csr 字段选择等）；
@@ -216,7 +214,7 @@ module rob(
 //      mem      ：result<=data；paddr/vaddr/wstrb/size/uncached/excp_dynamic 锁存；complete<=1
 //      mdu      ：result<=data；result2<=data2；complete<=1
 //
-// dispatch 读口（组合 + 同拍写回旁路，mariver 223~259 行）：
+// dispatch 读口（组合 + 同拍写回旁路）：
 //      rrdy = complete[raddr] | (任一 wb 口本拍 valid 且 robid==raddr)
 //      rdata = 本拍写回旁路优先，否则读 result[raddr]
 //      （旁路必不可少：写回与 dispatch 同拍时，不旁路会让指令在 RS 里
@@ -266,7 +264,7 @@ wire [`ROB_W-1:0] head1_idx  = {1'b1, head};
 // ---------------- 静态区：奇偶双体 LUTRAM（写一次读一次） ----------------
 // 分配拍恒成对写（偶体<=槽0、奇体<=槽1，各自单写口 @tail），提交只读 @head，
 // 满足分布式 RAM 1W1R 异步读模型；冲刷无需清内容（valid=0 即屏蔽陈旧值）。
-// futype 字段只写不读，已作为死存储删除（端口保留，入 lint 吸收）。
+// ROB 不保存 futype；执行类型只用于前级路由，提交所需类别使用独立位记录。
 // inst 32b 仅 difftest/调试需要：只在仿真视图保留（见下 `ifdef SIMU 段），
 // 综合视图用分配拍预译码的 2 bit（is_b0 / direct_b）替代提交侧全部真实用途，
 // 同时把 inst[head] 的 32b 读 mux 从"提交异常链"关键路径起点上摘除。
@@ -318,9 +316,6 @@ end
 wire [STA_W-1:0] sta_h0 = sta_even[head];
 wire [STA_W-1:0] sta_h1 = sta_odd[head];
 
-// 死存储 futype 的端口吸收（重排流水不用它，保留接口兼容）
-wire rob_lint_futype = |{a0_futype_i, a1_futype_i};
-
 assign rob_tail_o = tail;
 // 满判据必须按 ROB_PAIR_W 位宽环形加：`ROB_GUARD` 是无宽度十进制字面量，
 // 若写成 (head == tail+ROB_GUARD)，右边被扩成 32 位（如 11+5=16），与 4 位
@@ -331,7 +326,7 @@ assign rob_full_o = (head == rob_full_mark);
 assign rob_empty_o = (head == tail);
 assign head_robid0_o = head0_idx;
 
-// 读口 ready/data【不得】用 valid 门控（mariver robtag_ready 同款语义）：
+// 读口 ready/data【不得】用 valid 门控：
 // RAT 的 busy/tag 相对提交晚一拍——生产者提交当拍，消费者 rename 仍拿到
 // "busy=1, tag=生产者" 的旧视图，下一拍 dispatch 读 ROB 时表项已 pop。
 // 若此处再检查 valid，该操作数永远等不到唤醒，直到 robid 被新指令复用后
@@ -444,9 +439,8 @@ always @(posedge clk) begin
     end else begin
         // pop 只清 valid，complete/result 保留至该项被重新分配（alloc 时覆写）。
         // 原因：RAT 的 busy 视图比提交晚一拍——生产者提交当拍 rename 仍拿到
-        // 旧标签，下一拍 dispatch 读该 robid 时若 complete 已被清，操作数将
-        // 永远等不到唤醒，直至 robid 被复用后捕获错误数据（曾致 idle_1s 的
-        // ld.w 拿到 0x03000000 类计时器值作基址 -> 假 ALE -> 跳 EENTRY=0）
+        // 旧标签；下一拍 dispatch 仍可能读取该 robid，因此 complete/result
+        // 必须保留到重新分配，否则消费者会错过唤醒并在 robid 复用后捕获错误数据。
         if (cmt_clear0_i) begin
             valid[head0_idx]   <= 1'b0;
         end

@@ -1,40 +1,37 @@
 `include "mycpu.h"
 
 // ============================================================
-// alu 模块（运算核，新架构中被 fu_alu.v 例化）
+// alu 模块（fu_alu 使用的纯组合整数运算核）
 // ------------------------------------------------------------
-// 方案 A：纯组合 ALU。
 // - 只承担单周期组合运算：加减/逻辑/移位/比较/LUI（含 ANDN/ORN）；
-// - 乘除职责已迁出到 fu_mdu（mul.v/div.v），本模块乘除位输出 0；
-// - 端口保持框架原样：clk/reset 仅占位（lint 吸收）；exe_pc 供
-//   PCADD（pcaddu12i/pcaddi）作加法源使用。
+// - 乘除运算由 fu_mdu 执行；
+// - PCADD 使用 exe_pc，其余加减运算使用 alu_src1。
+// - 模块无状态，alu_result 始终为当前输入的组合结果。
 // ============================================================
 module alu(
-    input  wire                    clk,
-    input  wire                    reset,
-    input  wire [`ALU_OP_NUM-1:0]  alu_op,
+    // 紧凑位序：{PCADD, ORN, ANDN, LUI..ADD}，去掉全局操作码中的 MDU 空洞。
+    input  wire [14:0]             alu_op,
     input  wire [31:0]             alu_src1,
     input  wire [31:0]             alu_src2,
     input  wire [31:0]             exe_pc,
-    output wire [31:0]             alu_result,
-    output wire                    alu_result_valid
+    output wire [31:0]             alu_result
 );
 
-wire op_add  = alu_op[`ALU_OP_ADD];
-wire op_sub  = alu_op[`ALU_OP_SUB];
-wire op_slt  = alu_op[`ALU_OP_SLT];
-wire op_sltu = alu_op[`ALU_OP_SLTU];
-wire op_and  = alu_op[`ALU_OP_AND];
-wire op_nor  = alu_op[`ALU_OP_NOR];
-wire op_or   = alu_op[`ALU_OP_OR];
-wire op_xor  = alu_op[`ALU_OP_XOR];
-wire op_sll  = alu_op[`ALU_OP_SLL];
-wire op_srl  = alu_op[`ALU_OP_SRL];
-wire op_sra  = alu_op[`ALU_OP_SRA];
-wire op_lui  = alu_op[`ALU_OP_LUI];
-wire op_andn = alu_op[`ALU_OP_ANDN];
-wire op_orn  = alu_op[`ALU_OP_ORN];
-wire op_pcadd = alu_op[`ALU_OP_PCADD];
+wire op_add   = alu_op[0];
+wire op_sub   = alu_op[1];
+wire op_slt   = alu_op[2];
+wire op_sltu  = alu_op[3];
+wire op_and   = alu_op[4];
+wire op_nor   = alu_op[5];
+wire op_or    = alu_op[6];
+wire op_xor   = alu_op[7];
+wire op_sll   = alu_op[8];
+wire op_srl   = alu_op[9];
+wire op_sra   = alu_op[10];
+wire op_lui   = alu_op[11];
+wire op_andn  = alu_op[12];
+wire op_orn   = alu_op[13];
+wire op_pcadd = alu_op[14];
 
 wire [31:0] adder_a   = op_pcadd ? exe_pc : alu_src1;
 wire [31:0] adder_b   = (op_sub | op_slt | op_sltu) ? ~alu_src2 : alu_src2;
@@ -55,8 +52,11 @@ wire [31:0] lui_result     = alu_src2;
 wire [31:0] andn_result    = alu_src1 & ~alu_src2;
 wire [31:0] orn_result     = alu_src1 | ~alu_src2;
 wire [31:0] sll_result     = alu_src1 << alu_src2[4:0];
-wire [63:0] sr64_result    = {{32{op_sra & alu_src1[31]}}, alu_src1} >> alu_src2[4:0];
-wire [31:0] sr_result      = sr64_result[31:0];
+wire signed [31:0] signed_alu_src1 = alu_src1;
+wire [31:0] sra_result = signed_alu_src1 >>> alu_src2[4:0];
+wire [31:0] srl_result = alu_src1 >> alu_src2[4:0];
+wire [31:0] sr_result  = ({32{op_sra}} & sra_result)
+                       | ({32{op_srl}} & srl_result);
 
 assign alu_result = ({32{op_add | op_sub}} & add_sub_result)
                   | ({32{op_slt}}  & slt_result)
@@ -71,9 +71,5 @@ assign alu_result = ({32{op_add | op_sub}} & add_sub_result)
                   | ({32{op_pcadd}} & add_sub_result)
                   | ({32{op_sll}}  & sll_result)
                   | ({32{op_srl | op_sra}} & sr_result);
-
-assign alu_result_valid = 1'b1;
-
-wire alu_lint = clk | reset | (|exe_pc);
 
 endmodule

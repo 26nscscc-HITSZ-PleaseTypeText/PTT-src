@@ -8,7 +8,7 @@
 //         -> FU(ALU0/ALU1/LSU/MDU) -> ROB -> commit(双提交)
 //   访存：LSU(AGU+DC) / store_buffer(提交后写) / DCache / L2 / AXI 桥
 //   特权：csr_exception_commit_handler + tlb_manager(TLBNUM 项主 TLB，本层参数=32)
-// - 重命名标签 = ROB 编号（mariver 队列式重命名，无独立 PRF/freelist）；
+// - 重命名标签 = ROB 编号，无独立 PRF/freelist；
 // - 一切恢复（误预测/异常/ertn/特权 refetch）走提交级统一冲刷（ctrl 广播）；
 // - store 提交后经 store_buffer 按序写出；uncached load 仅在 ROB 头发出。
 //
@@ -114,11 +114,6 @@ module core_top #(
     wire [`FLUSH_TYPE_W-1:0]  cmt_flush_type;
     wire [31:0]               cmt_flush_pc;
     wire                      cmt_idle;
-    // 二期执行级重定向（一期 fu_alu 输出恒 0）
-    wire                      alu0_exred_valid, alu1_exred_valid;
-    wire [31:0]               alu0_exred_pc,    alu1_exred_pc;
-    wire                      ex_redirect_req = alu0_exred_valid | alu1_exred_valid;
-    wire [31:0]               ex_redirect_pc  = alu0_exred_valid ? alu0_exred_pc : alu1_exred_pc;
     // CSR 状态（前置声明，后方 CSR 分区驱动）
     wire                      csr_has_int;
 
@@ -129,10 +124,7 @@ module core_top #(
         .clk              (clk),
         .reset            (reset),
         .cmt_flush_req_i  (cmt_flush_req),
-        .cmt_flush_type_i (cmt_flush_type),
         .cmt_flush_pc_i   (cmt_flush_pc),
-        .ex_redirect_req_i(ex_redirect_req),
-        .ex_redirect_pc_i (ex_redirect_pc),
         .idle_commit_i    (cmt_idle),
         .has_int_i        (csr_has_int),
         .flush_o          (flush),
@@ -151,14 +143,11 @@ module core_top #(
     wire [`BLK_LEN_W-1:0]     bpu_p0_length;
     wire                      bpu_p0_taken;
     wire [31:0]               bpu_p0_target;
-    wire [`BR_TYPE_W-1:0]     bpu_p0_br_type;
     wire                      bpu_p1_valid;
     wire                      bpu_p1_meta_valid;
-    wire [31:0]               bpu_p1_pc;
     wire [`BLK_LEN_W-1:0]     bpu_p1_length;
     wire                      bpu_p1_taken;
     wire [31:0]               bpu_p1_target;
-    wire [`BR_TYPE_W-1:0]     bpu_p1_br_type;
     wire [`BPU_META_W-1:0]    bpu_p1_meta;
     // FTQ 状态与取块口
     wire                      ftq_full;
@@ -177,7 +166,8 @@ module core_top #(
     wire                      ftq_train_mispred;
     wire [31:0]               ftq_train_target;
     wire [`BR_TYPE_W-1:0]     ftq_train_br_type;
-    wire [31:0]               ftq_train_fall_through;
+    wire                      ftq_train_is_direct_b;  // JTC 训练类型
+    wire [`BLK_LEN_W+1:2]     ftq_train_fall_through;
     wire [`BPU_META_W-1:0]    ftq_train_meta;
     // IFU 预译码自重定向（-> BPU + FTQ）
     wire                      predec_redirect;
@@ -188,7 +178,14 @@ module core_top #(
     wire [`BLK_LEN_W-1:0]     predec_length;
     wire                      predec_taken;
     wire [31:0]               predec_target;
+    wire [31:0]               predec_block_pc;         // 预译码提前训练 uBTB
+    wire [31:0]               predec_branch_target;
     wire [`BR_TYPE_W-1:0]     predec_br_type;
+    wire                      predec_ras_call;
+    wire                      predec_ras_ret;
+    wire [31:0]               predec_ras_retaddr;
+    wire [31:0]               ras_checkpoint_top;
+    wire                      ras_checkpoint_nonempty;
     // IFU <-> MMU I 通道
     wire                      ifu_mmu_req;
     wire [31:0]               ifu_mmu_vaddr;
@@ -197,15 +194,15 @@ module core_top #(
     wire                      mmu_i_adef;
     wire [`TLB_EX_NUM-1:0]    mmu_i_tlb_ex;
     wire                      mmu_i_direct_ok;
+    wire                      mmu_i_direct_excp; // 直发路径异常（仅 CAM 口径）
     // IFU <-> ICache
     wire                      ifu_ic_req;
-    wire [31:0]               ifu_ic_vaddr;
+    wire [11:5]               ifu_ic_vindex;
     wire [31:0]               ifu_ic_paddr;
     wire                      ifu_ic_uncached;
     wire                      ic_ifu_addr_ok;
     wire                      ic_ifu_data_ok;
     wire [`CACHE_LINE_BITS-1:0] ic_ifu_rline;
-    wire                      ifu_ic_cancel;
     // IFU -> IB（4 槽）
     wire                      ifu_ib0_valid, ifu_ib1_valid, ifu_ib2_valid, ifu_ib3_valid;
     wire [31:0]               ifu_ib0_pc,    ifu_ib1_pc,    ifu_ib2_pc,    ifu_ib3_pc;
@@ -227,7 +224,6 @@ module core_top #(
     // commit -> FTQ 提交/训练 与 -> BPU RAS 提交栈
     wire                      cmt_ftq_valid;
     wire [`FTQ_W-1:0]         cmt_ftq_id;
-    wire                      cmt_ftq_is_last;
     wire [1:0]                cmt_ftq_release;
     wire                      cmt_ftq_is_branch;
     wire                      cmt_ftq_taken;
@@ -237,6 +233,7 @@ module core_top #(
     wire [31:0]               cmt_ftq_pc;
     wire [`FTQ_W-1:0]         cmt_ftq_query_id;
     wire [31:0]               ftq_cmt_blk_target;
+    wire                      cmt_ftq_is_direct_b_stat; // JTC 提交统计
     wire                      cmt_ras_call;
     wire                      cmt_ras_ret;
     wire [31:0]               cmt_ras_retaddr;
@@ -252,6 +249,18 @@ module core_top #(
         .predec_redirect_i    (predec_redirect),
         .predec_update_pc_i   (predec_update_pc),
         .predec_redirect_pc_i (predec_redirect_pc),
+        .predec_redirect_id_i (predec_redirect_id),
+        .predec_taken_i       (predec_taken),
+        .predec_block_pc_i    (predec_block_pc),
+        .predec_length_i      (predec_length),
+        .predec_branch_target_i(predec_branch_target),
+        .predec_br_type_i     (predec_br_type),
+        .predec_ras_call_i    (predec_ras_call),
+        .predec_ras_ret_i     (predec_ras_ret),
+        .predec_ras_retaddr_i (predec_ras_retaddr),
+        .ras_checkpoint_query_id_i(predec_redirect_id),
+        .ras_checkpoint_top_o (ras_checkpoint_top),
+        .ras_checkpoint_nonempty_o(ras_checkpoint_nonempty),
         // FTQ 满或 idle 睡眠都要冻结取指 PC
         .ftq_full_i           (ftq_full | fetch_stall),
         .p0_valid_o           (bpu_p0_valid),
@@ -259,14 +268,11 @@ module core_top #(
         .p0_length_o          (bpu_p0_length),
         .p0_taken_o           (bpu_p0_taken),
         .p0_target_o          (bpu_p0_target),
-        .p0_br_type_o         (bpu_p0_br_type),
         .p1_valid_o           (bpu_p1_valid),
         .p1_meta_valid_o      (bpu_p1_meta_valid),
-        .p1_pc_o              (bpu_p1_pc),
         .p1_length_o          (bpu_p1_length),
         .p1_taken_o           (bpu_p1_taken),
         .p1_target_o          (bpu_p1_target),
-        .p1_br_type_o         (bpu_p1_br_type),
         .p1_meta_o            (bpu_p1_meta),
         .train_valid_i        (ftq_train_valid),
         .train_pc_i           (ftq_train_pc),
@@ -275,11 +281,15 @@ module core_top #(
         .train_mispred_i      (ftq_train_mispred),
         .train_target_i       (ftq_train_target),
         .train_br_type_i      (ftq_train_br_type),
+        .train_is_direct_b_i  (ftq_train_is_direct_b),
         .train_fall_through_i (ftq_train_fall_through),
         .train_meta_i         (ftq_train_meta),
         .cmt_is_call_i        (cmt_ras_call),
         .cmt_is_ret_i         (cmt_ras_ret),
-        .cmt_call_retaddr_i   (cmt_ras_retaddr)
+        .cmt_call_retaddr_i   (cmt_ras_retaddr),
+        .cmt_hist_valid_i     (cmt_ftq_valid && cmt_ftq_is_branch &&
+                               (cmt_ftq_br_type == `BR_TYPE_COND)),
+        .cmt_hist_taken_i     (cmt_ftq_taken)
     );
 
 //--------------------------------------------------
@@ -294,14 +304,11 @@ module core_top #(
         .p0_length_i          (bpu_p0_length),
         .p0_taken_i           (bpu_p0_taken),
         .p0_target_i          (bpu_p0_target),
-        .p0_br_type_i         (bpu_p0_br_type),
         .p1_valid_i           (bpu_p1_valid),
         .p1_meta_valid_i      (bpu_p1_meta_valid),
-        .p1_pc_i              (bpu_p1_pc),
         .p1_length_i          (bpu_p1_length),
         .p1_taken_i           (bpu_p1_taken),
         .p1_target_i          (bpu_p1_target),
-        .p1_br_type_i         (bpu_p1_br_type),
         .p1_meta_i            (bpu_p1_meta),
         .ftq_full_o           (ftq_full),
         .ifu_valid_o          (ftq_ifu_valid),
@@ -317,17 +324,16 @@ module core_top #(
         .predec_length_i      (predec_length),
         .predec_taken_i       (predec_taken),
         .predec_target_i      (predec_target),
-        .predec_br_type_i     (predec_br_type),
         .cmt_valid_i          (cmt_ftq_valid),
         .cmt_ftq_id_i         (cmt_ftq_id),
-        .cmt_is_last_i        (cmt_ftq_is_last),
         .cmt_release_i        (cmt_ftq_release),
         .cmt_is_branch_i      (cmt_ftq_is_branch),
         .cmt_taken_i          (cmt_ftq_taken),
         .cmt_mispred_i        (cmt_ftq_mispred),
         .cmt_target_i         (cmt_ftq_target),
         .cmt_br_type_i        (cmt_ftq_br_type),
-        .cmt_pc_i             (cmt_ftq_pc),
+        .cmt_is_direct_b_i    (cmt_ftq_is_direct_b_stat),
+        .cmt_pc_word_i        (cmt_ftq_pc[`BLK_LEN_W+1:2]),
         .cmt_query_id_i       (cmt_ftq_query_id),
         .cmt_blk_target_o     (ftq_cmt_blk_target),
         .train_valid_o        (ftq_train_valid),
@@ -337,6 +343,7 @@ module core_top #(
         .train_mispred_o      (ftq_train_mispred),
         .train_target_o       (ftq_train_target),
         .train_br_type_o      (ftq_train_br_type),
+        .train_is_direct_b_o  (ftq_train_is_direct_b),
         .train_fall_through_o (ftq_train_fall_through),
         .train_meta_o         (ftq_train_meta)
     );
@@ -355,6 +362,8 @@ module core_top #(
         .ftq_target_i         (ftq_ifu_target),
         .ftq_ftq_id_i         (ftq_ifu_id),
         .ftq_accept_o         (ifu_ftq_accept),
+        .ras_checkpoint_top_i (ras_checkpoint_top),
+        .ras_checkpoint_nonempty_i(ras_checkpoint_nonempty),
         .mmu_i_req_o          (ifu_mmu_req),
         .mmu_i_vaddr_o        (ifu_mmu_vaddr),
         .mmu_i_paddr_i        (mmu_i_paddr),
@@ -362,14 +371,14 @@ module core_top #(
         .mmu_i_excp_adef_i    (mmu_i_adef),
         .mmu_i_tlb_ex_i       (mmu_i_tlb_ex),
         .mmu_i_direct_ok_i    (mmu_i_direct_ok),
+        .mmu_i_direct_excp_i  (mmu_i_direct_excp),
         .ic_req_o             (ifu_ic_req),
-        .ic_vaddr_o           (ifu_ic_vaddr),
+        .ic_vindex_o          (ifu_ic_vindex),
         .ic_paddr_o           (ifu_ic_paddr),
         .ic_uncached_o        (ifu_ic_uncached),
         .ic_addr_ok_i         (ic_ifu_addr_ok),
         .ic_data_ok_i         (ic_ifu_data_ok),
         .ic_rline_i           (ic_ifu_rline),
-        .ic_cancel_o          (ifu_ic_cancel),
         .predec_redirect_o    (predec_redirect),
         .predec_fixup_only_o  (predec_fixup_only),
         .predec_update_pc_o   (predec_update_pc),
@@ -378,7 +387,12 @@ module core_top #(
         .predec_length_o      (predec_length),
         .predec_taken_o       (predec_taken),
         .predec_target_o      (predec_target),
+        .predec_block_pc_o    (predec_block_pc),
+        .predec_branch_target_o(predec_branch_target),
         .predec_br_type_o     (predec_br_type),
+        .predec_ras_call_o    (predec_ras_call),
+        .predec_ras_ret_o     (predec_ras_ret),
+        .predec_ras_retaddr_o (predec_ras_retaddr),
         .ib_push0_valid_o     (ifu_ib0_valid),
         .ib_push0_pc_o        (ifu_ib0_pc),
         .ib_push0_inst_o      (ifu_ib0_inst),
@@ -430,13 +444,12 @@ module core_top #(
         .clk            (clk),
         .resetn         (aresetn),
         .ifu_req_i      (ifu_ic_req),
-        .ifu_vaddr_i    (ifu_ic_vaddr),
+        .ifu_vindex_i   (ifu_ic_vindex),
         .ifu_paddr_i    (ifu_ic_paddr),
         .ifu_uncached_i (ifu_ic_uncached),
         .ifu_addr_ok_o  (ic_ifu_addr_ok),
         .ifu_data_ok_o  (ic_ifu_data_ok),
         .ifu_rline_o    (ic_ifu_rline),
-        .ifu_cancel_i   (ifu_ic_cancel),
         .cacop_en_i     (cmt_icacop_valid),
         .cacop_op_i     (cmt_icacop_op),
         .cacop_addr_i   (cmt_icacop_addr),
@@ -582,7 +595,6 @@ module core_top #(
 //--------------------------------------------------
     decoder u_decoder0(
         .inst_i        (ib_pop0_inst),
-        .pc_i          (ib_pop0_pc),
         .csr_plv_i     (csr_crmd_plv),
         .csr_llbit_i   (csr_llbit),
         .futype_o      (dec0_futype),
@@ -614,7 +626,6 @@ module core_top #(
 
     decoder u_decoder1(
         .inst_i        (ib_pop1_inst),
-        .pc_i          (ib_pop1_pc),
         .csr_plv_i     (csr_crmd_plv),
         .csr_llbit_i   (csr_llbit),
         .futype_o      (dec1_futype),
@@ -677,7 +688,6 @@ module core_top #(
     wire [31:0]               rn_a0_inst, rn_a1_inst;
     wire                      rn_a0_rf_we, rn_a1_rf_we;
     wire [4:0]                rn_a0_rd, rn_a1_rd;
-    wire [`FU_NUM-1:0]        rn_a0_futype, rn_a1_futype;
     wire                      rn_a0_is_load, rn_a1_is_load;
     wire                      rn_a0_is_store, rn_a1_is_store;
     wire                      rn_a0_is_branch, rn_a1_is_branch;
@@ -704,6 +714,7 @@ module core_top #(
     wire [`WB_SRC_NUM-1:0]    dis0_wb_src_op, dis1_wb_src_op;
     wire [13:0]               dis0_csr_num, dis1_csr_num;
     wire                      dis0_is_cacop, dis1_is_cacop;
+    wire [4:3]                dis0_cacop_op, dis1_cacop_op;
     wire                      dis0_src0_ready, dis1_src0_ready;
     wire [31:0]               dis0_src0_val, dis1_src0_val;
     wire [`ROB_W-1:0]         dis0_src0_robid, dis1_src0_robid;
@@ -735,7 +746,7 @@ module core_top #(
         .clk               (clk),
         .reset             (reset),
         .flush_i           (flush),
-        .l0_csr_commit_i   (cmt_csr_we && `CSR_NUM_IS_L0_NOFLUSH(cmt_csr_wnum[11:0])),
+        .l0_csr_commit_i   (cmt_csr_we && `CSR_NUM_IS_L0_NOFLUSH(cmt_csr_wnum)),
         // 槽 0
         .ib0_valid_i       (ib_pop0_valid),
         .ib0_pc_i          (ib_pop0_pc),
@@ -839,7 +850,6 @@ module core_top #(
         .rob_a0_inst_o     (rn_a0_inst),
         .rob_a0_rf_we_o    (rn_a0_rf_we),
         .rob_a0_rd_o       (rn_a0_rd),
-        .rob_a0_futype_o   (rn_a0_futype),
         .rob_a0_is_load_o  (rn_a0_is_load),
         .rob_a0_is_store_o (rn_a0_is_store),
         .rob_a0_is_branch_o(rn_a0_is_branch),
@@ -858,7 +868,6 @@ module core_top #(
         .rob_a1_inst_o     (rn_a1_inst),
         .rob_a1_rf_we_o    (rn_a1_rf_we),
         .rob_a1_rd_o       (rn_a1_rd),
-        .rob_a1_futype_o   (rn_a1_futype),
         .rob_a1_is_load_o  (rn_a1_is_load),
         .rob_a1_is_store_o (rn_a1_is_store),
         .rob_a1_is_branch_o(rn_a1_is_branch),
@@ -888,6 +897,7 @@ module core_top #(
         .dis0_wb_src_op_o  (dis0_wb_src_op),
         .dis0_csr_num_o    (dis0_csr_num),
         .dis0_is_cacop_o   (dis0_is_cacop),
+        .dis0_cacop_op_o   (dis0_cacop_op),
         .dis0_src0_ready_o (dis0_src0_ready),
         .dis0_src0_val_o   (dis0_src0_val),
         .dis0_src0_robid_o   (dis0_src0_robid),
@@ -909,6 +919,7 @@ module core_top #(
         .dis1_wb_src_op_o  (dis1_wb_src_op),
         .dis1_csr_num_o    (dis1_csr_num),
         .dis1_is_cacop_o   (dis1_is_cacop),
+        .dis1_cacop_op_o   (dis1_cacop_op),
         .dis1_src0_ready_o (dis1_src0_ready),
         .dis1_src0_val_o   (dis1_src0_val),
         .dis1_src0_robid_o   (dis1_src0_robid),
@@ -1074,7 +1085,7 @@ module core_top #(
     wire                      rsa0_push_valid;
     wire [`ROB_W-1:0]         rsa0_push_robid;
     wire [31:0]               rsa0_push_pc;
-    wire [`ALU_OP_NUM-1:0]    rsa0_push_alu_op;
+    wire [14:0]               rsa0_push_alu_op;
     wire [`BR_OP_NUM-1:0]     rsa0_push_br_op;
     wire                      rsa0_push_src0_ready, rsa0_push_src1_ready;
     wire [31:0]               rsa0_push_src0_val,   rsa0_push_src1_val;
@@ -1085,7 +1096,7 @@ module core_top #(
     wire                      rsa0_issue_valid;
     wire [`ROB_W-1:0]         rsa0_issue_robid;
     wire [31:0]               rsa0_issue_pc;
-    wire [`ALU_OP_NUM-1:0]    rsa0_issue_alu_op;
+    wire [14:0]               rsa0_issue_alu_op;
     wire [`BR_OP_NUM-1:0]     rsa0_issue_br_op;
     wire [31:0]               rsa0_issue_src0, rsa0_issue_src1;
     wire [31:0]               rsa0_issue_imm;
@@ -1097,7 +1108,7 @@ module core_top #(
     wire                      rsa1_push_valid;
     wire [`ROB_W-1:0]         rsa1_push_robid;
     wire [31:0]               rsa1_push_pc;
-    wire [`ALU_OP_NUM-1:0]    rsa1_push_alu_op;
+    wire [14:0]               rsa1_push_alu_op;
     wire [`BR_OP_NUM-1:0]     rsa1_push_br_op;
     wire                      rsa1_push_src0_ready, rsa1_push_src1_ready;
     wire [31:0]               rsa1_push_src0_val,   rsa1_push_src1_val;
@@ -1108,7 +1119,7 @@ module core_top #(
     wire                      rsa1_issue_valid;
     wire [`ROB_W-1:0]         rsa1_issue_robid;
     wire [31:0]               rsa1_issue_pc;
-    wire [`ALU_OP_NUM-1:0]    rsa1_issue_alu_op;
+    wire [14:0]               rsa1_issue_alu_op;
     wire [`BR_OP_NUM-1:0]     rsa1_issue_br_op;
     wire [31:0]               rsa1_issue_src0, rsa1_issue_src1;
     wire [31:0]               rsa1_issue_imm;
@@ -1119,18 +1130,18 @@ module core_top #(
     wire [`RS_MEM_OCC_W-1:0]  rsm_occupancy;
     wire                      rsm_push_valid;
     wire [`ROB_W-1:0]         rsm_push_robid;
-    wire [31:0]               rsm_push_pc;
     wire [`MEM_OP_NUM-1:0]    rsm_push_mem_op;
     wire                      rsm_push_is_cacop;
+    wire [4:3]                rsm_push_cacop_op;
     wire                      rsm_push_src0_ready, rsm_push_src1_ready;
     wire [31:0]               rsm_push_src0_val,   rsm_push_src1_val;
     wire [`ROB_W-1:0]         rsm_push_src0_robid, rsm_push_src1_robid;
     wire [31:0]               rsm_push_imm;
     wire                      rsm_issue_valid;
     wire [`ROB_W-1:0]         rsm_issue_robid;
-    wire [31:0]               rsm_issue_pc;
     wire [`MEM_OP_NUM-1:0]    rsm_issue_mem_op;
     wire                      rsm_issue_is_cacop;
+    wire [4:3]                rsm_issue_cacop_op;
     wire [31:0]               rsm_issue_base, rsm_issue_wdata;
     wire [31:0]               rsm_issue_imm;
     wire                      lsu_ready;
@@ -1139,7 +1150,7 @@ module core_top #(
     wire [1:0]                rsd_occupancy;
     wire                      rsd_push_valid;
     wire [`ROB_W-1:0]         rsd_push_robid;
-    wire [`ALU_OP_NUM-1:0]    rsd_push_alu_op;
+    wire [18:12]              rsd_push_alu_op;
     wire [`CSR_OP_NUM-1:0]    rsd_push_csr_op;
     wire [13:0]               rsd_push_csr_num;
     wire [`TLB_OP_NUM-1:0]    rsd_push_tlb_op;
@@ -1149,7 +1160,7 @@ module core_top #(
     wire [`ROB_W-1:0]         rsd_push_src0_robid, rsd_push_src1_robid;
     wire                      rsd_issue_valid;
     wire [`ROB_W-1:0]         rsd_issue_robid;
-    wire [`ALU_OP_NUM-1:0]    rsd_issue_alu_op;
+    wire [18:12]              rsd_issue_alu_op;
     wire [`CSR_OP_NUM-1:0]    rsd_issue_csr_op;
     wire [13:0]               rsd_issue_csr_num;
     wire [`TLB_OP_NUM-1:0]    rsd_issue_tlb_op;
@@ -1173,6 +1184,7 @@ module core_top #(
         .dis0_wb_src_op_i    (dis0_wb_src_op),
         .dis0_csr_num_i      (dis0_csr_num),
         .dis0_is_cacop_i     (dis0_is_cacop),
+        .dis0_cacop_op_i     (dis0_cacop_op),
         .dis0_src0_ready_i   (dis0_src0_ready),
         .dis0_src0_val_i     (dis0_src0_val),
         .dis0_src0_robid_i     (dis0_src0_robid),
@@ -1194,6 +1206,7 @@ module core_top #(
         .dis1_wb_src_op_i    (dis1_wb_src_op),
         .dis1_csr_num_i      (dis1_csr_num),
         .dis1_is_cacop_i     (dis1_is_cacop),
+        .dis1_cacop_op_i     (dis1_cacop_op),
         .dis1_src0_ready_i   (dis1_src0_ready),
         .dis1_src0_val_i     (dis1_src0_val),
         .dis1_src0_robid_i     (dis1_src0_robid),
@@ -1261,9 +1274,9 @@ module core_top #(
         .rs_mem_can_accept_i (rsm_can_accept),
         .rs_mem_push_valid_o (rsm_push_valid),
         .rs_mem_push_robid_o (rsm_push_robid),
-        .rs_mem_push_pc_o    (rsm_push_pc),
         .rs_mem_push_mem_op_o(rsm_push_mem_op),
         .rs_mem_push_is_cacop_o(rsm_push_is_cacop),
+        .rs_mem_push_cacop_op_o(rsm_push_cacop_op),
         .rs_mem_push_src0_ready_o(rsm_push_src0_ready),
         .rs_mem_push_src0_val_o  (rsm_push_src0_val),
         .rs_mem_push_src0_robid_o(rsm_push_src0_robid),
@@ -1399,9 +1412,9 @@ module core_top #(
         .flush_i        (flush),
         .push_valid_i   (rsm_push_valid),
         .push_robid_i   (rsm_push_robid),
-        .push_pc_i      (rsm_push_pc),
         .push_mem_op_i  (rsm_push_mem_op),
         .push_is_cacop_i(rsm_push_is_cacop),
+        .push_cacop_op_i (rsm_push_cacop_op),
         .push_src0_ready_i(rsm_push_src0_ready),
         .push_src0_val_i  (rsm_push_src0_val),
         .push_src0_robid_i(rsm_push_src0_robid),
@@ -1431,9 +1444,9 @@ module core_top #(
         .early2_robid_i (lsu_early_robid),
         .issue_valid_o  (rsm_issue_valid),
         .issue_robid_o  (rsm_issue_robid),
-        .issue_pc_o     (rsm_issue_pc),
         .issue_mem_op_o (rsm_issue_mem_op),
         .issue_is_cacop_o(rsm_issue_is_cacop),
+        .issue_cacop_op_o(rsm_issue_cacop_op),
         .issue_base_o   (rsm_issue_base),
         .issue_wdata_o  (rsm_issue_wdata),
         .issue_imm_o    (rsm_issue_imm),
@@ -1512,9 +1525,7 @@ module core_top #(
         .wb_br_taken_o   (alu0_wb_br_taken),
         .wb_br_target_o  (alu0_wb_br_target),
         .early_wakeup_valid_o(alu0_early_valid),
-        .early_wakeup_robid_o(alu0_early_robid),
-        .ex_redirect_valid_o (alu0_exred_valid),
-        .ex_redirect_pc_o    (alu0_exred_pc)
+        .early_wakeup_robid_o(alu0_early_robid)
     );
 
     fu_alu u_fu_alu1(
@@ -1537,9 +1548,7 @@ module core_top #(
         .wb_br_taken_o   (alu1_wb_br_taken),
         .wb_br_target_o  (alu1_wb_br_target),
         .early_wakeup_valid_o(alu1_early_valid),
-        .early_wakeup_robid_o(alu1_early_robid),
-        .ex_redirect_valid_o (alu1_exred_valid),
-        .ex_redirect_pc_o    (alu1_exred_pc)
+        .early_wakeup_robid_o(alu1_early_robid)
     );
 
 //--------------------------------------------------
@@ -1583,11 +1592,12 @@ module core_top #(
     wire        lsu_mmu_is_store;
     wire [31:0] mmu_d_paddr;
     wire [1:0]  mmu_d_mat;
-    wire [`TLB_EX_NUM-1:0] mmu_d_tlb_ex;
+    wire        mmu_d_ex_tlbr, mmu_d_ex_pil, mmu_d_ex_pis;
+    wire        mmu_d_ex_ppi,  mmu_d_ex_pme;
     wire        mmu_d_adem;
     // LSU <-> DCache load 口（含非阻塞 miss 扩展通道）
     wire        lsu_dc_req;
-    wire [31:0] lsu_dc_vaddr;
+    wire [11:5] lsu_dc_vindex;
     wire [31:0] lsu_dc_paddr;
     wire [2:0]  lsu_dc_size;
     wire        lsu_dc_uncached;
@@ -1596,13 +1606,21 @@ module core_top #(
     wire        dc_lsu_data_ok;
     wire [31:0] dc_lsu_rdata;
     wire        lsu_dc_cancel;
-    wire        dc_lsu_miss;         // load 移入 MSHR（hit-under-miss）
+    wire        dc_lsu_miss;         // load 移入 MSHR；D$ 组合产生，LSU 寄存完成状态
     wire        dc_lsu_mshr_ok;      // MSHR 重填数据返回（CWF-lite 提前回）
     wire [31:0] dc_lsu_mshr_rdata;
     wire [`ROB_W-1:0] dc_lsu_mshr_robid;
     // LSU <-> store buffer 前递查询
-    wire [31:0] lsu_sb_qpaddr;
-    wire        lsu_sb_quncached;    // 查询来自 uncached load（设备写序保证）
+    wire [31:2] lsu_sb_qpaddr;
+    wire        lsu_sb_quncached;
+    // commit→SB→LSU STQ 释放（须在 LSU 例化前声明）
+    wire        cmt_sb_push_valid;
+    wire [`ROB_W-1:0] cmt_sb_push_robid;
+    wire [31:0] cmt_sb_push_paddr;
+    wire [31:0] cmt_sb_push_data;
+    wire [3:0]  cmt_sb_push_wstrb;
+    wire [2:0]  cmt_sb_push_size;
+    wire        cmt_sb_push_uncached;    // 查询来自 uncached load（设备写序保证）
     wire        sb_q_hit;
     wire [31:0] sb_q_data;
     wire        sb_q_partial;
@@ -1623,9 +1641,9 @@ module core_top #(
         .flush_i          (flush),
         .issue_valid_i    (rsm_issue_valid),
         .issue_robid_i    (rsm_issue_robid),
-        .issue_pc_i       (rsm_issue_pc),
         .issue_mem_op_i   (rsm_issue_mem_op),
         .issue_is_cacop_i (rsm_issue_is_cacop),
+        .issue_cacop_op_i  (rsm_issue_cacop_op),
         .issue_base_i     (rsm_issue_base),
         .issue_wdata_i    (rsm_issue_wdata),
         .issue_imm_i      (rsm_issue_imm),
@@ -1635,10 +1653,14 @@ module core_top #(
         .mmu_d_is_store_o (lsu_mmu_is_store),
         .mmu_d_paddr_i    (mmu_d_paddr),
         .mmu_d_mat_i      (mmu_d_mat),
-        .mmu_d_tlb_ex_i   (mmu_d_tlb_ex),
+        .mmu_d_excp_tlbr_i(mmu_d_ex_tlbr),
+        .mmu_d_excp_pil_i (mmu_d_ex_pil),
+        .mmu_d_excp_pis_i (mmu_d_ex_pis),
+        .mmu_d_excp_ppi_i (mmu_d_ex_ppi),
+        .mmu_d_excp_pme_i (mmu_d_ex_pme),
         .mmu_d_excp_adem_i(mmu_d_adem),
         .dc_req_o         (lsu_dc_req),
-        .dc_vaddr_o       (lsu_dc_vaddr),
+        .dc_vindex_o      (lsu_dc_vindex),
         .dc_paddr_o       (lsu_dc_paddr),
         .dc_size_o        (lsu_dc_size),
         .dc_uncached_o    (lsu_dc_uncached),
@@ -1658,6 +1680,8 @@ module core_top #(
         .sb_query_partial_i(sb_q_partial),
         .rob_head_robid_i (lsu_rob_head_enc),
         .rob_head_valid_i (~rob_empty),
+        .st_retire_valid_i(cmt_sb_push_valid),
+        .st_retire_robid_i(cmt_sb_push_robid),
         .uncached_ld_inflight_o(lsu_unc_inflight),
         .wb_valid_o       (mem_wb_valid_raw),
         .wb_robid_o       (mem_wb_robid_raw),
@@ -1672,7 +1696,7 @@ module core_top #(
         .early_wakeup_robid_o(lsu_early_robid_raw)
     );
 
-    // V3.4@55MHz：`LSU_WB_PIPE` 时 LSU 写回整总线打一拍再进 RS/ROB，
+    // `LSU_WB_PIPE` 打开时，LSU 写回整总线打一拍再进 RS/ROB，
     // 切断 D$ hit → mem_wb_valid → RS 组合长链（合规 RTL 切割，非改综实参数）。
     generate if (`LSU_WB_PIPE != 0) begin : g_mem_wb_pipe
         reg                      mem_wb_valid_r;
@@ -1727,7 +1751,7 @@ module core_top #(
         assign mem_wb_excp     = mem_wb_excp_raw;
     end endgenerate
 
-    // V3.4：`LSU_EARLY2_PIPE` 时 early2 打一拍再进三 RS，切断 D$ hit→RS ready 组合链。
+    // `LSU_EARLY2_PIPE` 打开时，early2 打一拍再进三 RS，切断 D$ hit→RS ready 组合链。
     // 与 hold 写回同拍到达时 early2 退化为与 WB 同位（仍正确）；未打拍则保持同拍早唤醒。
     generate if (`LSU_EARLY2_PIPE != 0) begin : g_early2_pipe
         reg                      lsu_early_valid_r;
@@ -1751,12 +1775,6 @@ module core_top #(
 //--------------------------------------------------
 // store_buffer：提交后写缓冲 / 按序写出
 //--------------------------------------------------
-    wire        cmt_sb_push_valid;
-    wire [31:0] cmt_sb_push_paddr;
-    wire [31:0] cmt_sb_push_data;
-    wire [3:0]  cmt_sb_push_wstrb;
-    wire [2:0]  cmt_sb_push_size;
-    wire        cmt_sb_push_uncached;
     // SB -> DCache store 写出
     wire        sb_dc_wr_req;
     wire [31:0] sb_dc_wr_paddr;
@@ -1765,7 +1783,7 @@ module core_top #(
     wire [2:0]  sb_dc_wr_size;
     wire        sb_dc_wr_uncached;
     wire        dc_sb_addr_ok;
-    wire        dc_sb_done;
+    wire        dc_sb_done;  // D$ st_done 组合；SB 内部寄存一拍后再 pop
 
     store_buffer u_store_buffer(
         .clk             (clk),
@@ -1827,6 +1845,21 @@ module core_top #(
     wire [`TLB_OP_NUM-1:0] rob_cmt0_tlb_op, rob_cmt1_tlb_op;
     wire [4:0]  rob_cmt0_cacop_code, rob_cmt1_cacop_code;
     wire [`EXCP_NUM-1:0] rob_cmt0_excp, rob_cmt1_excp;
+
+    // 把 FTQ 提交包回配到 ROB 头槽，读取 is_direct_b。
+    // （区分 direct B vs ordinary JIRL，供 JTC 训练）。
+    wire cmt_ftq_match_rob0 =
+        cmt_ftq_valid && (cmt_ftq_pc == rob_cmt0_pc) &&
+        (cmt_ftq_id == rob_cmt0_ftq_id);
+    wire cmt_ftq_match_rob1 =
+        cmt_ftq_valid && (cmt_ftq_pc == rob_cmt1_pc) &&
+        (cmt_ftq_id == rob_cmt1_ftq_id);
+    assign cmt_ftq_is_direct_b_stat =
+        cmt_ftq_valid && cmt_ftq_is_branch &&
+        (cmt_ftq_br_type == `BR_TYPE_UNCOND) &&
+        ((cmt_ftq_match_rob0 && rob_cmt0_is_direct_b) ||
+         (cmt_ftq_match_rob1 && rob_cmt1_is_direct_b));
+
     // commit -> ROB 推进
     wire        cmt_rob_pop, cmt_rob_clear0, cmt_rob_clear1;
     // commit -> CSR 提交
@@ -1842,7 +1875,6 @@ module core_top #(
     wire [31:0] cmt_csr_wmask;
     wire [31:0] cmt_csr_wvalue;
     wire        cmt_ll_set, cmt_sc_set;
-    wire [27:0] cmt_lladdr;
     // commit -> TLB 维护
     wire [`TLB_OP_NUM-1:0] cmt_tlb_op;
     wire [9:0]  cmt_invtlb_asid;
@@ -1853,11 +1885,11 @@ module core_top #(
     wire [31:0] cmt_dcacop_addr;
     // CSR -> commit
     wire [31:0] csr_next_pc;
-    wire [1:0]  csr_redirect;
     // commit 调试/difftest 口
     wire        cmt_dbg0_valid, cmt_dbg1_valid;
     wire [31:0] cmt_dbg0_pc,    cmt_dbg1_pc;
-    wire [3:0]  cmt_dbg0_wen,   cmt_dbg1_wen;
+    wire [3:0]  cmt_dbg0_wen;
+    wire        cmt_dbg1_we;
     wire [4:0]  cmt_dbg0_wnum,  cmt_dbg1_wnum;
     wire [31:0] cmt_dbg0_wdata, cmt_dbg1_wdata;
     wire [31:0] cmt_dbg0_inst,  cmt_dbg1_inst;
@@ -1878,7 +1910,6 @@ module core_top #(
         .a0_inst_i        (rn_a0_inst),
         .a0_rf_we_i       (rn_a0_rf_we),
         .a0_rd_i          (rn_a0_rd),
-        .a0_futype_i      (rn_a0_futype),
         .a0_is_load_i     (rn_a0_is_load),
         .a0_is_store_i    (rn_a0_is_store),
         .a0_is_branch_i   (rn_a0_is_branch),
@@ -1897,7 +1928,6 @@ module core_top #(
         .a1_inst_i        (rn_a1_inst),
         .a1_rf_we_i       (rn_a1_rf_we),
         .a1_rd_i          (rn_a1_rd),
-        .a1_futype_i      (rn_a1_futype),
         .a1_is_load_i     (rn_a1_is_load),
         .a1_is_store_i    (rn_a1_is_store),
         .a1_is_branch_i   (rn_a1_is_branch),
@@ -2014,8 +2044,6 @@ module core_top #(
 // commit：提交级（双提交仲裁 + 异常/特权/误预测处理）
 //--------------------------------------------------
     commit u_commit(
-        .clk               (clk),
-        .reset             (reset),
         .flush_pending_i   (flush),   // ctrl 寄存器版 flush:广播拍闸住退休,防误提交
         .head_robid0_i     (rob_head_robid0),
         .cmt0_valid_i      (rob_cmt0_valid),
@@ -2023,12 +2051,10 @@ module core_top #(
         .cmt0_pc_i         (rob_cmt0_pc),
         .cmt0_inst_i       (rob_cmt0_inst),
         .cmt0_inst_is_b0_i (rob_cmt0_inst_is_b0),
-        .cmt0_is_direct_b_i(rob_cmt0_is_direct_b),
         .cmt0_rf_we_i      (rob_cmt0_rf_we),
         .cmt0_rd_i         (rob_cmt0_rd),
         .cmt0_result_i     (rob_cmt0_result),
         .cmt0_result2_i    (rob_cmt0_result2),
-        .cmt0_is_load_i    (rob_cmt0_is_load),
         .cmt0_is_store_i   (rob_cmt0_is_store),
         .cmt0_paddr_i      (rob_cmt0_paddr),
         .cmt0_vaddr_i      (rob_cmt0_vaddr),
@@ -2057,7 +2083,6 @@ module core_top #(
         .cmt1_rd_i         (rob_cmt1_rd),
         .cmt1_result_i     (rob_cmt1_result),
         .cmt1_result2_i    (rob_cmt1_result2),
-        .cmt1_is_load_i    (rob_cmt1_is_load),
         .cmt1_is_store_i   (rob_cmt1_is_store),
         .cmt1_paddr_i      (rob_cmt1_paddr),
         .cmt1_vaddr_i      (rob_cmt1_vaddr),
@@ -2097,6 +2122,7 @@ module core_top #(
         .sb_push_wstrb_o   (cmt_sb_push_wstrb),
         .sb_push_size_o    (cmt_sb_push_size),
         .sb_push_uncached_o(cmt_sb_push_uncached),
+        .sb_push_robid_o   (cmt_sb_push_robid),
         .sb_full_i         (sb_full),
         .sb_empty_i        (sb_empty),
         .csr_cmt_valid_o   (cmt_csr_valid),
@@ -2119,10 +2145,8 @@ module core_top #(
         .csr_wvalue_o      (cmt_csr_wvalue),
         .ll_set_o          (cmt_ll_set),
         .sc_set_o          (cmt_sc_set),
-        .lladdr_o          (cmt_lladdr),
         .has_int_i         (csr_has_int),
         .csr_next_pc_i     (csr_next_pc),
-        .csr_redirect_i    (csr_redirect),
         .tlb_op_cmt_o      (cmt_tlb_op),
         .invtlb_asid_o     (cmt_invtlb_asid),
         .invtlb_vpn_o      (cmt_invtlb_vpn),
@@ -2134,7 +2158,6 @@ module core_top #(
         .dcacop_addr_o     (cmt_dcacop_addr),
         .ftq_cmt_valid_o   (cmt_ftq_valid),
         .ftq_cmt_id_o      (cmt_ftq_id),
-        .ftq_cmt_is_last_o (cmt_ftq_is_last),
         .ftq_cmt_release_o (cmt_ftq_release),
         .ftq_cmt_is_branch_o(cmt_ftq_is_branch),
         .ftq_cmt_taken_o   (cmt_ftq_taken),
@@ -2160,7 +2183,7 @@ module core_top #(
         .debug0_inst_o     (cmt_dbg0_inst),
         .debug1_valid_o    (cmt_dbg1_valid),
         .debug1_pc_o       (cmt_dbg1_pc),
-        .debug1_rf_wen_o   (cmt_dbg1_wen),
+        .debug1_rf_we_o    (cmt_dbg1_we),
         .debug1_rf_wnum_o  (cmt_dbg1_wnum),
         .debug1_rf_wdata_o (cmt_dbg1_wdata),
         .debug1_inst_o     (cmt_dbg1_inst)
@@ -2176,8 +2199,21 @@ module core_top #(
     wire        csr_crmd_da, csr_crmd_pg;
     wire [1:0]  csr_crmd_datf, csr_crmd_datm;
     wire [9:0]  csr_asid;
-    wire [31:0] csr_tlbidx, csr_tlbehi, csr_tlbelo0, csr_tlbelo1;
-    wire [31:0] csr_dmw0, csr_dmw1;
+    wire        csr_tlbidx_ne;
+    wire [5:0]  csr_tlbidx_ps;
+    wire [4:0]  csr_tlbidx_index;
+    wire [18:0] csr_tlbehi_vppn;
+    wire [19:0] csr_tlbelo0_ppn, csr_tlbelo1_ppn;
+    wire [1:0]  csr_tlbelo0_plv, csr_tlbelo1_plv;
+    wire [1:0]  csr_tlbelo0_mat, csr_tlbelo1_mat;
+    wire        csr_tlbelo0_d, csr_tlbelo0_v, csr_tlbelo0_g;
+    wire        csr_tlbelo1_d, csr_tlbelo1_v, csr_tlbelo1_g;
+    wire [2:0]  csr_dmw0_vseg, csr_dmw0_pseg;
+    wire [1:0]  csr_dmw0_mat;
+    wire        csr_dmw0_plv3, csr_dmw0_plv0;
+    wire [2:0]  csr_dmw1_vseg, csr_dmw1_pseg;
+    wire [1:0]  csr_dmw1_mat;
+    wire        csr_dmw1_plv3, csr_dmw1_plv0;
     wire [4:0]  csr_rand_index;
     wire [7:0]  csr_estat_ecode;
     // mmu <-> tlb_manager
@@ -2191,6 +2227,7 @@ module core_top #(
     wire        tlbm_inst_ex_adef;   // PLV3 取指越界（ADEF 特权子情形）
     wire        tlbm_inst_ex_tlbr, tlbm_inst_ex_pif, tlbm_inst_ex_ppi;
     wire        tlbm_inst_direct_ok;
+    wire        tlbm_inst_direct_excp; // 直发路径专用（仅 CAM 口径）
     wire [31:0] tlbm_data_paddr;
     wire [1:0]  tlbm_data_mat;
     wire        tlbm_data_ex_adem;   // PLV3 访存越界（ADEM）
@@ -2199,7 +2236,9 @@ module core_top #(
     // tlb_manager -> CSR（tlbsrch/tlbrd 回读）
     wire        tlbsrch_found;
     wire [4:0]  tlbsrch_index;
-    wire [31:0] tlbrd_tlbidx, tlbrd_tlbehi, tlbrd_tlbelo0, tlbrd_tlbelo1;
+    wire        tlbrd_ne;
+    wire [5:0]  tlbrd_ps;
+    wire [31:0] tlbrd_tlbehi, tlbrd_tlbelo0, tlbrd_tlbelo1;
     wire [9:0]  tlbrd_asid;
     // invtlb 类型编码（one-hot tlb_op -> 5bit op 号）
     wire [4:0]  cmt_invtlb_op = cmt_tlb_op[`TLB_OP_INVTLB_1] ? 5'd1 :
@@ -2217,13 +2256,18 @@ module core_top #(
         .i_excp_adef_o     (mmu_i_adef),
         .i_tlb_ex_o        (mmu_i_tlb_ex),
         .i_direct_ok_o     (mmu_i_direct_ok),
+        .i_direct_excp_o   (mmu_i_direct_excp),
         .d_req_i           (lsu_mmu_req),
         .d_is_store_i      (lsu_mmu_is_store),
         .d_vaddr_i         (lsu_mmu_vaddr),
         .d_paddr_o         (mmu_d_paddr),
         .d_mat_o           (mmu_d_mat),
         .d_excp_adem_o     (mmu_d_adem),
-        .d_tlb_ex_o        (mmu_d_tlb_ex),
+        .d_excp_tlbr_o     (mmu_d_ex_tlbr),
+        .d_excp_pil_o      (mmu_d_ex_pil),
+        .d_excp_pis_o      (mmu_d_ex_pis),
+        .d_excp_ppi_o      (mmu_d_ex_ppi),
+        .d_excp_pme_o      (mmu_d_ex_pme),
         .tlbm_inst_req_o   (mmu_tlbm_inst_req),
         .tlbm_inst_vaddr_o (mmu_tlbm_inst_vaddr),
         .tlbm_data_req_o   (mmu_tlbm_data_req),
@@ -2236,6 +2280,7 @@ module core_top #(
         .tlbm_inst_ex_pif_i(tlbm_inst_ex_pif),
         .tlbm_inst_ex_ppi_i(tlbm_inst_ex_ppi),
         .tlbm_inst_direct_ok_i(tlbm_inst_direct_ok),
+        .tlbm_inst_direct_excp_i(tlbm_inst_direct_excp),
         .tlbm_data_paddr_i (tlbm_data_paddr),
         .tlbm_data_mat_i   (tlbm_data_mat),
         .tlbm_data_ex_tlbr_i(tlbm_data_ex_tlbr),
@@ -2260,15 +2305,35 @@ module core_top #(
         .csr_crmd_datf  (csr_crmd_datf),
         .csr_crmd_datm  (csr_crmd_datm),
         .csr_asid       (csr_asid),
-        .csr_tlbidx     (csr_tlbidx),
-        .csr_tlbehi     (csr_tlbehi),
-        .csr_tlbelo0    (csr_tlbelo0),
-        .csr_tlbelo1    (csr_tlbelo1),
-        .csr_dmw0       (csr_dmw0),
-        .csr_dmw1       (csr_dmw1),
+        .csr_tlbidx_ne  (csr_tlbidx_ne),
+        .csr_tlbidx_ps  (csr_tlbidx_ps),
+        .csr_tlbidx_index(csr_tlbidx_index),
+        .csr_tlbehi_vppn(csr_tlbehi_vppn),
+        .csr_tlbelo0_ppn(csr_tlbelo0_ppn),
+        .csr_tlbelo0_plv(csr_tlbelo0_plv),
+        .csr_tlbelo0_mat(csr_tlbelo0_mat),
+        .csr_tlbelo0_d  (csr_tlbelo0_d),
+        .csr_tlbelo0_v  (csr_tlbelo0_v),
+        .csr_tlbelo0_g  (csr_tlbelo0_g),
+        .csr_tlbelo1_ppn(csr_tlbelo1_ppn),
+        .csr_tlbelo1_plv(csr_tlbelo1_plv),
+        .csr_tlbelo1_mat(csr_tlbelo1_mat),
+        .csr_tlbelo1_d  (csr_tlbelo1_d),
+        .csr_tlbelo1_v  (csr_tlbelo1_v),
+        .csr_tlbelo1_g  (csr_tlbelo1_g),
+        .csr_dmw0_vseg  (csr_dmw0_vseg),
+        .csr_dmw0_pseg  (csr_dmw0_pseg),
+        .csr_dmw0_mat   (csr_dmw0_mat),
+        .csr_dmw0_plv3  (csr_dmw0_plv3),
+        .csr_dmw0_plv0  (csr_dmw0_plv0),
+        .csr_dmw1_vseg  (csr_dmw1_vseg),
+        .csr_dmw1_pseg  (csr_dmw1_pseg),
+        .csr_dmw1_mat   (csr_dmw1_mat),
+        .csr_dmw1_plv3  (csr_dmw1_plv3),
+        .csr_dmw1_plv0  (csr_dmw1_plv0),
         .csr_estat_ecode(csr_estat_ecode),
         .csr_rand_index (csr_rand_index),
-        .tlb_op         (cmt_tlb_op),
+        .tlb_mut_op     (cmt_tlb_op[`TLB_OP_NUM-1:2]),
         .invtlb_op      (cmt_invtlb_op),
         .invtlb_asid    (cmt_invtlb_asid),
         .invtlb_vpn     (cmt_invtlb_vpn),
@@ -2279,6 +2344,7 @@ module core_top #(
         .inst_ex_pif    (tlbm_inst_ex_pif),
         .inst_ex_ppi    (tlbm_inst_ex_ppi),
         .inst_direct_ok (tlbm_inst_direct_ok),
+        .inst_direct_excp(tlbm_inst_direct_excp),
         .data_paddr     (tlbm_data_paddr),
         .data_mat       (tlbm_data_mat),
         .data_ex_adem   (tlbm_data_ex_adem),
@@ -2289,7 +2355,8 @@ module core_top #(
         .data_ex_pme    (tlbm_data_ex_pme),
         .tlbsrch_found  (tlbsrch_found),
         .tlbsrch_index  (tlbsrch_index),
-        .tlbrd_tlbidx   (tlbrd_tlbidx),
+        .tlbrd_ne       (tlbrd_ne),
+        .tlbrd_ps       (tlbrd_ps),
         .tlbrd_tlbehi   (tlbrd_tlbehi),
         .tlbrd_tlbelo0  (tlbrd_tlbelo0),
         .tlbrd_tlbelo1  (tlbrd_tlbelo1),
@@ -2301,8 +2368,6 @@ module core_top #(
 //--------------------------------------------------
 // CSR：寄存器组与异常提交处理
 //--------------------------------------------------
-    wire [31:0] csr_crmd_live_unused;
-    wire [27:0] csr_lladdr_unused;
 
 `ifdef DIFFTEST_EN
     wire [31:0] diff_csr_crmd,   diff_csr_prmd,  diff_csr_euen,   diff_csr_ecfg;
@@ -2318,14 +2383,15 @@ module core_top #(
     csr_exception_commit_handler u_csr_exception_commit_handler(
         .clk            (clk),
         .reset          (reset),
-        .csr_rnum       (mdu_csr_raddr[11:0]),     // fu_mdu 执行级读 CSR 旧值
-        .csr_num        (cmt_csr_wnum[11:0]),      // commit 提交级写 CSR
+        .csr_rnum       (mdu_csr_raddr),           // fu_mdu 执行级读 CSR 旧值（完整 14 位）
+        .csr_num        (cmt_csr_wnum),            // commit 提交级写 CSR（完整 14 位）
         .csr_we         (cmt_csr_we),
         .csr_wmask      (cmt_csr_wmask),
         .csr_wvalue     (cmt_csr_wvalue),
         .tlbsrch_found  (tlbsrch_found),
         .tlbsrch_index  (tlbsrch_index),
-        .tlbrd_tlbidx   (tlbrd_tlbidx),
+        .tlbrd_ne       (tlbrd_ne),
+        .tlbrd_ps       (tlbrd_ps),
         .tlbrd_tlbehi   (tlbrd_tlbehi),
         .tlbrd_tlbelo0  (tlbrd_tlbelo0),
         .tlbrd_tlbelo1  (tlbrd_tlbelo1),
@@ -2337,7 +2403,8 @@ module core_top #(
         .wb_is_ertn     (cmt_csr_ertn),
         .wb_vaddr       (cmt_csr_vaddr),
         .wb_ex          (cmt_csr_ex),
-        .wb_tlb_op      (cmt_tlb_op),
+        .wb_tlbsrch     (cmt_tlb_op[`TLB_OP_TLBSRCH]),
+        .wb_tlbrd       (cmt_tlb_op[`TLB_OP_TLBRD]),
         .INT_valid      (cmt_excp_int),
         .ADEF_valid     (cmt_excp_adef),
         .ADEM_valid     (cmt_excp_adem),
@@ -2349,9 +2416,7 @@ module core_top #(
         .INE_valid      (cmt_excp_ine),
         .ll_set_in      (cmt_ll_set),
         .sc_set_in      (cmt_sc_set),
-        .lladdr_in      (cmt_lladdr),
         .csr_next_pc    (csr_next_pc),
-        .csr_redirect   (csr_redirect),
         .has_int        (csr_has_int),
         .csr_rvalue     (csr_rvalue),
         .csr_tid_out    (csr_tid),
@@ -2359,19 +2424,37 @@ module core_top #(
         .csr_crmd_pg_out(csr_crmd_pg),
         .csr_crmd_plv_out(csr_crmd_plv),
         .csr_asid_out   (csr_asid),
-        .csr_tlbidx_out (csr_tlbidx),
-        .csr_tlbehi_out (csr_tlbehi),
-        .csr_tlbelo0_out(csr_tlbelo0),
-        .csr_tlbelo1_out(csr_tlbelo1),
-        .csr_dmw0_out   (csr_dmw0),
-        .csr_dmw1_out   (csr_dmw1),
+        .csr_tlbidx_ne_out(csr_tlbidx_ne),
+        .csr_tlbidx_ps_out(csr_tlbidx_ps),
+        .csr_tlbidx_index_out(csr_tlbidx_index),
+        .csr_tlbehi_vppn_out(csr_tlbehi_vppn),
+        .csr_tlbelo0_ppn_out(csr_tlbelo0_ppn),
+        .csr_tlbelo0_plv_out(csr_tlbelo0_plv),
+        .csr_tlbelo0_mat_out(csr_tlbelo0_mat),
+        .csr_tlbelo0_d_out(csr_tlbelo0_d),
+        .csr_tlbelo0_v_out(csr_tlbelo0_v),
+        .csr_tlbelo0_g_out(csr_tlbelo0_g),
+        .csr_tlbelo1_ppn_out(csr_tlbelo1_ppn),
+        .csr_tlbelo1_plv_out(csr_tlbelo1_plv),
+        .csr_tlbelo1_mat_out(csr_tlbelo1_mat),
+        .csr_tlbelo1_d_out(csr_tlbelo1_d),
+        .csr_tlbelo1_v_out(csr_tlbelo1_v),
+        .csr_tlbelo1_g_out(csr_tlbelo1_g),
+        .csr_dmw0_vseg_out(csr_dmw0_vseg),
+        .csr_dmw0_pseg_out(csr_dmw0_pseg),
+        .csr_dmw0_mat_out(csr_dmw0_mat),
+        .csr_dmw0_plv3_out(csr_dmw0_plv3),
+        .csr_dmw0_plv0_out(csr_dmw0_plv0),
+        .csr_dmw1_vseg_out(csr_dmw1_vseg),
+        .csr_dmw1_pseg_out(csr_dmw1_pseg),
+        .csr_dmw1_mat_out(csr_dmw1_mat),
+        .csr_dmw1_plv3_out(csr_dmw1_plv3),
+        .csr_dmw1_plv0_out(csr_dmw1_plv0),
         .csr_rand_index_out(csr_rand_index),
         .csr_crmd_datf_out(csr_crmd_datf),
         .csr_crmd_datm_out(csr_crmd_datm),
         .csr_estat_ecode_out(csr_estat_ecode),
-        .csr_crmd_out   (csr_crmd_live_unused),
         .csr_llbit_out  (csr_llbit),
-        .csr_lladdr_out (csr_lladdr_unused),
         .diff_timer_64  (timer_64)
 `ifdef DIFFTEST_EN
         ,
@@ -2422,10 +2505,13 @@ module core_top #(
     wire         dc_l2_wr_req;
     wire [2:0]   dc_l2_wr_type;
     wire [31:0]  dc_l2_wr_addr;
-    wire [15:0]  dc_l2_wr_strb;
+    wire [3:0]   dc_l2_wr_strb;
     wire [127:0] dc_l2_wr_data;
     wire         dc_l2_wr_cacop;
     wire         l2_dc_wr_rdy;
+    wire         dc_l2_cacop_req;
+    wire [31:0]  dc_l2_cacop_addr;
+    wire         l2_dc_cacop_done;
     // L2 <-> AXI 桥互联（读口 0：D 侧/旁路，走桥 dc 通道 ARID=1）
     wire         l2_mem_rd_req;
     wire [2:0]   l2_mem_rd_type;
@@ -2445,13 +2531,12 @@ module core_top #(
     wire         l2_mem_wr_req;
     wire [2:0]   l2_mem_wr_type;
     wire [31:0]  l2_mem_wr_addr;
-    wire [15:0]  l2_mem_wr_strb;
+    wire [3:0]   l2_mem_wr_strb;
     wire [127:0] l2_mem_wr_data;
     wire         mem_l2_wr_rdy;
     // AXI 桥 <-> 顶层 AXI 引脚
     wire         axi_awvalid_line;
     wire [31:0]  axi_awaddr_line;
-    wire [2:0]   axi_awburst_line;
     wire [3:0]   axi_awlen_line;
     wire [2:0]   axi_awsize_line;
     wire         axi_wvalid_line;
@@ -2462,7 +2547,6 @@ module core_top #(
     wire         axi_arvalid_line;
     wire [3:0]   axi_arid_line;
     wire [31:0]  axi_araddr_line;
-    wire [2:0]   axi_arburst_line;
     wire [3:0]   axi_arlen_line;
     wire [2:0]   axi_arsize_line;
     wire         axi_rready_line;
@@ -2471,7 +2555,7 @@ module core_top #(
         .clk            (clk),
         .resetn         (aresetn),
         .ld_req_i       (lsu_dc_req),
-        .ld_vaddr_i     (lsu_dc_vaddr),
+        .ld_vindex_i    (lsu_dc_vindex),
         .ld_paddr_i     (lsu_dc_paddr),
         .ld_size_i      (lsu_dc_size),
         .ld_uncached_i  (lsu_dc_uncached),
@@ -2508,7 +2592,10 @@ module core_top #(
         .axi_wr_strb    (dc_l2_wr_strb),
         .axi_wr_data    (dc_l2_wr_data),
         .axi_wr_cacop   (dc_l2_wr_cacop),
-        .axi_wr_rdy     (l2_dc_wr_rdy)
+        .axi_wr_rdy     (l2_dc_wr_rdy),
+        .l2_cacop_req   (dc_l2_cacop_req),
+        .l2_cacop_addr  (dc_l2_cacop_addr),
+        .l2_cacop_done  (l2_dc_cacop_done)
     );
     l2cache u_l2cache(
         .clk           (clk),
@@ -2534,6 +2621,9 @@ module core_top #(
         .dc_wr_data    (dc_l2_wr_data),
         .dc_wr_cacop   (dc_l2_wr_cacop),
         .dc_wr_rdy     (l2_dc_wr_rdy),
+        .dc_cacop_req  (dc_l2_cacop_req),
+        .dc_cacop_addr (dc_l2_cacop_addr),
+        .dc_cacop_done (l2_dc_cacop_done),
         .mem_rd_req    (l2_mem_rd_req),
         .mem_rd_type   (l2_mem_rd_type),
         .mem_rd_addr   (l2_mem_rd_addr),
@@ -2583,7 +2673,6 @@ module core_top #(
         .dc_wr_rdy     (mem_l2_wr_rdy),
         .axi_awvalid   (axi_awvalid_line),
         .axi_awaddr    (axi_awaddr_line),
-        .axi_awburst   (axi_awburst_line),
         .axi_awlen     (axi_awlen_line),
         .axi_awsize    (axi_awsize_line),
         .axi_awready   (awready),
@@ -2593,25 +2682,24 @@ module core_top #(
         .axi_wlast     (axi_wlast_line),
         .axi_wready    (wready),
         .axi_bvalid    (bvalid),
-        .axi_bresp     (bresp),
+        .axi_bresp_unused(bresp),
         .axi_bready    (axi_bready_line),
         .axi_arvalid   (axi_arvalid_line),
         .axi_arid      (axi_arid_line),
         .axi_araddr    (axi_araddr_line),
-        .axi_arburst   (axi_arburst_line),
         .axi_arlen     (axi_arlen_line),
         .axi_arsize    (axi_arsize_line),
         .axi_arready   (arready),
         .axi_rvalid    (rvalid),
         .axi_rid       (rid),
         .axi_rdata     (rdata),
-        .axi_rresp     (rresp),
+        .axi_rresp_unused(rresp),
         .axi_rlast     (rlast),
         .axi_rready    (axi_rready_line)
     );
 
     // AXI 引脚固定属性（与 chiplab SoC 对接约定一致）
-    // arid 由桥给出：0=取指（L2 I-miss 引擎）、1=数据——R 通道按 rid 分流
+    // arid 由桥给出：0=取指（I-miss）、1=数据 de0、2=数据 de1——R 通道按 rid 分流
     assign arid    = axi_arid_line;
     assign araddr  = axi_araddr_line;
     assign arlen   = {4'b0000, axi_arlen_line};
@@ -2654,37 +2742,11 @@ module core_top #(
     assign debug0_wb_inst     = cmt_dbg0_inst;
     `ifdef CPU_2CMT
     assign debug1_wb_pc       = cmt_dbg1_pc;
-    assign debug1_wb_rf_wen   = cmt_dbg1_wen;
+    assign debug1_wb_rf_wen   = {4{cmt_dbg1_we}};
     assign debug1_wb_rf_wnum  = cmt_dbg1_wnum;
     assign debug1_wb_rf_wdata = cmt_dbg1_wdata;
     assign debug1_wb_inst     = cmt_dbg1_inst;
     `endif
-
-    // INE 定位探针（log_vcd u_cpu/* 可见）
-    wire        dbg_rob_cmt0_valid    = rob_cmt0_valid;
-    wire        dbg_rob_cmt0_complete = rob_cmt0_complete;
-    wire [31:0] dbg_rob_cmt0_pc       = rob_cmt0_pc;
-    wire [31:0] dbg_rob_cmt0_inst     = rob_cmt0_inst;
-    wire [`EXCP_NUM-1:0] dbg_rob_cmt0_excp = rob_cmt0_excp;
-    wire [31:0] dbg_ib_pop0_pc        = ib_pop0_pc;
-    wire [31:0] dbg_ib_pop0_inst      = ib_pop0_inst;
-    wire [`EXCP_NUM-1:0] dbg_ib_pop0_excp = ib_pop0_excp;
-    wire [`EXCP_NUM-1:0] dbg_dec0_excp     = dec0_excp;
-    wire [`EXCP_NUM-1:0] dbg_dec0_excp_eff = dec0_excp_eff;
-    wire [`EXCP_NUM-1:0] dbg_rn_ib0_excp   = rn_ib0_excp;
-
-    // Spyglass/lint：吸收暂未使用的观测信号
-    wire mycpu_lint_sink;
-    assign mycpu_lint_sink = break_point | infor_flag
-                           | (|csr_crmd_live_unused) | (|csr_lladdr_unused)
-                           | (|rsm_occupancy) | (|rsd_occupancy)
-`ifndef CPU_2CMT
-                           | cmt_dbg1_valid
-`endif
-                           | dbg_rob_cmt0_valid | dbg_rob_cmt0_complete
-                           | (|dbg_rob_cmt0_excp) | (|dbg_ib_pop0_excp)
-                           | (|dbg_dec0_excp) | (|dbg_rn_ib0_excp);
-
 
 
 `ifdef DIFFTEST_EN
@@ -2699,7 +2761,7 @@ module core_top #(
     //      4. store/load 事件的 8 位类型掩码按 inst 编码生成（下面给了 st/ld 模板）
     //      5. 所有 cmt_* 信号 posedge 打一拍再送 DPI（与 NEMU 步进对齐）
 
-    // 槽 0/1 提交指令的访存类型掩码（按指令编码判别，与旧实现同口径）
+    // 槽 0/1 提交指令的访存类型掩码（按指令编码判别）
     wire dbg0_is_st_w = (cmt_dbg0_inst[31:26] == 6'h0a) && (cmt_dbg0_inst[25:22] == 4'h6);
     wire dbg0_is_st_h = (cmt_dbg0_inst[31:26] == 6'h0a) && (cmt_dbg0_inst[25:22] == 4'h5);
     wire dbg0_is_st_b = (cmt_dbg0_inst[31:26] == 6'h0a) && (cmt_dbg0_inst[25:22] == 4'h4);
@@ -2746,9 +2808,9 @@ module core_top #(
     wire dbg0_is_csr_op = (cmt_dbg0_inst[31:24] == 8'h04);
     wire dbg1_is_csr_op = (cmt_dbg1_inst[31:24] == 8'h04);
     wire dbg0_is_csr_estat = dbg0_is_csr_op
-                          && (cmt_dbg0_inst[23:10] == {2'b0, `CSR_ESTAT});
+                          && (cmt_dbg0_inst[23:10] == `CSR_ESTAT);
     wire dbg1_is_csr_estat = dbg1_is_csr_op
-                          && (cmt_dbg1_inst[23:10] == {2'b0, `CSR_ESTAT});
+                          && (cmt_dbg1_inst[23:10] == `CSR_ESTAT);
 
     // 提交拍打一拍后送 DPI（槽 0）
     reg         cmt0_valid_r;
@@ -2834,7 +2896,7 @@ module core_top #(
             cmt1_valid_r    <= cmt_dbg1_valid;
             cmt1_pc_r       <= cmt_dbg1_pc;
             cmt1_inst_r     <= cmt_dbg1_inst;
-            cmt1_wen_r      <= cmt_dbg1_wen[0];
+            cmt1_wen_r      <= cmt_dbg1_we;
             cmt1_wdest_r    <= {3'b0, cmt_dbg1_wnum};
             cmt1_wdata_r    <= cmt_dbg1_wdata;
             cmt1_ld_en_r    <= (cmt_dbg1_valid && rob_cmt1_is_load)
@@ -2881,21 +2943,21 @@ module core_top #(
     // NEMU StoreEvent 要「落在目标字节道、其余为 0」：st.b@+0→0xa，st.h@+2→0x00f00000。
     // 用 vaddr[1:0] 生成字节掩码，从复制字里剥出与 REF 同口径的值。
     function automatic [31:0] diff_store_nbytes;
-        input [7:0]  st_en;
+        input [1:0]  st_en;
         input [31:0] st_data;
-        input [31:0] st_vaddr;
+        input [1:0]  st_vaddr;
         reg   [31:0] mask;
         begin
-            if (st_en[0])      mask = 32'h000000ff << {st_vaddr[1:0], 3'b0};
+            if (st_en[0])      mask = 32'h000000ff << {st_vaddr, 3'b0};
             else if (st_en[1]) mask = 32'h0000ffff << {st_vaddr[1], 4'b0};
             else               mask = 32'hffffffff;
             diff_store_nbytes = st_data & mask;
         end
     endfunction
     wire [31:0] diff_st0_data_raw = cmt0_valid_r ? cmt0_st_data_r : cmt1_st_data_r;
-    wire [31:0] diff_st0_data = diff_store_nbytes(diff_st0_en, diff_st0_data_raw, diff_st0_vaddr);
+    wire [31:0] diff_st0_data = diff_store_nbytes(diff_st0_en[1:0], diff_st0_data_raw, diff_st0_vaddr[1:0]);
     wire [7:0]  diff_st1_en   = diff_cmt1_v ? cmt1_st_en_r : 8'b0;
-    wire [31:0] diff_st1_data = diff_store_nbytes(diff_st1_en, cmt1_st_data_r, cmt1_st_vaddr_r);
+    wire [31:0] diff_st1_data = diff_store_nbytes(diff_st1_en[1:0], cmt1_st_data_r, cmt1_st_vaddr_r[1:0]);
     wire        diff_cmt0_cnt = cmt0_valid_r ? cmt0_is_cnt_r : cmt1_is_cnt_r;
     wire [63:0] diff_cmt0_tmr = cmt0_valid_r ? cmt0_timer64_r : cmt1_timer64_r;
     wire        diff_cmt0_fill = cmt0_valid_r ? cmt0_is_tlbfill_r : cmt1_is_tlbfill_r;
@@ -2946,7 +3008,7 @@ module core_top #(
         .coreid        (DIFFTEST_COREID),
         .excp_valid    (excp_flush_r),
         .eret          (ertn_flush_r),
-        .intrNo        (diff_csr_estat[12:2]),
+        .intrNo        ({21'b0, diff_csr_estat[12:2]}),
         .cause         ({24'b0, excp_ecode_r}),
         .exceptionPC   ({32'b0, excp_pc_r}),
         .exceptionInst (excp_inst_r)
@@ -3087,6 +3149,15 @@ reg [63:0] perf_turnover_refill_cyc; // dispatch 有旧指令时同拍腾空并 
 reg [63:0] stall_dispatch_cyc;     // IB 有指令但 dispatch 无法整体腾空
 reg [63:0] stall_rename_rob_cyc;   // IB 有指令但 ROB 达到安全满阈值
 reg [31:0] probe_cmt_idle_cyc;     // 连续无提交拍；过长则 $finish 打 PERF（抓 Linux 挂死）
+// 前端性能计数：RAS / predec / flush / redirect / IB / FTQ settle
+reg [63:0] perf_predec_ras_call;
+reg [63:0] perf_predec_ras_ret;
+reg [63:0] perf_flush_cyc;
+reg [63:0] perf_predec_redirect_cyc;
+reg [63:0] perf_ib_empty_cyc;      // 无 pop valid 且未满
+reg [63:0] perf_ib_push_stall_cyc; // IB 反压（!can_push）
+reg [63:0] perf_ftq_settle_cyc;    // head_blk_settling
+reg [63:0] perf_ftq_pending_cyc;   // FTQ 有待 IFU 取块
 
 // ROB 有效项数不能只看 head/tail（每对可有 0/1/2 条有效指令），按分配与
 // 提交事件维护；flush 只清当前占用，不清整次仿真的累计统计。
@@ -3123,6 +3194,7 @@ reg [7:0]  perf_occ_now      [0:PERF_OCC_N-1];
 reg [7:0]  perf_occ_cap      [0:PERF_OCC_N-1];
 reg [7:0]  perf_occ_max      [0:PERF_OCC_N-1];
 reg [63:0] perf_occ_sum      [0:PERF_OCC_N-1];
+reg [63:0] perf_occ_half_cyc [0:PERF_OCC_N-1]; // >= 50% 有效容量的周期数
 reg [63:0] perf_occ_high_cyc [0:PERF_OCC_N-1]; // >= 75% 有效容量
 reg [63:0] perf_occ_full_cyc [0:PERF_OCC_N-1];
 integer perf_occ_i;
@@ -3179,9 +3251,19 @@ always @(posedge clk) begin
         stall_dispatch_cyc     <= 64'd0;
         stall_rename_rob_cyc   <= 64'd0;
         probe_cmt_idle_cyc     <= 32'd0;
+        // 前端性能计数
+        perf_predec_ras_call      <= 64'd0;
+        perf_predec_ras_ret       <= 64'd0;
+        perf_flush_cyc            <= 64'd0;
+        perf_predec_redirect_cyc  <= 64'd0;
+        perf_ib_empty_cyc         <= 64'd0;
+        perf_ib_push_stall_cyc    <= 64'd0;
+        perf_ftq_settle_cyc       <= 64'd0;
+        perf_ftq_pending_cyc      <= 64'd0;
         for (perf_occ_i = 0; perf_occ_i < PERF_OCC_N; perf_occ_i = perf_occ_i + 1) begin
             perf_occ_max[perf_occ_i]      <= 8'd0;
             perf_occ_sum[perf_occ_i]      <= 64'd0;
+            perf_occ_half_cyc[perf_occ_i] <= 64'd0;
             perf_occ_high_cyc[perf_occ_i] <= 64'd0;
             perf_occ_full_cyc[perf_occ_i] <= 64'd0;
         end
@@ -3253,11 +3335,33 @@ always @(posedge clk) begin
             stall_dispatch_cyc <= stall_dispatch_cyc + 64'd1;
         if ((ib_pop0_valid || ib_pop1_valid) && rob_full)
             stall_rename_rob_cyc <= stall_rename_rob_cyc + 64'd1;
+        // RAS / predec / flush / redirect
+        if (predec_ras_call)
+            perf_predec_ras_call <= perf_predec_ras_call + 64'd1;
+        if (predec_ras_ret)
+            perf_predec_ras_ret <= perf_predec_ras_ret + 64'd1;
+        if (flush)
+            perf_flush_cyc <= perf_flush_cyc + 64'd1;
+        if (predec_redirect)
+            perf_predec_redirect_cyc <= perf_predec_redirect_cyc + 64'd1;
+        // IB empty / push stall
+        if (!ib_pop0_valid && (u_inst_buffer.count < `IB_SIZE))
+            perf_ib_empty_cyc <= perf_ib_empty_cyc + 64'd1;
+        if (!ib_can_push)
+            perf_ib_push_stall_cyc <= perf_ib_push_stall_cyc + 64'd1;
+        // FTQ settle / pending-to-IFU
+        if (u_ftq.head_blk_settling)
+            perf_ftq_settle_cyc <= perf_ftq_settle_cyc + 64'd1;
+        if (u_ftq.ifu_ptr != u_ftq.bpu_ptr)
+            perf_ftq_pending_cyc <= perf_ftq_pending_cyc + 64'd1;
         for (perf_occ_i = 0; perf_occ_i < PERF_OCC_N; perf_occ_i = perf_occ_i + 1) begin
             perf_occ_sum[perf_occ_i] <= perf_occ_sum[perf_occ_i]
                                       + {56'd0, perf_occ_now[perf_occ_i]};
             if (perf_occ_now[perf_occ_i] > perf_occ_max[perf_occ_i])
                 perf_occ_max[perf_occ_i] <= perf_occ_now[perf_occ_i];
+            // occupancy >= 50%
+            if ((perf_occ_now[perf_occ_i] * 2) >= perf_occ_cap[perf_occ_i])
+                perf_occ_half_cyc[perf_occ_i] <= perf_occ_half_cyc[perf_occ_i] + 64'd1;
             if ((perf_occ_now[perf_occ_i] * 4) >= (perf_occ_cap[perf_occ_i] * 3))
                 perf_occ_high_cyc[perf_occ_i] <= perf_occ_high_cyc[perf_occ_i] + 64'd1;
             if (perf_occ_now[perf_occ_i] >= perf_occ_cap[perf_occ_i])
@@ -3267,15 +3371,15 @@ always @(posedge clk) begin
 end
 
 // 64bit 无符号 → real 安全转换。Verilator(4.x) 对宽向量隐式转 real 走 32bit
-// 有符号 ITORD，计数 ≥2^31 时会得到负数（V2.3 报告中 FTQ/RAS 负均值即此因，
-// 探针计数本身无误）；按 16bit 分段转换绕开。
+// 有符号 ITORD 在计数达到 2^31 后会得到负数；按 16 bit 分段转换，
+// 保留完整的 64 bit 无符号计数。
 function automatic real perf_u64_real;
     input [63:0] v;
     begin
-        perf_u64_real = (($itor(v[63:48]) * 65536.0
-                        + $itor(v[47:32])) * 65536.0
-                        + $itor(v[31:16])) * 65536.0
-                        + $itor(v[15:0]);
+        perf_u64_real = (($itor({16'b0, v[63:48]}) * 65536.0
+                        + $itor({16'b0, v[47:32]})) * 65536.0
+                        + $itor({16'b0, v[31:16]})) * 65536.0
+                        + $itor({16'b0, v[15:0]});
     end
 endfunction
 
@@ -3309,6 +3413,30 @@ function automatic real perf_ipc;
             perf_ipc = 0.0;
         else
             perf_ipc = perf_u64_real(insts) / perf_u64_real(cycles);
+    end
+endfunction
+
+// 每千条提交指令的误预测数
+function automatic real perf_mpki;
+    input [63:0] mispred;
+    input [63:0] retire;
+    begin
+        if (retire == 64'd0)
+            perf_mpki = 0.0;
+        else
+            perf_mpki = 1000.0 * perf_u64_real(mispred) / perf_u64_real(retire);
+    end
+endfunction
+
+// 平均延迟 = 累计延迟 / 样本数
+function automatic real perf_avg_lat;
+    input [63:0] sum;
+    input [63:0] n;
+    begin
+        if (n == 64'd0)
+            perf_avg_lat = 0.0;
+        else
+            perf_avg_lat = perf_u64_real(sum) / perf_u64_real(n);
     end
 endfunction
 
@@ -3349,6 +3477,11 @@ final begin
              u_icache.ic_access_total,
              u_icache.ic_hit_total,
              perf_rate(u_icache.ic_hit_total, u_icache.ic_access_total));
+    $display("  I$ miss lat:      n=%0d  avg=%.2f  max=%0d  MPKI=%.3f",
+             u_icache.ic_miss_n,
+             perf_avg_lat(u_icache.ic_miss_lat_sum, u_icache.ic_miss_n),
+             u_icache.ic_miss_lat_max,
+             perf_mpki(u_icache.ic_miss_n, perf_retire_count));
     $display("DCache (cached):    access=%0d  hit=%0d  hit_rate=%.2f%%",
              u_dcache.dc_access_total,
              u_dcache.dc_hit_total,
@@ -3361,11 +3494,30 @@ final begin
              u_dcache.dc_st_access_total,
              u_dcache.dc_st_hit_total,
              perf_rate(u_dcache.dc_st_hit_total, u_dcache.dc_st_access_total));
+    $display("  D$ ld miss lat:   n=%0d  avg=%.2f  max=%0d  st_miss=%0d",
+             u_dcache.dc_ld_miss_n,
+             perf_avg_lat(u_dcache.dc_ld_miss_lat_sum, u_dcache.dc_ld_miss_n),
+             u_dcache.dc_ld_miss_lat_max,
+             u_dcache.dc_st_miss_total);
+    $display("  D$ CWF probe:     early_opp=%0d  beat1_lo=%0d  beat1_hi=%0d",
+             u_dcache.dc_cwf_early_opp,
+             u_dcache.dc_cwf_beat1_lo,
+             u_dcache.dc_cwf_beat1_hi);
+    $display("L2 (line rd):       access=%0d  hit=%0d  miss=%0d  hit_rate=%.2f%%",
+             u_l2cache.l2_rd_access_total,
+             u_l2cache.l2_rd_hit_total,
+             u_l2cache.l2_rd_miss_total,
+             perf_rate(u_l2cache.l2_rd_hit_total, u_l2cache.l2_rd_access_total));
     $display("---- stall / mem ----");
     $display("ROB full cycles:    %0d  (%.2f%%)",
              stall_rob_full_cyc, perf_rate(stall_rob_full_cyc, perf_cycle_count));
     $display("SB  full cycles:    %0d  (%.2f%%)",
              stall_sb_full_cyc, perf_rate(stall_sb_full_cyc, perf_cycle_count));
+    $display("SB nonempty/drain:  nonempty=%0d  (%.2f%%)  wr_req=%0d  (%.2f%%)",
+             u_store_buffer.sb_nonempty_cyc,
+             perf_rate(u_store_buffer.sb_nonempty_cyc, perf_cycle_count),
+             u_store_buffer.sb_wr_req_cyc,
+             perf_rate(u_store_buffer.sb_wr_req_cyc, perf_cycle_count));
     $display("D$ MWAIT cycles:    %0d  (%.2f%%)",
              u_dcache.dc_mwait_cycles, perf_rate(u_dcache.dc_mwait_cycles, perf_cycle_count));
     $display("D$ pend cycles:     %0d  (%.2f%%)  push=%0d",
@@ -3373,60 +3525,94 @@ final begin
              u_dcache.dc_pend_push_total);
     $display("D$ MSHR busy:       %0d  (%.2f%%)",
              u_dcache.dc_mshr_busy_cycles, perf_rate(u_dcache.dc_mshr_busy_cycles, perf_cycle_count));
+    // MSHR 占用 avg/max/cap（与队列 occupancy 同口径）
+    $display("D$ MSHR occupancy:  avg=%.3f  max=%0d  cap=%0d",
+             perf_avg_occ(u_dcache.dc_mshr_occ_sum, perf_cycle_count),
+             u_dcache.dc_mshr_occ_max, `DC_MSHR_DEPTH);
     $display("LSU store-order:    %0d  (%.2f%%)",
              u_lsu.lsu_store_order_stall_cyc,
              perf_rate(u_lsu.lsu_store_order_stall_cyc, perf_cycle_count));
     $display("LSU DC wait:        %0d  (%.2f%%)",
              u_lsu.lsu_dc_wait_cyc, perf_rate(u_lsu.lsu_dc_wait_cyc, perf_cycle_count));
+    $display("LSU STQ:            full=%0d  (%.2f%%)  avg=%.3f  max=%0d  cap=%0d",
+             u_lsu.lsu_stq_full_cyc, perf_rate(u_lsu.lsu_stq_full_cyc, perf_cycle_count),
+             perf_avg_occ(u_lsu.lsu_stq_occ_sum, perf_cycle_count),
+             u_lsu.lsu_stq_occ_max, `STQ_DEPTH);
     $display("RS_MEM src stall:   %0d  (%.2f%%)",
              u_rs_mem.rsm_src_stall_cyc, perf_rate(u_rs_mem.rsm_src_stall_cyc, perf_cycle_count));
     $display("RS_MEM LSU stall:   %0d  (%.2f%%)",
              u_rs_mem.rsm_lsu_stall_cyc, perf_rate(u_rs_mem.rsm_lsu_stall_cyc, perf_cycle_count));
     $display("RS_MEM full stall:  %0d  (%.2f%%)",
              u_rs_mem.rsm_full_stall_cyc, perf_rate(u_rs_mem.rsm_full_stall_cyc, perf_cycle_count));
-    $display("---- queue occupancy: avg / max / effective-cap / >=75%% cycles / full cycles ----");
-    $display("ROB pairs:          %.3f / %0d / %0d / %0d / %0d",
+    // MPKI / RAS-predec / JTC / IB-FTQ / D$ outstanding / flush-redirect
+    $display("---- frontend / branch / D$ outstanding ----");
+    $display("Branch MPKI:        all=%.3f  cond=%.3f  (mispred*1000/retire)",
+             perf_mpki(u_bpu.commit_all_mispred_count, perf_retire_count),
+             perf_mpki(u_bpu.commit_cond_mispred_count, perf_retire_count));
+    $display("RAS/predec:         ras_call=%0d  ras_ret=%0d  flush=%0d  predec_redirect=%0d",
+             perf_predec_ras_call, perf_predec_ras_ret,
+             perf_flush_cyc, perf_predec_redirect_cyc);
+    $display("JTC:                hit=%0d  miss=%0d  train=%0d  hit_rate=%.2f%%",
+             u_bpu.u_jirl_target_cache.jtc_query_hit,
+             u_bpu.u_jirl_target_cache.jtc_query_miss,
+             u_bpu.u_jirl_target_cache.jtc_train_updates,
+             perf_rate(u_bpu.u_jirl_target_cache.jtc_query_hit,
+                       u_bpu.u_jirl_target_cache.jtc_query_hit
+                     + u_bpu.u_jirl_target_cache.jtc_query_miss));
+    $display("IB frontend:        empty=%0d  (%.2f%%)  push_stall=%0d  (%.2f%%)  full_occ=%0d",
+             perf_ib_empty_cyc, perf_rate(perf_ib_empty_cyc, perf_cycle_count),
+             perf_ib_push_stall_cyc, perf_rate(perf_ib_push_stall_cyc, perf_cycle_count),
+             perf_occ_full_cyc[8]);
+    $display("FTQ settle/pending: settle=%0d  (%.2f%%)  pending=%0d  (%.2f%%)",
+             perf_ftq_settle_cyc, perf_rate(perf_ftq_settle_cyc, perf_cycle_count),
+             perf_ftq_pending_cyc, perf_rate(perf_ftq_pending_cyc, perf_cycle_count));
+    $display("D$ AXI OS:          N/A (dual-OS not in tree; dc_os_* absent)");
+    $display("Flush/redirect:     flush=%0d  (%.2f%%)  predec_redirect=%0d  (%.2f%%)",
+             perf_flush_cyc, perf_rate(perf_flush_cyc, perf_cycle_count),
+             perf_predec_redirect_cyc, perf_rate(perf_predec_redirect_cyc, perf_cycle_count));
+    $display("---- queue occupancy: avg / max / effective-cap / >=50%% / >=75%% / full ----");
+    $display("ROB pairs:          %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[0], perf_cycle_count), perf_occ_max[0], perf_occ_cap[0],
-             perf_occ_high_cyc[0], perf_occ_full_cyc[0]);
-    $display("ROB valid entries:  %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[0], perf_occ_high_cyc[0], perf_occ_full_cyc[0]);
+    $display("ROB valid entries:  %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[1], perf_cycle_count), perf_occ_max[1], perf_occ_cap[1],
-             perf_occ_high_cyc[1], perf_occ_full_cyc[1]);
-    $display("Dispatch slots:     %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[1], perf_occ_high_cyc[1], perf_occ_full_cyc[1]);
+    $display("Dispatch slots:     %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[2], perf_cycle_count), perf_occ_max[2], perf_occ_cap[2],
-             perf_occ_high_cyc[2], perf_occ_full_cyc[2]);
-    $display("RS ALU0:            %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[2], perf_occ_high_cyc[2], perf_occ_full_cyc[2]);
+    $display("RS ALU0:            %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[3], perf_cycle_count), perf_occ_max[3], perf_occ_cap[3],
-             perf_occ_high_cyc[3], perf_occ_full_cyc[3]);
-    $display("RS ALU1:            %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[3], perf_occ_high_cyc[3], perf_occ_full_cyc[3]);
+    $display("RS ALU1:            %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[4], perf_cycle_count), perf_occ_max[4], perf_occ_cap[4],
-             perf_occ_high_cyc[4], perf_occ_full_cyc[4]);
-    $display("RS MEM:             %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[4], perf_occ_high_cyc[4], perf_occ_full_cyc[4]);
+    $display("RS MEM:             %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[5], perf_cycle_count), perf_occ_max[5], perf_occ_cap[5],
-             perf_occ_high_cyc[5], perf_occ_full_cyc[5]);
-    $display("RS MDU:             %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[5], perf_occ_high_cyc[5], perf_occ_full_cyc[5]);
+    $display("RS MDU:             %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[6], perf_cycle_count), perf_occ_max[6], perf_occ_cap[6],
-             perf_occ_high_cyc[6], perf_occ_full_cyc[6]);
-    $display("Store buffer:       %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[6], perf_occ_high_cyc[6], perf_occ_full_cyc[6]);
+    $display("Store buffer:       %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[7], perf_cycle_count), perf_occ_max[7], perf_occ_cap[7],
-             perf_occ_high_cyc[7], perf_occ_full_cyc[7]);
-    $display("Instruction buffer: %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[7], perf_occ_high_cyc[7], perf_occ_full_cyc[7]);
+    $display("Instruction buffer: %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[8], perf_cycle_count), perf_occ_max[8], perf_occ_cap[8],
-             perf_occ_high_cyc[8], perf_occ_full_cyc[8]);
-    $display("FTQ retained:       %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[8], perf_occ_high_cyc[8], perf_occ_full_cyc[8]);
+    $display("FTQ retained:       %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[9], perf_cycle_count), perf_occ_max[9], perf_occ_cap[9],
-             perf_occ_high_cyc[9], perf_occ_full_cyc[9]);
-    $display("FTQ to IFU pending: %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[9], perf_occ_high_cyc[9], perf_occ_full_cyc[9]);
+    $display("FTQ to IFU pending: %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[10], perf_cycle_count), perf_occ_max[10], perf_occ_cap[10],
-             perf_occ_high_cyc[10], perf_occ_full_cyc[10]);
-    $display("RAT busy mappings:  %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[10], perf_occ_high_cyc[10], perf_occ_full_cyc[10]);
+    $display("RAT busy mappings:  %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[11], perf_cycle_count), perf_occ_max[11], perf_occ_cap[11],
-             perf_occ_high_cyc[11], perf_occ_full_cyc[11]);
-    $display("RAS speculative:    %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[11], perf_occ_high_cyc[11], perf_occ_full_cyc[11]);
+    $display("RAS speculative:    %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[12], perf_cycle_count), perf_occ_max[12], perf_occ_cap[12],
-             perf_occ_high_cyc[12], perf_occ_full_cyc[12]);
-    $display("RAS committed:      %.3f / %0d / %0d / %0d / %0d",
+             perf_occ_half_cyc[12], perf_occ_high_cyc[12], perf_occ_full_cyc[12]);
+    $display("RAS committed:      %.3f / %0d / %0d / %0d / %0d / %0d",
              perf_avg_occ(perf_occ_sum[13], perf_cycle_count), perf_occ_max[13], perf_occ_cap[13],
-             perf_occ_high_cyc[13], perf_occ_full_cyc[13]);
+             perf_occ_half_cyc[13], perf_occ_high_cyc[13], perf_occ_full_cyc[13]);
     $display("FTB update queue:   max=%0d/%0d  overflow=%0d",
              u_bpu.u_ftb.ftb_update_queue_max_occupancy, `FTB_UPDATE_Q_DEPTH,
              u_bpu.u_ftb.ftb_update_overflow_count);

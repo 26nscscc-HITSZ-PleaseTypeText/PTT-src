@@ -5,10 +5,10 @@
 // ------------------------------------------------------------
 // 参数：TLBNUM 主表项数（模块默认 16，顶层 core_top 例化为 32）。
 //
-// 功能（新架构下角色不变，对接对象变化）：
+// 功能：
 // - 翻译通道：inst（s0 口，接 mmu 的 I 通道）/ data（s1 口，接 mmu 的 D 通道），
 //   组合完成 DA 直址 / DMW 窗口 / TLB 查表三种模式与页表异常生成；
-// - L1 微 TLB（二期加速，l1_tlb.v）：I/D 各一份 8 项微表插在主表 s0/s1 查询口
+// - L1 微 TLB：I/D 各一份 8 项微表插在主表 s0/s1 查询口
 //   之前——命中时只比较 8 项（替代 TLBNUM 项全相联比较链），miss 透传主表并回填；
 //   fence（TLB 写/无效化/ASID 变化）整表失效，对软件完全透明；
 // - 特权地址检查：
@@ -16,24 +16,20 @@
 //     特权子情形；PC 非对齐的 ADEF 由 mmu 本地检测，两者在 mmu 侧合并）；
 //   * data_ex_adem：PLV3 映射模式访存 va[31]=1 且未落 PLV3 可用 DMW；
 //   * 地址本身非法时不再报 TLB 类异常（地址错优先于查表结果）；
-// - 维护通道：tlb_op/invtlb_* 由【commit 提交级】驱动（旧设计是 WB 级，
-//   语义相同——只在指令确定提交时落地，且伴随全局 FLUSH_REFETCH 冲刷）；
+// - 维护通道：tlb_mut_op/invtlb_* 由 commit 提交级驱动，只在指令确定
+//   提交时修改主表，并伴随全局 FLUSH_REFETCH；
 // - tlbsrch/tlbrd 结果回送 csr_exception_commit_handler（接口原样保留）。
 //
 // 维护时序说明：
-// - tlb_op 是 commit 提交拍的一拍脉冲，与原 WB 提交语义一致；
-// - tlbsrch 走主表专用 srch 口（V2.3 提频改动）：输入直接取
+// - tlb_mut_op 是 commit 提交拍的一拍脉冲，只包含写入、填充和无效化；
+// - tlbsrch 走主表专用 srch 口，输入直接取
 //   CSR.TLBEHI/CSR.ASID 寄存器，found/index 每拍常备，提交拍由
 //   csr handler 采样写回 TLBIDX。s0 口不再被挪用，commit 逻辑
 //   与「TLB 查表 → 翻译 → 取指」关键路径完全解耦，I 侧 l1_tlb
 //   也不再需要 dis_refill 屏蔽（s0 口永远承载真实取指查询）。
 //
-// 端口：顶层接线变化：
-// - inst_req/inst_vaddr  <- mmu.tlbm_inst_*（原来自 IF）
-// - data_req/.../vaddr   <- mmu.tlbm_data_*（原来自 EXE/MEM）
-// - tlb_op/invtlb_*      <- commit 提交口（原来自 WB）
-// - csr_* 输入           <- csr_exception_commit_handler（不变）
-// - inst_ex_adef/data_ex_adem -> mmu（新增，特权地址错）
+// 端口契约：翻译请求来自 mmu，维护请求来自 commit，CSR 状态与回读结果
+// 连接 csr_exception_commit_handler；inst_direct_excp 只包含可直发 CAM 路径异常。
 // ============================================================
 module tlb_manager #(
     parameter TLBNUM = 16
@@ -53,16 +49,36 @@ module tlb_manager #(
     input  wire [1:0]                   csr_crmd_datf,
     input  wire [1:0]                   csr_crmd_datm,
     input  wire [9:0]                   csr_asid,
-    input  wire [31:0]                  csr_tlbidx,
-    input  wire [31:0]                  csr_tlbehi,
-    input  wire [31:0]                  csr_tlbelo0,
-    input  wire [31:0]                  csr_tlbelo1,
-    input  wire [31:0]                  csr_dmw0,
-    input  wire [31:0]                  csr_dmw1,
+    input  wire                         csr_tlbidx_ne,
+    input  wire [5:0]                   csr_tlbidx_ps,
+    input  wire [$clog2(TLBNUM)-1:0]    csr_tlbidx_index,
+    input  wire [18:0]                  csr_tlbehi_vppn,
+    input  wire [19:0]                  csr_tlbelo0_ppn,
+    input  wire [1:0]                   csr_tlbelo0_plv,
+    input  wire [1:0]                   csr_tlbelo0_mat,
+    input  wire                         csr_tlbelo0_d,
+    input  wire                         csr_tlbelo0_v,
+    input  wire                         csr_tlbelo0_g,
+    input  wire [19:0]                  csr_tlbelo1_ppn,
+    input  wire [1:0]                   csr_tlbelo1_plv,
+    input  wire [1:0]                   csr_tlbelo1_mat,
+    input  wire                         csr_tlbelo1_d,
+    input  wire                         csr_tlbelo1_v,
+    input  wire                         csr_tlbelo1_g,
+    input  wire [2:0]                   csr_dmw0_vseg,
+    input  wire [2:0]                   csr_dmw0_pseg,
+    input  wire [1:0]                   csr_dmw0_mat,
+    input  wire                         csr_dmw0_plv3,
+    input  wire                         csr_dmw0_plv0,
+    input  wire [2:0]                   csr_dmw1_vseg,
+    input  wire [2:0]                   csr_dmw1_pseg,
+    input  wire [1:0]                   csr_dmw1_mat,
+    input  wire                         csr_dmw1_plv3,
+    input  wire                         csr_dmw1_plv0,
     input  wire [7:0]                   csr_estat_ecode,
     input  wire [$clog2(TLBNUM)-1:0]    csr_rand_index,
 
-    input  wire [`TLB_OP_NUM-1:0]       tlb_op,
+    input  wire [`TLB_OP_NUM-1:2]       tlb_mut_op,
     input  wire [4:0]                   invtlb_op,
     input  wire [9:0]                   invtlb_asid,
     input  wire [18:0]                  invtlb_vpn,
@@ -74,6 +90,8 @@ module tlb_manager #(
     output wire                         inst_ex_pif,
     output wire                         inst_ex_ppi,
     output wire                         inst_direct_ok, // 1: 本拍结果不依赖主 TLB（供 IFU 同拍发 I$）
+    // 仅 ADEF + L1 CAM 命中项的 PIF/PPI，不含主 TLB 匹配归约。
+    output wire                         inst_direct_excp,
 
     output wire [31:0]                  data_paddr,
     output wire [1:0]                   data_mat,
@@ -87,7 +105,8 @@ module tlb_manager #(
     output wire                         tlbsrch_found,
     output wire [$clog2(TLBNUM)-1:0]    tlbsrch_index,
 
-    output wire [31:0]                  tlbrd_tlbidx,
+    output wire                         tlbrd_ne,
+    output wire [5:0]                   tlbrd_ps,
     output wire [31:0]                  tlbrd_tlbehi,
     output wire [31:0]                  tlbrd_tlbelo0,
     output wire [31:0]                  tlbrd_tlbelo1,
@@ -102,10 +121,10 @@ wire pg_mode = (csr_crmd_da === 1'b0) && (csr_crmd_pg === 1'b1);
 wire da_mode = (csr_crmd_da === 1'b1) && (csr_crmd_pg === 1'b0);
 
 // Case equality: avoids inst_paddr/data_paddr going X when CSR/vaddr bits are unknown during sim bring-up.
-wire inst_dmw0_hit = pg_mode && ((inst_vaddr[31:29] === csr_dmw0[31:29]) && (((csr_crmd_plv === 2'b00) && (csr_dmw0[0] === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw0[3] === 1'b1))));
-wire inst_dmw1_hit = pg_mode && ((inst_vaddr[31:29] === csr_dmw1[31:29]) && (((csr_crmd_plv === 2'b00) && (csr_dmw1[0] === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw1[3] === 1'b1))));
-wire data_dmw0_hit = pg_mode && ((data_vaddr[31:29] === csr_dmw0[31:29]) && (((csr_crmd_plv === 2'b00) && (csr_dmw0[0] === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw0[3] === 1'b1))));
-wire data_dmw1_hit = pg_mode && ((data_vaddr[31:29] === csr_dmw1[31:29]) && (((csr_crmd_plv === 2'b00) && (csr_dmw1[0] === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw1[3] === 1'b1))));
+wire inst_dmw0_hit = pg_mode && ((inst_vaddr[31:29] === csr_dmw0_vseg) && (((csr_crmd_plv === 2'b00) && (csr_dmw0_plv0 === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw0_plv3 === 1'b1))));
+wire inst_dmw1_hit = pg_mode && ((inst_vaddr[31:29] === csr_dmw1_vseg) && (((csr_crmd_plv === 2'b00) && (csr_dmw1_plv0 === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw1_plv3 === 1'b1))));
+wire data_dmw0_hit = pg_mode && ((data_vaddr[31:29] === csr_dmw0_vseg) && (((csr_crmd_plv === 2'b00) && (csr_dmw0_plv0 === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw0_plv3 === 1'b1))));
+wire data_dmw1_hit = pg_mode && ((data_vaddr[31:29] === csr_dmw1_vseg) && (((csr_crmd_plv === 2'b00) && (csr_dmw1_plv0 === 1'b1)) || ((csr_crmd_plv === 2'b11) && (csr_dmw1_plv3 === 1'b1))));
 
 // ------------------------------------------------------------
 // 特权地址检查（映射模式 + PLV3 + va[31]=1 且未落可用 DMW 窗口）
@@ -124,15 +143,13 @@ assign data_ex_adem = data_req && data_plv_oob;
 // ------------------------------------------------------------
 // 维护操作译码（commit 提交拍一拍脉冲）
 // ------------------------------------------------------------
-// tlbsrch/tlbrd 在本模块无需动作：srch 口每拍常备、r 口按 TLBIDX 常读，
-// 结果由 csr handler 在提交拍采样（tlb_op 对应位仅作 lint 吸收）。
-wire do_tlbsrch = tlb_op[`TLB_OP_TLBSRCH];
-wire do_tlbrd   = tlb_op[`TLB_OP_TLBRD];
-wire do_tlbwr   = tlb_op[`TLB_OP_TLBWR];
-wire do_tlbfill = tlb_op[`TLB_OP_TLBFILL];
-wire do_invtlb  = tlb_op[`TLB_OP_INVTLB_0] | tlb_op[`TLB_OP_INVTLB_1] | tlb_op[`TLB_OP_INVTLB_2]
-                | tlb_op[`TLB_OP_INVTLB_3] | tlb_op[`TLB_OP_INVTLB_4] | tlb_op[`TLB_OP_INVTLB_5]
-                | tlb_op[`TLB_OP_INVTLB_6];
+// tlbsrch/tlbrd 无需在本模块译码：srch 口每拍常备，r 口按 TLBIDX 常读，
+// 结果由 csr handler 在提交拍采样。
+wire do_tlbwr   = tlb_mut_op[`TLB_OP_TLBWR];
+wire do_tlbfill = tlb_mut_op[`TLB_OP_TLBFILL];
+wire do_invtlb  = tlb_mut_op[`TLB_OP_INVTLB_0] | tlb_mut_op[`TLB_OP_INVTLB_1] | tlb_mut_op[`TLB_OP_INVTLB_2]
+                | tlb_mut_op[`TLB_OP_INVTLB_3] | tlb_mut_op[`TLB_OP_INVTLB_4] | tlb_mut_op[`TLB_OP_INVTLB_5]
+                | tlb_mut_op[`TLB_OP_INVTLB_6];
 
 // ------------------------------------------------------------
 // L1 微 TLB fence：任何"主表内容/匹配条件可能变化"的时刻整表失效。
@@ -158,7 +175,8 @@ wire        l1i_found;
 wire [19:0] l1i_ppn;
 wire [5:0]  l1i_ps;
 wire [1:0]  l1i_mat;
-wire        l1i_v, l1i_d;
+wire        l1i_v;
+wire        l1i_d_unused; // 取指只检查有效位和权限，不使用页脏位。
 wire [1:0]  l1i_plv;
 // D 侧微表 -> 主表 s1
 wire [18:0] l1d_tlb_vppn;
@@ -171,7 +189,6 @@ wire        l1d_v, l1d_d;
 wire [1:0]  l1d_plv;
 
 wire                        s0_found;
-wire [IDXW-1:0]            s0_index;
 wire [19:0]                s0_ppn;
 wire [5:0]                 s0_ps;
 wire [1:0]                 s0_plv;
@@ -179,7 +196,6 @@ wire [1:0]                 s0_mat;
 wire                       s0_d;
 wire                       s0_v;
 wire                        s1_found;
-wire [IDXW-1:0]            s1_index;
 wire                        srch_found;
 wire [IDXW-1:0]            srch_index;
 wire [19:0]                s1_ppn;
@@ -207,20 +223,24 @@ wire                        r_v1;
 
 // I 侧微表：连主表 s0 口（tlbsrch 已走专用口，s0 恒为真实取指查询）
 wire l1i_cam_hit;
+wire l1i_cam_v;
+wire [1:0] l1i_cam_plv;
 l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
     .clk            (clk),
     .reset          (reset),
     .fence_i        (l1_fence),
     .req_valid_i    (inst_req),
-    .vaddr_i        (inst_vaddr),
+    .vaddr_i        (inst_vaddr[31:12]),
     .found_o        (l1i_found),
     .l1_hit_o       (l1i_cam_hit),
     .ppn_o          (l1i_ppn),
     .ps_o           (l1i_ps),
     .mat_o          (l1i_mat),
     .v_o            (l1i_v),
-    .d_o            (l1i_d),
+    .d_o            (l1i_d_unused),
     .plv_o          (l1i_plv),
+    .cam_v_o        (l1i_cam_v),
+    .cam_plv_o      (l1i_cam_plv),
     .tlb_vppn_o     (l1i_tlb_vppn),
     .tlb_va_bit12_o (l1i_tlb_va_bit12),
     .tlb_found_i    (s0_found),
@@ -232,14 +252,16 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
     .tlb_plv_i      (s0_plv)
 );
 
-// D 侧微表：连主表 s1 口
+// D 侧微表连接主表 s1；I/D 共用 l1_tlb 接口，D 侧不消费 CAM 探测属性。
 wire l1d_cam_hit_unused;
+wire l1d_cam_v_unused;
+wire [1:0] l1d_cam_plv_unused;
 l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_d (
     .clk            (clk),
     .reset          (reset),
     .fence_i        (l1_fence),
     .req_valid_i    (data_req),
-    .vaddr_i        (data_vaddr),
+    .vaddr_i        (data_vaddr[31:12]),
     .found_o        (l1d_found),
     .l1_hit_o       (l1d_cam_hit_unused),
     .ppn_o          (l1d_ppn),
@@ -248,6 +270,8 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_d (
     .v_o            (l1d_v),
     .d_o            (l1d_d),
     .plv_o          (l1d_plv),
+    .cam_v_o        (l1d_cam_v_unused),
+    .cam_plv_o      (l1d_cam_plv_unused),
     .tlb_vppn_o     (l1d_tlb_vppn),
     .tlb_va_bit12_o (l1d_tlb_va_bit12),
     .tlb_found_i    (s1_found),
@@ -260,21 +284,21 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_d (
 );
 
 // TLBR 写回时强制写入有效位；否则沿用 CSR_TLBIDX.E。
-wire w_e = (csr_estat_ecode == `TLBR_ECODE) ? 1'b1 : ~csr_tlbidx[31];
-wire [5:0] w_ps = csr_tlbidx[29:24];
-wire [IDXW-1:0] w_index = do_tlbfill ? csr_rand_index[IDXW-1:0] : csr_tlbidx[IDXW-1:0];
+wire w_e = (csr_estat_ecode == `TLBR_ECODE) ? 1'b1 : !csr_tlbidx_ne;
+wire [5:0] w_ps = csr_tlbidx_ps;
+wire [IDXW-1:0] w_index = do_tlbfill ? csr_rand_index[IDXW-1:0] : csr_tlbidx_index;
 
-wire [19:0] w_ppn0 = csr_tlbelo0[27:8];
-wire [1:0]  w_plv0 = csr_tlbelo0[3:2];
-wire [1:0]  w_mat0 = csr_tlbelo0[5:4];
-wire        w_d0   = csr_tlbelo0[1];
-wire        w_v0   = csr_tlbelo0[0];
-wire [19:0] w_ppn1 = csr_tlbelo1[27:8];
-wire [1:0]  w_plv1 = csr_tlbelo1[3:2];
-wire [1:0]  w_mat1 = csr_tlbelo1[5:4];
-wire        w_d1   = csr_tlbelo1[1];
-wire        w_v1   = csr_tlbelo1[0];
-wire        w_g    = csr_tlbelo0[6] & csr_tlbelo1[6];
+wire [19:0] w_ppn0 = csr_tlbelo0_ppn;
+wire [1:0]  w_plv0 = csr_tlbelo0_plv;
+wire [1:0]  w_mat0 = csr_tlbelo0_mat;
+wire        w_d0   = csr_tlbelo0_d;
+wire        w_v0   = csr_tlbelo0_v;
+wire [19:0] w_ppn1 = csr_tlbelo1_ppn;
+wire [1:0]  w_plv1 = csr_tlbelo1_plv;
+wire [1:0]  w_mat1 = csr_tlbelo1_mat;
+wire        w_d1   = csr_tlbelo1_d;
+wire        w_v1   = csr_tlbelo1_v;
+wire        w_g    = csr_tlbelo0_g & csr_tlbelo1_g;
 
 // 主 TLB：s0/s1 恒为取指/访存翻译查询；tlbsrch 走独立 srch 口（见头注）
 tlb #(.TLBNUM(TLBNUM)) u_tlb (
@@ -284,7 +308,6 @@ tlb #(.TLBNUM(TLBNUM)) u_tlb (
     .s0_va_bit12  (l1i_tlb_va_bit12),
     .s0_asid      (csr_asid),
     .s0_found     (s0_found),
-    .s0_index     (s0_index),
     .s0_ppn       (s0_ppn),
     .s0_ps        (s0_ps),
     .s0_plv       (s0_plv),
@@ -295,14 +318,13 @@ tlb #(.TLBNUM(TLBNUM)) u_tlb (
     .s1_va_bit12  (l1d_tlb_va_bit12),
     .s1_asid      (csr_asid),
     .s1_found     (s1_found),
-    .s1_index     (s1_index),
     .s1_ppn       (s1_ppn),
     .s1_ps        (s1_ps),
     .s1_plv       (s1_plv),
     .s1_mat       (s1_mat),
     .s1_d         (s1_d),
     .s1_v         (s1_v),
-    .srch_vppn    (csr_tlbehi[31:13]),
+    .srch_vppn    (csr_tlbehi_vppn),
     .srch_asid    (csr_asid),
     .srch_found   (srch_found),
     .srch_index   (srch_index),
@@ -313,7 +335,7 @@ tlb #(.TLBNUM(TLBNUM)) u_tlb (
     .we           (do_tlbwr | do_tlbfill),
     .w_index      (w_index),
     .w_e          (w_e),
-    .w_vppn       (csr_tlbehi[31:13]),
+    .w_vppn       (csr_tlbehi_vppn),
     .w_ps         (w_ps),
     .w_asid       (csr_asid),
     .w_g          (w_g),
@@ -327,7 +349,7 @@ tlb #(.TLBNUM(TLBNUM)) u_tlb (
     .w_mat1       (w_mat1),
     .w_d1         (w_d1),
     .w_v1         (w_v1),
-    .r_index      (csr_tlbidx[IDXW-1:0]),
+    .r_index      (csr_tlbidx_index),
     .r_e          (r_e),
     .r_vppn       (r_vppn),
     .r_ps         (r_ps),
@@ -362,9 +384,17 @@ wire data_need_tlb = pg_mode && !data_dmw0_hit && !data_dmw1_hit && !data_plv_oo
 assign inst_direct_ok = !inst_need_tlb || l1i_cam_hit;
 
 // TLB 查询结果和异常在同一拍组合给出，供后级直接使用。
+// 完整口径（含主表透传）：供 PRE 级锁存用；不进入 ftq_direct_req。
 assign inst_ex_tlbr = inst_req && inst_need_tlb && !l1i_found;
 assign inst_ex_pif  = inst_req && inst_need_tlb && l1i_found && !l1i_v;
 assign inst_ex_ppi  = inst_req && inst_need_tlb && l1i_found && l1i_v && (csr_crmd_plv > l1i_plv);
+
+// 直发异常只依赖 L1 微表 CAM 命中项（cam_v/cam_plv），不含主 TLB。
+// |match0 归约与 s0_v 独热 mux。在 direct_ok=1 前提下与完整口径逐位等价。
+wire inst_ex_pif_cam = inst_req && inst_need_tlb && l1i_cam_hit && !l1i_cam_v;
+wire inst_ex_ppi_cam = inst_req && inst_need_tlb && l1i_cam_hit && l1i_cam_v
+                     && (csr_crmd_plv > l1i_cam_plv);
+assign inst_direct_excp = inst_ex_adef || inst_ex_pif_cam || inst_ex_ppi_cam;
 
 assign data_ex_tlbr = data_req && data_need_tlb && !l1d_found;
 assign data_ex_pil  = data_req && !data_is_store && data_need_tlb && l1d_found && !l1d_v;
@@ -373,23 +403,23 @@ assign data_ex_ppi  = data_req && data_need_tlb && l1d_found && l1d_v && (csr_cr
 assign data_ex_pme  = data_req && data_is_store && data_need_tlb && l1d_found && l1d_v && (csr_crmd_plv <= l1d_plv) && !l1d_d;
 
 assign inst_paddr = (da_mode === 1'b1) ? inst_vaddr :
-                    (inst_dmw0_hit === 1'b1) ? {csr_dmw0[27:25], inst_vaddr[28:0]} :
-                    (inst_dmw1_hit === 1'b1) ? {csr_dmw1[27:25], inst_vaddr[28:0]} :
+                    (inst_dmw0_hit === 1'b1) ? {csr_dmw0_pseg, inst_vaddr[28:0]} :
+                    (inst_dmw1_hit === 1'b1) ? {csr_dmw1_pseg, inst_vaddr[28:0]} :
                     inst_tlb_paddr;
 
 assign data_paddr = (da_mode === 1'b1) ? data_vaddr :
-                    (data_dmw0_hit === 1'b1) ? {csr_dmw0[27:25], data_vaddr[28:0]} :
-                    (data_dmw1_hit === 1'b1) ? {csr_dmw1[27:25], data_vaddr[28:0]} :
+                    (data_dmw0_hit === 1'b1) ? {csr_dmw0_pseg, data_vaddr[28:0]} :
+                    (data_dmw1_hit === 1'b1) ? {csr_dmw1_pseg, data_vaddr[28:0]} :
                     data_tlb_paddr;
 
 assign inst_mat = (da_mode === 1'b1) ? csr_crmd_datf :
-                  (inst_dmw0_hit === 1'b1) ? csr_dmw0[5:4] :
-                  (inst_dmw1_hit === 1'b1) ? csr_dmw1[5:4] :
+                  (inst_dmw0_hit === 1'b1) ? csr_dmw0_mat :
+                  (inst_dmw1_hit === 1'b1) ? csr_dmw1_mat :
                   l1i_mat;
 
 assign data_mat = (da_mode === 1'b1) ? csr_crmd_datm :
-                  (data_dmw0_hit === 1'b1) ? csr_dmw0[5:4] :
-                  (data_dmw1_hit === 1'b1) ? csr_dmw1[5:4] :
+                  (data_dmw0_hit === 1'b1) ? csr_dmw0_mat :
+                  (data_dmw1_hit === 1'b1) ? csr_dmw1_mat :
                   l1d_mat;
 
 // ------------------------------------------------------------
@@ -400,15 +430,13 @@ assign data_mat = (da_mode === 1'b1) ? csr_crmd_datm :
 assign tlbsrch_found = srch_found;
 assign tlbsrch_index = srch_index;
 
-// 与参考实现对齐：TLBRD 有效时输出 NE=0、PS=r_ps；无效时 NE=1 且 PS=0（勿在 !r_e 时仍用 RAM 的 r_ps）。
-// 使用 ===/!==：r_e 为 X 时勿用 ? : 把 X 灌进 TLBRD 回读（曾导致 csr_tlbehi / WB wdata 出现 X）。
-assign tlbrd_tlbidx  = {(r_e !== 1'b1), 1'b0, (r_e === 1'b1) ? r_ps : 6'b0, 24'b0};
+// TLBRD 有效时输出 NE=0、PS=r_ps；无效时输出 NE=1、PS=0。
+// 使用 ===/!==：r_e 为 X 时不能用条件表达式把 X 传播到 TLBRD、csr_tlbehi 和写回数据。
+assign tlbrd_ne      = (r_e !== 1'b1);
+assign tlbrd_ps      = (r_e === 1'b1) ? r_ps : 6'b0;
 assign tlbrd_tlbehi  = (r_e === 1'b1) ? {r_vppn, 13'b0} : 32'b0;
 assign tlbrd_tlbelo0 = (r_e === 1'b1) ? {4'b0, r_ppn0, 1'b0, r_g, r_mat0, r_plv0, r_d0, r_v0} : 32'b0;
 assign tlbrd_tlbelo1 = (r_e === 1'b1) ? {4'b0, r_ppn1, 1'b0, r_g, r_mat1, r_plv1, r_d1, r_v1} : 32'b0;
 assign tlbrd_asid    = (r_e === 1'b1) ? r_asid : 10'b0;
-
-// lint 吸收（s0_index/s1_index 仅主表内部使用；tlbsrch/tlbrd 由 CSR 侧采样）
-wire tlbm_lint_sink = (|s0_index) | (|s1_index) | do_tlbsrch | do_tlbrd;
 
 endmodule

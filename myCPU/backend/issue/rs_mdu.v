@@ -6,7 +6,7 @@
 //   rdcnt 类、TLB 维护类（执行级只打包 invtlb 的 asid/vpn）指令。
 // - FIFO 严格顺序发射（MDU 非流水多周期，且 CSR 读必须按序——
 //   虽然 CSR 写会触发 refetch 冲刷保证了顺序，但保守起见仍按序发射）。
-// - 容量 2 项即可（这类指令频率低，mariver 同款配置）。
+// - 容量为 2 项；这类低频指令由非流水 MDU 顺序处理。
 //
 // 端口：与 rs_mem 同构，差异：
 // - bundle 为 alu_op（乘除位）/csr_op/csr_num/tlb_op/wb_src_op
@@ -22,11 +22,11 @@ module rs_mdu(
     // ---------------- 入站（dispatch）----------------
     input  wire                       push_valid_i,
     input  wire [`ROB_W-1:0]          push_robid_i,
-    input  wire [`ALU_OP_NUM-1:0]     push_alu_op_i,       // 乘除位有效
+    input  wire [18:12]               push_alu_op_i,       // MUL..MOD_WU
     input  wire [`CSR_OP_NUM-1:0]     push_csr_op_i,
     input  wire [13:0]                push_csr_num_i,
     input  wire [`TLB_OP_NUM-1:0]     push_tlb_op_i,
-    input  wire [`WB_SRC_NUM-1:0]     push_wb_src_op_i,    // rdcnt 类选择
+    input  wire [`WB_SRC_NUM-1:0]     push_wb_src_op_i,    // {TID,CNTVH,CNTVL,ALU}
     input  wire                       push_src0_ready_i,   // src0 = rj（csrxchg 的 mask / invtlb 的 asid / 乘除源1）
     input  wire [31:0]                push_src0_val_i,
     input  wire [`ROB_W-1:0]          push_src0_robid_i,
@@ -62,7 +62,7 @@ module rs_mdu(
     // ---------------- 发射口（到 fu_mdu）----------------
     output wire                       issue_valid_o,
     output wire [`ROB_W-1:0]          issue_robid_o,
-    output wire [`ALU_OP_NUM-1:0]     issue_alu_op_o,
+    output wire [18:12]               issue_alu_op_o,
     output wire [`CSR_OP_NUM-1:0]     issue_csr_op_o,
     output wire [13:0]                issue_csr_num_o,
     output wire [`TLB_OP_NUM-1:0]     issue_tlb_op_o,
@@ -72,7 +72,7 @@ module rs_mdu(
     input  wire                       mdu_ready_i          // MDU 空闲可接收
 );
 
-// 设计说明（已实现，参考 mariver station.v 的 MDU 保留站部分）：
+// 设计说明：
 //      结构与 rs_mem 同构（head/tail FIFO + 唤醒捕获 + 队头发射），
 //      容量 2 项、bundle 字段不同、反压来自 mdu_ready_i。
 //
@@ -83,7 +83,7 @@ module rs_mdu(
 
 reg                     valid [0:`RS_MDU_SIZE-1];
 reg [`ROB_W-1:0]        robid [0:`RS_MDU_SIZE-1];
-reg [`ALU_OP_NUM-1:0]   alu_op [0:`RS_MDU_SIZE-1];
+reg [18:12]             alu_op [0:`RS_MDU_SIZE-1];
 reg [`CSR_OP_NUM-1:0]   csr_op [0:`RS_MDU_SIZE-1];
 reg [13:0]              csr_num [0:`RS_MDU_SIZE-1];
 reg [`TLB_OP_NUM-1:0]   tlb_op [0:`RS_MDU_SIZE-1];

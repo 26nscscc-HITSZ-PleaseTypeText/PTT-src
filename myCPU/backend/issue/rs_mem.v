@@ -23,9 +23,9 @@ module rs_mem(
     // ---------------- 入站（dispatch）----------------
     input  wire                       push_valid_i,
     input  wire [`ROB_W-1:0]          push_robid_i,
-    input  wire [31:0]                push_pc_i,
     input  wire [`MEM_OP_NUM-1:0]     push_mem_op_i,
     input  wire                       push_is_cacop_i,
+    input  wire [4:3]                 push_cacop_op_i,
     input  wire                       push_src0_ready_i,   // src0 = 基址 rj
     input  wire [31:0]                push_src0_val_i,
     input  wire [`ROB_W-1:0]          push_src0_robid_i,
@@ -51,7 +51,7 @@ module rs_mem(
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
 
-    // ---------------- 提前唤醒总线 ×3（early0/1=ALU；early2=LSU DC 命中，V3.4）----------------
+    // ---------------- 提前唤醒总线 ×3（early0/1=ALU；early2=LSU DC 命中）----------------
     input  wire                       early0_valid_i,
     input  wire [`ROB_W-1:0]          early0_robid_i,
     input  wire                       early1_valid_i,
@@ -62,16 +62,16 @@ module rs_mem(
     // ---------------- 发射口（到 lsu）----------------
     output wire                       issue_valid_o,
     output wire [`ROB_W-1:0]          issue_robid_o,
-    output wire [31:0]                issue_pc_o,
     output wire [`MEM_OP_NUM-1:0]     issue_mem_op_o,
     output wire                       issue_is_cacop_o,
+    output wire [4:3]                 issue_cacop_op_o,
     output wire [31:0]                issue_base_o,        // 基址（src0 捕获值）
     output wire [31:0]                issue_wdata_o,       // store 数据（src1 捕获值）
     output wire [31:0]                issue_imm_o,
     input  wire                       lsu_ready_i          // LSU 本拍可接收（AGU 级空闲）
 );
 
-// 设计说明（已实现，参考 mariver station.v 的 MU 保留站部分 + 有限 load 越过）
+// 设计说明：
 //
 // 存储结构：
 //      与 rs_alu 类似（valid/robid/op/双源/imm），但组织成 FIFO：
@@ -90,19 +90,14 @@ module rs_mem(
 //
 // 冲刷：flush_i 清空 head/tail/valid。
 //
-// 坑点提示：
-//      1. lsu_ready_i 为 0 时队头保持，不要丢发射（脉冲式发射 + not-ready 丢失
-//         是常见 bug，发射条件里与上 lsu_ready 即可避免）。
-//      2. load 提前唤醒（V3.4：lsu DC 命中限定 early2）已接入；唤醒的是依赖
-//         load 结果的指令，本站自身的操作数捕获逻辑不变。
-//      3. 若想 load 越过前面的 store，必须加 store 地址比较（内存消歧）+
-//         违例恢复，工作量大，务必先评估收益。
+// 接口约束：lsu_ready_i 为 0 时必须保持队头；early2 只表示 D$ 命中 load
+// 的提前唤醒。没有地址消歧和违例恢复时，load 不得越过 store。
 
 reg                     valid [0:`RS_MEM_SIZE-1];
 reg [`ROB_W-1:0]        robid [0:`RS_MEM_SIZE-1];
-reg [31:0]              pc [0:`RS_MEM_SIZE-1];
 reg [`MEM_OP_NUM-1:0]   mem_op [0:`RS_MEM_SIZE-1];
 reg                     is_cacop [0:`RS_MEM_SIZE-1];
+reg [4:3]               cacop_op [0:`RS_MEM_SIZE-1];
 reg                     s0_ready [0:`RS_MEM_SIZE-1];
 reg                     s0_val_valid [0:`RS_MEM_SIZE-1];
 reg [31:0]              s0_val [0:`RS_MEM_SIZE-1];
@@ -238,9 +233,9 @@ assign issue_valid_o = issue_sel_valid && lsu_ready_i;
 assign issue_fire = issue_valid_o;
 
 assign issue_robid_o = robid[issue_idx];
-assign issue_pc_o = pc[issue_idx];
 assign issue_mem_op_o = mem_op[issue_idx];
 assign issue_is_cacop_o = is_cacop[issue_idx];
+assign issue_cacop_op_o = cacop_op[issue_idx];
 assign issue_base_o = s0_wbhit[issue_idx] ? s0_wbdat[issue_idx] : s0_val[issue_idx];
 assign issue_wdata_o = s1_wbhit[issue_idx] ? s1_wbdat[issue_idx] : s1_val[issue_idx];
 assign issue_imm_o = imm[issue_idx];
@@ -280,9 +275,9 @@ always @(posedge clk) begin
             if (issue_need_swap) begin
                 // 未就绪队头挪到被越过槽，保持年龄序；本拍发射项按已位于 head 出队
                 robid[issue_idx]     <= robid[head];
-                pc[issue_idx]        <= pc[head];
                 mem_op[issue_idx]    <= mem_op[head];
                 is_cacop[issue_idx]  <= is_cacop[head];
+                cacop_op[issue_idx]  <= cacop_op[head];
                 s0_ready[issue_idx]  <= s0_ready[head] || s0_wbhit[head] || s0_earlyhit[head];
                 s0_val_valid[issue_idx] <= s0_val_valid[head] || s0_wbhit[head];
                 s0_val[issue_idx]    <= s0_wbhit[head] ? s0_wbdat[head] : s0_val[head];
@@ -301,9 +296,9 @@ always @(posedge clk) begin
         if (push_valid_i && can_accept_o) begin
             valid[tail] <= 1'b1;
             robid[tail] <= push_robid_i;
-            pc[tail] <= push_pc_i;
             mem_op[tail] <= push_mem_op_i;
             is_cacop[tail] <= push_is_cacop_i;
+            cacop_op[tail] <= push_cacop_op_i;
             s0_ready[tail] <= push_src0_ready_i || push_s0_wbhit || push_s0_early;
             s0_val_valid[tail] <= push_src0_ready_i || push_s0_wbhit;
             s0_val[tail] <= push_s0_wbhit ? push_s0_wbdat :

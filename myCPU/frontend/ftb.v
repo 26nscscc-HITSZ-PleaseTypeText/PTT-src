@@ -1,7 +1,7 @@
 // ============================================================
 // ftb 模块（Fetch Target Buffer，取指目标缓冲）
 // ------------------------------------------------------------
-// 参考实现说明：
+// 当前结构与约束：
 // - 4 路 × 2048 组，推断 BRAM（1R+1W 简单双口），查询 1 拍延迟；
 // - 条目 {valid, tag(19), br_type(2), len(3), target(32)}；
 //   fall_through 不存全宽：由 len 重建（= 块PC + 4*len）；
@@ -30,11 +30,10 @@ module ftb(
 
     // ---------------- 更新口（提交训练）----------------
     input  wire                       update_valid_i,
-    input  wire [31:0]                update_block_pc_i,   // 块起始 PC
+    input  wire [31:2]                update_block_pc_i,   // 块起始 PC 的字地址
     input  wire [31:0]                update_jump_target_i,
-    input  wire [31:0]                update_fall_through_i,
-    input  wire [`BR_TYPE_W-1:0]      update_br_type_i,
-    input  wire                       update_alloc_i       // 1=新分配，0=仅更新
+    input  wire [`BLK_LEN_W+1:2]      update_fall_through_i, // 顺序出口的块内字偏移
+    input  wire [`BR_TYPE_W-1:0]      update_br_type_i
 );
 
 localparam TAGW    = 32 - 2 - `FTB_INDEX_W;        // pc[31:(2+INDEX)]；2048 组时为 19
@@ -47,17 +46,21 @@ localparam [FTB_UPDATE_Q_CNT_W-1:0] FTB_UPDATE_Q_DEPTH_C = FTB_UPDATE_Q_DEPTH;
 
 // ---------------- 更新流水 U0/U1 ----------------
 reg                   u0_valid;
-reg [31:0]            u0_pc, u0_target, u0_ft;
+reg [31:2]            u0_pc_word;
+reg [31:0]            u0_target;
+reg [`BLK_LEN_W-1:0]  u0_ft_wordoff;
 reg [`BR_TYPE_W-1:0]  u0_btype;
-reg                   u0_alloc;
 reg                   u1_valid;
-reg [31:0]            u1_pc, u1_target;
+reg [31:2]            u1_pc_word;
+reg [31:0]            u1_target;
 reg [`BR_TYPE_W-1:0]  u1_btype;
 reg [`BLK_LEN_W-1:0]  u1_len;
 
+wire [`BLK_LEN_W-1:0] u0_len =
+    u0_ft_wordoff - u0_pc_word[`BLK_LEN_W+1:2];
+
 wire [`FTB_INDEX_W-1:0] q_index = query_pc_i[2 +: `FTB_INDEX_W];
-wire [`FTB_INDEX_W-1:0] u0_index= u0_pc[2 +: `FTB_INDEX_W];
-wire [`FTB_INDEX_W-1:0] u1_index= u1_pc[2 +: `FTB_INDEX_W];
+wire [`FTB_INDEX_W-1:0] u1_index= u1_pc_word[2 +: `FTB_INDEX_W];
 
 // 读口仲裁：查询优先，训练请求进入小 FIFO 后在空闲周期借口
 reg                     initing;
@@ -65,11 +68,10 @@ reg [`FTB_INDEX_W-1:0]  init_set;
 
 // 训练 FIFO 载荷：强制分布式 RAM——32 项小队列若被推断成 RAMB18
 // 利用率仅 ~6%，且 BRAM 读延迟约束会打断"出队拍借读口"的异步读用法
-(* ram_style = "distributed" *) reg [31:0]           uq_pc      [0:FTB_UPDATE_Q_DEPTH-1];
+(* ram_style = "distributed" *) reg [31:2]           uq_pc_word [0:FTB_UPDATE_Q_DEPTH-1];
 (* ram_style = "distributed" *) reg [31:0]           uq_target  [0:FTB_UPDATE_Q_DEPTH-1];
-(* ram_style = "distributed" *) reg [31:0]           uq_ft      [0:FTB_UPDATE_Q_DEPTH-1];
+(* ram_style = "distributed" *) reg [`BLK_LEN_W-1:0] uq_ft_wordoff[0:FTB_UPDATE_Q_DEPTH-1];
 (* ram_style = "distributed" *) reg [`BR_TYPE_W-1:0] uq_btype   [0:FTB_UPDATE_Q_DEPTH-1];
-(* ram_style = "distributed" *) reg                  uq_alloc   [0:FTB_UPDATE_Q_DEPTH-1];
 reg [FTB_UPDATE_Q_PTR_W-1:0] uq_rptr, uq_wptr;
 reg [FTB_UPDATE_Q_CNT_W-1:0] uq_count;
 
@@ -86,7 +88,7 @@ wire [FTB_UPDATE_Q_CNT_W-1:0] uq_count_next =
                                           uq_count;
 wire [63:0] uq_count_next_64 = {{(64-FTB_UPDATE_Q_CNT_W){1'b0}}, uq_count_next};
 
-wire [`FTB_INDEX_W-1:0] service_index = uq_pc[uq_rptr][2 +: `FTB_INDEX_W];
+wire [`FTB_INDEX_W-1:0] service_index = uq_pc_word[uq_rptr][2 +: `FTB_INDEX_W];
 wire [`FTB_INDEX_W-1:0] rd_index = service_update ? service_index : q_index;
 
 
@@ -147,19 +149,18 @@ always @(*) begin
         if (q_hit[qi]) q_way = qi[1:0];
 end
 
-wire [ENTRY_W-1:0] q_entry = way_rdata[q_way];
-wire [`BLK_LEN_W-1:0] q_len = q_entry[32 +: `BLK_LEN_W];
+wire [`BLK_LEN_W-1:0] q_len = way_rdata[q_way][32 +: `BLK_LEN_W];
 
 assign hit_o          = |q_hit;
 assign resp_valid_o   = q_valid_r;
 assign hit_way_o      = q_way;
-assign jump_target_o  = q_entry[31:0];
+assign jump_target_o  = way_rdata[q_way][31:0];
 assign fall_through_o = q_pc_r + {27'b0, q_len, 2'b00};
-assign br_type_o      = q_entry[32+`BLK_LEN_W +: `BR_TYPE_W];
+assign br_type_o      = way_rdata[q_way][32+`BLK_LEN_W +: `BR_TYPE_W];
 
 // ---------------- 更新流水 ----------------
 // U1 拍：U0 读出的 4 路与 u1 tag 比较
-wire [TAGW-1:0] u1_tag = u1_pc[31 -: TAGW];
+wire [TAGW-1:0] u1_tag = u1_pc_word[31 -: TAGW];
 wire [`FTB_NWAY-1:0] u_hit;
 generate
 for (g = 0; g < `FTB_NWAY; g = g + 1) begin : gen_ftb_uhit
@@ -209,12 +210,11 @@ always @(posedge clk) begin
     end else begin
         // 更新请求先进入 FIFO；空闲周期再借读口进入 U0
         if (update_enqueue) begin
-            uq_pc[uq_wptr]     <= update_block_pc_i;
-            uq_target[uq_wptr] <= update_jump_target_i;
-            uq_ft[uq_wptr]     <= update_fall_through_i;
-            uq_btype[uq_wptr]  <= update_br_type_i;
-            uq_alloc[uq_wptr]  <= update_alloc_i;
-            uq_wptr            <= uq_wptr + {{(FTB_UPDATE_Q_PTR_W-1){1'b0}},1'b1};
+            uq_pc_word[uq_wptr]  <= update_block_pc_i;
+            uq_target[uq_wptr]   <= update_jump_target_i;
+            uq_ft_wordoff[uq_wptr] <= update_fall_through_i;
+            uq_btype[uq_wptr]    <= update_br_type_i;
+            uq_wptr              <= uq_wptr + {{(FTB_UPDATE_Q_PTR_W-1){1'b0}},1'b1};
         end
 
         if (update_dequeue) begin
@@ -224,32 +224,27 @@ always @(posedge clk) begin
 
         u0_valid <= update_dequeue;
         if (update_dequeue) begin
-            u0_pc     <= uq_pc[uq_rptr];
-            u0_target <= uq_target[uq_rptr];
-            u0_ft     <= uq_ft[uq_rptr];
-            u0_btype  <= uq_btype[uq_rptr];
-            u0_alloc  <= uq_alloc[uq_rptr];
+            u0_pc_word    <= uq_pc_word[uq_rptr];
+            u0_target     <= uq_target[uq_rptr];
+            u0_ft_wordoff <= uq_ft_wordoff[uq_rptr];
+            u0_btype      <= uq_btype[uq_rptr];
         end
         // U1：写入
         u1_valid <= u0_valid;
         if (u0_valid) begin
-            u1_pc     <= u0_pc;
+            u1_pc_word<= u0_pc_word;
             u1_target <= u0_target;
             u1_btype  <= u0_btype;
-            u1_len    <= (u0_ft - u0_pc) >> 2;      // 块长（1~4）
+            u1_len    <= u0_len;                    // 块长（1~4 条指令）
         end
         if (u1_valid && !u_found && !u_inv_found)
             victim_rr <= victim_rr + 2'd1;
     end
 end
 
-// lint 吸收（alloc 标志当前未区分语义：命中即原地更新，未命中即分配）
-wire ftb_lint = u0_alloc;
-
 `ifdef SYNTHESIS
 // synthesis translate_off
 reg [63:0] ftb_query_total;
-reg [63:0] ftb_query_suppressed_by_train;
 reg [63:0] ftb_response_total;
 reg [63:0] ftb_hit_total;
 reg [63:0] ftb_train_total;
@@ -259,14 +254,12 @@ reg [63:0] ftb_update_dequeue_count;
 reg [63:0] ftb_update_write_count;
 reg [63:0] ftb_update_overflow_count;
 reg [63:0] ftb_update_queue_max_occupancy;
-reg [63:0] ftb_update_queue_pending_count;
 reg [63:0] ftb_query_while_update_arrives_count;
 reg [63:0] ftb_update_service_idle_cycle_count;
 
 always @(posedge clk) begin
     if (reset) begin
         ftb_query_total               <= 64'd0;
-        ftb_query_suppressed_by_train <= 64'd0;
         ftb_response_total            <= 64'd0;
         ftb_hit_total                 <= 64'd0;
         ftb_train_total               <= 64'd0;
@@ -276,7 +269,6 @@ always @(posedge clk) begin
         ftb_update_write_count        <= 64'd0;
         ftb_update_overflow_count     <= 64'd0;
         ftb_update_queue_max_occupancy <= 64'd0;
-        ftb_update_queue_pending_count <= 64'd0;
         ftb_query_while_update_arrives_count <= 64'd0;
         ftb_update_service_idle_cycle_count  <= 64'd0;
     end else begin
@@ -300,7 +292,6 @@ always @(posedge clk) begin
             ftb_update_overflow_count <= ftb_update_overflow_count + 64'd1;
         if (uq_count_next_64 > ftb_update_queue_max_occupancy)
             ftb_update_queue_max_occupancy <= uq_count_next_64;
-        ftb_update_queue_pending_count <= uq_count_next_64;
         if (query_valid_i && update_valid_i && !initing)
             ftb_query_while_update_arrives_count <= ftb_query_while_update_arrives_count + 64'd1;
         if (update_dequeue)

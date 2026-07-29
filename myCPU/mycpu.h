@@ -18,8 +18,8 @@
  *   后端：decoder x2 -> rename(RAT+ARF/ROB读) -> dispatch -> 4xRS
  *         -> FU(ALU0/ALU1/LSU/MDU) -> ROB -> commit(双提交)
  *   访存：LSU(AGU+DC两级) / store_buffer(提交后写) / DCache / L2 / AXI桥
- *   重命名：ROB 编号即重命名标签（mariver 队列式重命名，无独立 PRF/freelist）
- *   恢复：误预测/异常/特权指令 -> 提交级统一冲刷（一期）
+ *   重命名：ROB 编号即重命名标签，无独立 PRF/freelist
+ *   恢复：误预测/异常/特权指令 -> 提交级统一冲刷
  * ============================================================ */
 
 /* =====================================================
@@ -37,7 +37,7 @@
 `define ROB_SIZE        32  // ROB 总项数（奇偶双体 = 16 对 x 2 路）
 `define ROB_W           5   // $clog2(ROB_SIZE)，ROB 编号位宽 = {奇偶位, 对指针}
 `define ROB_PAIR_W      4   // ROB_W-1，ROB 对指针(head/tail)位宽
-`define ROB_GUARD       5   // head/tail 安全间距（mariver：保证 dispatch 读 ROB
+`define ROB_GUARD       5   // head/tail 安全间距：保证 dispatch 读 ROB
                             // 结果时，已提交但未被覆盖的数据仍可读，必须保留！）
 // 未决 store 提交判定：对指针距离 d=(R-head) 环形；存活项 d ∈ [0, N-GUARD)，
 // wrap 后 d ∈ [N-GUARD, N)。阈值须随 ROB_PAIR_W 伸缩（原写死 12 只适配 16 对）。
@@ -46,9 +46,8 @@
 `define RS_ALU_SIZE     4   // 每个 ALU 保留站项数（乱序发射）
 `define RS_ALU_IDX_W    2   // $clog2(RS_ALU_SIZE)
 `define RS_ALU_OCC_W    3   // $clog2(RS_ALU_SIZE+1)，occupancy 0..SIZE
-`define RS_MEM_SIZE     4   // 访存保留站项数（FIFO + 有限 load 越过；V2.3 A/B 过 4→8：
-                            //   IPC 0.5700 持平——反压只是转移成 ROB full（9%→22%），
-                            //   真瓶颈在 D$ miss 串行延迟，故保持 4 省资源）
+`define RS_MEM_SIZE     4   // 访存保留站项数（FIFO + 有限 load 越过）；加深只会把
+                            // 反压转移到 ROB，D$ miss 延迟不变，因此保持 4 项
 `define RS_MEM_IDX_W    2   // $clog2(RS_MEM_SIZE)
 `define RS_MEM_OCC_W    3   // $clog2(RS_MEM_SIZE+1)
 `define RS_MDU_SIZE     2   // 乘除保留站项数（FIFO 顺序发射）
@@ -61,6 +60,9 @@
 
 `define IB_SIZE         16  // 指令缓冲项数（入口<=4条/拍，出口 2条/拍）
 `define IB_W            4   // $clog2(IB_SIZE)
+// 默认启用空 IB 组合旁路；定义该宏可关闭旁路，用于隔离冷启动行为。
+// `define IB_DISABLE_EMPTY_FALLTHROUGH
+
 
 /* =====================================================
  * Cache 几何参数
@@ -75,25 +77,23 @@
 `define CACHE_LINE_WORDS  8           // 每行 32bit 字数
 
 `define L1_NWAY           4           // L1 I/D cache 路数
-`define L1_NMSHR          2           // L1 D$ MSHR 项数（Phase1b 起参数化；V2.3 A/B 过 2→4：
-                                      //   IPC 0.5699 持平（AXI 读通道单 owner，MSHR 数不增并行度），
-                                      //   资源反增（行缓冲/比较器 ×2），故保持 2）
+`define L1_NMSHR          2           // L1 D$ MSHR 项数（单 AXI 读 owner）
 `define DC_MSHR_DEPTH     `L1_NMSHR   // dcache 后台 MSHR 深度
 `define LSU_MISS_DEPTH    `DC_MSHR_DEPTH // LSU miss 槽深度（与 D$ MSHR 对齐）
-// V3.4@55MHz 合规：bypass=0 的 hold 路径会 Linux hang（疑 hold 与 V3.4 交互 bug）。
-// 改为保留 hit-bypass，在顶层对 mem_wb 整总线打一拍切断 D$→RS；early2 关闭避免早醒。
+// 保留 hit-bypass，在顶层对 mem_wb 整总线打一拍切断 D$→RS；early2 关闭，
+// 避免消费者在写回数据可用前提前唤醒。
 `define LSU_DC_HIT_BYPASS 1           // 保持命中当拍算出 WB 数据
-`define LSU_WB_PIPE       1           // 顶层 mem_wb→RS/ROB 打一拍（55MHz 时序）
+`define LSU_WB_PIPE       1           // 顶层 mem_wb→RS/ROB 打一拍，切断命中组合路径
 `define LSU_EARLY2_ENABLE 0           // 与 WB_PIPE 配对关闭（否则 T 醒、T+1 数据）
 `define LSU_EARLY2_PIPE   0
 `define IFU_FTQ_DIRECT    1           // 1: 允许同拍 FTQ→I$；仅在 mmu_i_direct_ok（无主 TLB）时开火
-`define STQ_DEPTH         8           // 软门 STQ4 IPC 同 0.570，但 difftest 在 account_user_time 错载；默认 8
+`define STQ_DEPTH         16          // 未提交 store 队列深度；提交后按 ROB id 释放
 `define L1_NSET           128         // L1 每路组数（16KB/4路/32B）
 `define L1_INDEX_W        7           // $clog2(L1_NSET)
 `define L1_TAG_W          20          // 32 - 7 - 5
 
 `define L2_NWAY           2           // L2 路数
-`define L2_NSET           2048        // L2 每路组数（V3.4：128KB/2路/32B；原 512=32KB）
+`define L2_NSET           2048        // L2 每路组数（128KB/2路/32B）
 `define L2_INDEX_W        11          // $clog2(L2_NSET)
 `define L2_TAG_W          16          // 32 - 11 - 5
 
@@ -101,16 +101,15 @@
  * 分支预测器（BPU）参数
  * ===================================================== */
 `define UBTB_SIZE         16          // uBTB 项数（全相联，当拍返回，回填小循环）
+// 普通 JIRL 使用小型目标缓存；CALL/RET 由 RAS 处理。
+`define JIRL_TC_SIZE      32          // 普通 JIRL 小型目标缓存项数（直接映射）
+`define JIRL_TC_INDEX_W   5           // $clog2(JIRL_TC_SIZE)
 `define FTB_NWAY          4           // FTB 路数
 `define FTB_NSET          2048        // FTB 每路组数（共 8192 项，BRAM 实现）
 `define FTB_INDEX_W       11          // $clog2(FTB_NSET)
-`define FTB_UPDATE_Q_DEPTH 32          // FTB 训练更新 FIFO 深度（2 的幂；查询优先不偷读口；
-                                       //   V2.3 A/B 过 32→64：overflow 31万→26万 但 BPU 准确率
-                                       //   与 IPC 均持平——溢出集中在查询独占读口的突发段，
-                                       //   加深只延后丢弃，故保持 32）
-`define TAGE_UPDATE_Q_DEPTH 32          // TAGE 训练更新 FIFO（COND 突发训练更密，需更深；
-                                       //   V2.3 A/B 过 32→64：overflow 16万→14万，准确率/IPC
-                                       //   持平，保持 32）
+`define FTB_UPDATE_Q_DEPTH 32          // FTB 训练更新 FIFO；查询优先，突发训练可排队
+`define TAGE_UPDATE_Q_DEPTH 32         // TAGE 条件分支训练 FIFO；较小深度无法满足
+                                       // Linux 长程稳定性，较大深度未改善准确率或 IPC
 
 `define TAGE_BASE_DEPTH   8192        // TAGE 基础表项数（2bit 饱和计数器）
 `define TAGE_TAG_NUM      4           // TAGE 标记表个数
@@ -120,7 +119,7 @@
 `define TAGE_HIST_LEN1    23
 `define TAGE_HIST_LEN2    53
 `define TAGE_HIST_LEN3    112
-`define GHR_LEN           1136        // 全局历史寄存器总长（1024+112）
+`define GHR_LEN           112         // 覆盖 TAGE 最长标记表使用的全局历史
 
 `define RAS_DEPTH         32          // 返回地址栈深度（前端栈+提交栈双栈）
 `define RAS_W             5           // $clog2(RAS_DEPTH)
@@ -256,7 +255,7 @@
  * ===================================================== */
 // load 按 mem_op + 字内偏移 → 访问字节掩码（与 store wstrb 对齐比较）
 function automatic [3:0] mem_load_byte_mask;
-    input [`MEM_OP_NUM-1:0] op;
+    input [7:4]             op;
     input [1:0]             off;
     begin
         if (op[`MEM_OP_LD_B] || op[`MEM_OP_LD_BU])
@@ -270,22 +269,22 @@ endfunction
 
 // 同字地址上 store.strb 与 load 字节掩码是否重叠
 function automatic mem_st_ld_overlap;
-    input [31:0] st_paddr;
+    input [31:2] st_word;
     input [3:0]  st_strb;
-    input [31:0] ld_paddr;
+    input [31:2] ld_word;
     input [3:0]  ld_mask;
     begin
-        mem_st_ld_overlap = (st_paddr[31:2] == ld_paddr[31:2])
+        mem_st_ld_overlap = (st_word == ld_word)
                          && |(st_strb & ld_mask);
     end
 endfunction
 
 // SB 前递：项与查询是否同字
 function automatic mem_same_word;
-    input [31:0] a;
-    input [31:0] b;
+    input [31:2] a;
+    input [31:2] b;
     begin
-        mem_same_word = (a[31:2] == b[31:2]);
+        mem_same_word = (a == b);
     end
 endfunction
 
@@ -300,13 +299,11 @@ endfunction
 /* =====================================================
  * 写回数据源 (wb_src_op)
  * ===================================================== */
-`define WB_SRC_NUM      6
+`define WB_SRC_NUM      4
 `define WB_SRC_ALU      0
-`define WB_SRC_MEM      1
-`define WB_SRC_CSR      2
-`define WB_SRC_CNTVL    3
-`define WB_SRC_CNTVH    4
-`define WB_SRC_TID      5
+`define WB_SRC_CNTVL    1
+`define WB_SRC_CNTVH    2
+`define WB_SRC_TID      3
 
 /* =====================================================
  * TLB 维护指令 (tlb_op)
@@ -374,7 +371,7 @@ endfunction
 `define Esubcode_other_exception 1'b0
 
 /* =====================================================
- * 6 位 Ecode（与 open-la500 csr.h 对齐，便于 CSR 写值）
+ * 6 位 Ecode（LoongArch CSR 编码）
  * ===================================================== */
 `define ECODE_INT  6'h0
 `define ECODE_PIL  6'h1
@@ -397,43 +394,43 @@ endfunction
 /* =====================================================
  * CSR 寄存器号
  * ===================================================== */
-`define CSR_CRMD        12'h000
-`define CSR_PRMD        12'h001
-`define CSR_EUEN        12'h002
-`define CSR_ECFG        12'h004
-`define CSR_ESTAT       12'h005
-`define CSR_ERA         12'h006
-`define CSR_BADV        12'h007
-`define CSR_EENTRY      12'h00c
-`define CSR_TLBIDX      12'h010
-`define CSR_TLBEHI      12'h011
-`define CSR_TLBELO0     12'h012
-`define CSR_TLBELO1     12'h013
-`define CSR_ASID        12'h018
-`define CSR_PGDL        12'h019
-`define CSR_PGDH        12'h01a
-`define CSR_PGD         12'h01b
-`define CSR_CPUID       12'h020
-`define CSR_SAVE0       12'h030
-`define CSR_SAVE1       12'h031
-`define CSR_SAVE2       12'h032
-`define CSR_SAVE3       12'h033
-`define CSR_TID         12'h040
-`define CSR_TCFG        12'h041
-`define CSR_TVAL        12'h042
-`define CSR_TICLR       12'h044
+`define CSR_CRMD        14'h0000
+`define CSR_PRMD        14'h0001
+`define CSR_EUEN        14'h0002
+`define CSR_ECFG        14'h0004
+`define CSR_ESTAT       14'h0005
+`define CSR_ERA         14'h0006
+`define CSR_BADV        14'h0007
+`define CSR_EENTRY      14'h000c
+`define CSR_TLBIDX      14'h0010
+`define CSR_TLBEHI      14'h0011
+`define CSR_TLBELO0     14'h0012
+`define CSR_TLBELO1     14'h0013
+`define CSR_ASID        14'h0018
+`define CSR_PGDL        14'h0019
+`define CSR_PGDH        14'h001a
+`define CSR_PGD         14'h001b
+`define CSR_CPUID       14'h0020
+`define CSR_SAVE0       14'h0030
+`define CSR_SAVE1       14'h0031
+`define CSR_SAVE2       14'h0032
+`define CSR_SAVE3       14'h0033
+`define CSR_TID         14'h0040
+`define CSR_TCFG        14'h0041
+`define CSR_TVAL        14'h0042
+`define CSR_TICLR       14'h0044
 // L0 CSR 写白名单：提交可免 FLUSH_REFETCH（须配合 rename 串行排空，防在途 csrrd 读旧值）
 `define CSR_NUM_IS_L0_NOFLUSH(n) ( \
     ((n) == `CSR_TICLR) || ((n) == `CSR_SAVE0) || ((n) == `CSR_SAVE1) || \
     ((n) == `CSR_SAVE2) || ((n) == `CSR_SAVE3) || ((n) == `CSR_TID))
-`define CSR_LLBCTL      12'h060
-`define CSR_TLBRENTRY   12'h088
-`define CSR_CTAG        12'h098
-`define CSR_DMW0        12'h180
-`define CSR_DMW1        12'h181
+`define CSR_LLBCTL      14'h0060
+`define CSR_TLBRENTRY   14'h0088
+`define CSR_CTAG        14'h0098
+`define CSR_DMW0        14'h0180
+`define CSR_DMW1        14'h0181
 
 /* =====================================================
- * CSR 字段宏（open-la500 csr.h 风格）
+ * CSR 字段宏
  * ===================================================== */
 `define PLV       1:0
 `define IE        2
@@ -498,13 +495,6 @@ endfunction
 `define CSR_TCFG_EN        0
 `define CSR_TCFG_PERIODIC  1
 `define CSR_TCFG_INITVAL   31:2
-
-/* =====================================================
- * NPC/CSR 重定向类型（csr_exception_commit_handler 输出）
- * ===================================================== */
-`define CSR_REDIRECT_NONE  2'b00
-`define CSR_REDIRECT_EX    2'b01
-`define CSR_REDIRECT_ERTN  2'b10
 
 /* =====================================================
  * Cache 维护指令操作码 (cache_op / cacop_op)

@@ -22,10 +22,11 @@
 module tage(
     input  wire                       clk,
     input  wire                       reset,
+    input  wire                       flush_i,
 
     // ---------------- 查询口（1 拍延迟返回）----------------
     input  wire                       query_valid_i,
-    input  wire [31:0]                query_pc_i,         // 预测块起始 PC
+    input  wire [21:2]                query_pc_i,         // 预测索引使用的 PC 位
 
     output wire                       taken_o,            // 方向预测（晚查询 1 拍）
     output wire                       resp_valid_o,
@@ -33,10 +34,24 @@ module tage(
 
     // ---------------- 训练口（提交级 BPU 训练，经内部 FIFO 缓冲）----------------
     input  wire                       train_valid_i,
-    input  wire [31:0]                train_pc_i,
+    input  wire [21:2]                train_pc_i,
     input  wire                       train_taken_i,      // 实际方向
     input  wire                       train_mispred_i,    // 该分支发生误预测
-    input  wire [`BPU_META_W-1:0]     train_meta_i        // 查询时的 meta 原样回传
+    input  wire [`BPU_META_W-1:0]     train_meta_i,       // 查询时的 meta 原样回传
+
+    // 按 FTQ 编号保存的推测历史检查点
+    input  wire                       hist_checkpoint_save_i,
+    input  wire [`FTQ_W-1:0]          hist_checkpoint_id_i,
+    input  wire                       hist_restore_i,
+    input  wire [`FTQ_W-1:0]          hist_restore_id_i,
+    input  wire                       hist_restore_append_i,
+    input  wire                       hist_restore_taken_i,
+    input  wire                       hist_update_valid_i,
+    input  wire                       hist_update_taken_i,
+
+    // 后端冲刷时用于恢复的精确提交历史
+    input  wire                       cmt_hist_valid_i,
+    input  wire                       cmt_hist_taken_i
 );
 
 localparam BASE_IDXW = 13;          // 8192
@@ -55,14 +70,30 @@ localparam META_PROVIDER_U_LSB     = 36;
 localparam META_TAGE_VALID_BIT     = 38;
 localparam META_PROVIDER_TAG_LSB   = 43;
 localparam META_PROVIDER_TAG_W     = `TAGE_TAG_W;
+localparam META_FTQ_ID_LSB         = 55;
 localparam TAGE_UPDATE_Q_DEPTH = `TAGE_UPDATE_Q_DEPTH;
 localparam TAGE_UPDATE_Q_PTR_W =
     (TAGE_UPDATE_Q_DEPTH <= 1) ? 1 : $clog2(TAGE_UPDATE_Q_DEPTH);
 localparam TAGE_UPDATE_Q_CNT_W = $clog2(TAGE_UPDATE_Q_DEPTH + 1);
 localparam [TAGE_UPDATE_Q_CNT_W-1:0] TAGE_UPDATE_Q_DEPTH_C = TAGE_UPDATE_Q_DEPTH;
 
-// ---------------- GHR ----------------
-reg [`GHR_LEN-1:0] ghr;
+// ---------------- 推测 / 提交 GHR ----------------
+reg [`GHR_LEN-1:0] spec_ghr;
+reg [`GHR_LEN-1:0] commit_ghr;
+(* ram_style = "distributed" *) reg [`GHR_LEN-1:0]
+    hist_checkpoint [0:`FTQ_SIZE-1];
+
+function [`GHR_LEN-1:0] hist_shift;
+    input [`GHR_LEN-1:0] h;
+    input taken;
+    begin
+        hist_shift = (h << 1) | {{(`GHR_LEN-1){1'b0}}, taken};
+    end
+endfunction
+
+// P1 结算当前块与下一块查询同拍发生；将本拍预测结果前递到历史折叠网络。
+wire [`GHR_LEN-1:0] query_ghr =
+    hist_update_valid_i ? hist_shift(spec_ghr, hist_update_taken_i) : spec_ghr;
 
 // ---------------- 历史折叠函数 ----------------
 function [TIDXW-1:0] fold10;
@@ -89,10 +120,10 @@ endfunction
 
 // 索引/标签生成：查询用 query_pc + 当前 ghr；训练用入队快照的 ghr（_h 版本）
 function [TIDXW-1:0] tidx;
-    input [31:0] pc;
+    input [21:2] pc;
     input integer t;
     begin
-        tidx = fold10(ghr, (t == 0) ? `TAGE_HIST_LEN0 :
+        tidx = fold10(query_ghr, (t == 0) ? `TAGE_HIST_LEN0 :
                            (t == 1) ? `TAGE_HIST_LEN1 :
                            (t == 2) ? `TAGE_HIST_LEN2 : `TAGE_HIST_LEN3)
              ^ pc[2 +: TIDXW] ^ pc[12 +: TIDXW];
@@ -100,7 +131,7 @@ function [TIDXW-1:0] tidx;
 endfunction
 
 function [TIDXW-1:0] tidx_h;
-    input [31:0] pc;
+    input [21:2] pc;
     input integer t;
     input [`GHR_LEN-1:0] h;
     begin
@@ -112,10 +143,10 @@ function [TIDXW-1:0] tidx_h;
 endfunction
 
 function [`TAGE_TAG_W-1:0] ttag;
-    input [31:0] pc;
+    input [13:2] pc;
     input integer t;
     begin
-        ttag = fold12(ghr, (t == 0) ? `TAGE_HIST_LEN0 :
+        ttag = fold12(query_ghr, (t == 0) ? `TAGE_HIST_LEN0 :
                            (t == 1) ? `TAGE_HIST_LEN1 :
                            (t == 2) ? `TAGE_HIST_LEN2 : `TAGE_HIST_LEN3)
              ^ pc[2 +: `TAGE_TAG_W];
@@ -123,7 +154,7 @@ function [`TAGE_TAG_W-1:0] ttag;
 endfunction
 
 function [`TAGE_TAG_W-1:0] ttag_h;
-    input [31:0] pc;
+    input [13:2] pc;
     input integer t;
     input [`GHR_LEN-1:0] h;
     begin
@@ -136,10 +167,8 @@ endfunction
 
 // ---------------- 训练流水线寄存器（T0 读表 / T1 / T2 写回）----------------
 reg        t0_valid;
-reg        t0_ghr_valid;
-reg [31:0] t0_pc;
+reg [21:2] t0_pc;
 reg        t0_taken, t0_mispred;
-reg        t0_ghr_taken;
 reg [`GHR_LEN-1:0] t0_ghr;
 reg [`BPU_META_W-1:0] t0_meta;
 reg        t1_valid;
@@ -148,16 +177,14 @@ reg [`BPU_META_W-1:0] t1_meta;
 reg [TIDXW-1:0]      t1_alloc_idx [0:3];
 reg [`TAGE_TAG_W-1:0] t1_alloc_tag [0:3];
 reg [TENTRY_W-1:0]   t1_rd_entry [0:3];
-reg [BASE_IDXW-1:0]  t1_base_idx;
 reg        t2_valid;
 reg        t2_taken, t2_mispred;
 reg [`BPU_META_W-1:0] t2_meta;
 reg [TIDXW-1:0]      t2_alloc_idx [0:3];
 reg [`TAGE_TAG_W-1:0] t2_alloc_tag [0:3];
 reg [TENTRY_W-1:0]   t2_rd_entry [0:3];
-reg [BASE_IDXW-1:0]  t2_base_idx;
 
-reg [31:0]               uq_pc      [0:TAGE_UPDATE_Q_DEPTH-1];
+reg [21:2]               uq_pc      [0:TAGE_UPDATE_Q_DEPTH-1];
 reg                      uq_taken   [0:TAGE_UPDATE_Q_DEPTH-1];
 reg                      uq_mispred [0:TAGE_UPDATE_Q_DEPTH-1];
 reg [`BPU_META_W-1:0]    uq_meta    [0:TAGE_UPDATE_Q_DEPTH-1];
@@ -178,7 +205,7 @@ wire [TAGE_UPDATE_Q_CNT_W-1:0] uq_count_next =
                                                     uq_count;
 wire [63:0] uq_count_next_64 = {{(64-TAGE_UPDATE_Q_CNT_W){1'b0}}, uq_count_next};
 
-wire [31:0]            uq_head_pc      = uq_pc[uq_rptr];
+wire [21:2]            uq_head_pc      = uq_pc[uq_rptr];
 wire                   uq_head_taken   = uq_taken[uq_rptr];
 wire                   uq_head_mispred = uq_mispred[uq_rptr];
 wire [`BPU_META_W-1:0] uq_head_meta    = uq_meta[uq_rptr];
@@ -187,6 +214,7 @@ wire                   uq_head_meta_valid = uq_head_meta[META_TAGE_VALID_BIT];
 wire                   uq_head_pvalid  = uq_head_meta[META_PROVIDER_VALID_BIT];
 wire [1:0]             uq_head_pid     = uq_head_meta[META_PROVIDER_ID_LSB +: 2];
 wire [TIDXW-1:0]       uq_head_pidx    = uq_head_meta[META_PROVIDER_IDX_LSB +: TIDXW];
+wire [`FTQ_W-1:0]      train_ftq_id    = train_meta_i[META_FTQ_ID_LSB +: `FTQ_W];
 
 `ifdef SYNTHESIS
 // synthesis translate_off
@@ -202,7 +230,6 @@ end
 // ---------------- 基础表（bimodal，2R+1W）----------------
 wire [BASE_IDXW-1:0] q_base_idx = query_pc_i[2 +: BASE_IDXW];
 wire [1:0] base_q_rdata;
-wire [1:0] base_train_rdata;
 reg        base_we;
 reg [BASE_IDXW-1:0] base_waddr;
 reg [1:0]  base_wdata;
@@ -210,7 +237,6 @@ reg [1:0]  base_wdata;
 tage_base_ram u_base(
     .clk(clk),
     .q_raddr(q_base_idx), .q_rdata(base_q_rdata),
-    .t_raddr(uq_head_pc[2 +: BASE_IDXW]), .t_rdata(base_train_rdata),
     .we(base_we), .waddr(base_waddr), .wdata(base_wdata)
 );
 
@@ -223,12 +249,6 @@ reg  [3:0] t_we;
 reg  [TIDXW-1:0] t_waddr [0:3];
 reg  [TENTRY_W-1:0] t_wdata [0:3];
 
-wire                  t0_meta_valid = t0_meta[META_TAGE_VALID_BIT];
-wire                  t0_pvalid     = t0_meta[META_PROVIDER_VALID_BIT];
-wire [1:0]            t0_pid        = t0_meta[META_PROVIDER_ID_LSB +: 2];
-wire [TIDXW-1:0]      t0_pidx       = t0_meta[META_PROVIDER_IDX_LSB +: TIDXW];
-wire [`TAGE_TAG_W-1:0] t0_ptag      = t0_meta[META_PROVIDER_TAG_LSB +: META_PROVIDER_TAG_W];
-
 genvar g;
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_ttab
@@ -236,7 +256,7 @@ for (g = 0; g < 4; g = g + 1) begin : gen_ttab
     wire provider_read_sel = uq_head_meta_valid && uq_head_pvalid && (uq_head_pid == TABLE_ID);
     wire [TIDXW-1:0] train_raddr = provider_read_sel ? uq_head_pidx : tidx_h(uq_head_pc, g, uq_head_ghr);
     assign q_idx[g] = tidx(query_pc_i, g);
-    assign q_tag[g] = ttag(query_pc_i, g);
+    assign q_tag[g] = ttag(query_pc_i[13:2], g);
     tage_tag_ram u_ttab(
         .clk(clk),
         .q_raddr(q_idx[g]),
@@ -300,8 +320,6 @@ wire [`BPU_META_W-1:0] meta_provider_tag =
 assign meta_o = q_valid_r ? (meta_raw | meta_provider_tag) : {`BPU_META_W{1'b0}};
 
 // meta 解包（训练 T2 拍使用）
-wire                  train_meta_valid = train_meta_i[META_TAGE_VALID_BIT];
-wire [3:0]            m_hits     = t2_meta[META_HITS_LSB +: 4];
 wire [BASE_IDXW-1:0]  m_base_idx = t2_meta[META_BASE_IDX_LSB +: BASE_IDXW];
 wire [1:0]            m_base_ctr = t2_meta[META_BASE_CTR_LSB +: 2];
 wire                  m_alt      = t2_meta[META_ALT_TAKEN_BIT];
@@ -335,9 +353,15 @@ endfunction
 wire [3:0] alloc_cand;
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_alloc
-    assign alloc_cand[g] = (!t2_rd_entry[g][TENTRY_W-1]
-                         || (t2_rd_entry[g][1:0] == 2'b00))
-                        && (!m_pvalid || (g[1:0] > m_pid));
+    if (g == 0) begin : gen_first
+        assign alloc_cand[g] = (!t2_rd_entry[g][TENTRY_W-1]
+                             || (t2_rd_entry[g][1:0] == 2'b00))
+                            && !m_pvalid;
+    end else begin : gen_longer
+        assign alloc_cand[g] = (!t2_rd_entry[g][TENTRY_W-1]
+                             || (t2_rd_entry[g][1:0] == 2'b00))
+                            && (!m_pvalid || (m_pid < g[1:0]));
+    end
 end
 endgenerate
 wire alloc_any = |alloc_cand;
@@ -395,20 +419,34 @@ always @(*) begin
     end
 end
 
-reg [`TAGE_TAG_W-1:0] t1_rd_tag [0:3];  // lint 吸收用途
-
 integer pk;
 always @(posedge clk) begin
     if (reset) begin
         t0_valid     <= 1'b0;
-        t0_ghr_valid <= 1'b0;
         t1_valid     <= 1'b0;
         t2_valid     <= 1'b0;
-        ghr          <= {`GHR_LEN{1'b0}};
+        spec_ghr     <= {`GHR_LEN{1'b0}};
+        commit_ghr   <= {`GHR_LEN{1'b0}};
         uq_rptr      <= {TAGE_UPDATE_Q_PTR_W{1'b0}};
         uq_wptr      <= {TAGE_UPDATE_Q_PTR_W{1'b0}};
         uq_count     <= {TAGE_UPDATE_Q_CNT_W{1'b0}};
     end else begin
+        if (cmt_hist_valid_i)
+            commit_ghr <= hist_shift(commit_ghr, cmt_hist_taken_i);
+
+        if (flush_i) begin
+            spec_ghr <= cmt_hist_valid_i
+                      ? hist_shift(commit_ghr, cmt_hist_taken_i)
+                      : commit_ghr;
+        end else if (hist_restore_i) begin
+            spec_ghr <= hist_restore_append_i
+                      ? hist_shift(hist_checkpoint[hist_restore_id_i],
+                                   hist_restore_taken_i)
+                      : hist_checkpoint[hist_restore_id_i];
+        end else if (hist_update_valid_i) begin
+            spec_ghr <= hist_shift(spec_ghr, hist_update_taken_i);
+        end
+
         // T0：出队项进读表级（用入队快照 GHR 重算读地址，已在组合段完成，
         //     此处仅锁存出队 bundle；meta 无效项直接旁落不进流水）
         if (tage_update_enqueue) begin
@@ -416,7 +454,7 @@ always @(posedge clk) begin
             uq_taken[uq_wptr]   <= train_taken_i;
             uq_mispred[uq_wptr] <= train_mispred_i;
             uq_meta[uq_wptr]    <= train_meta_i;
-            uq_ghr[uq_wptr]     <= ghr;
+            uq_ghr[uq_wptr]     <= hist_checkpoint[train_ftq_id];
             uq_wptr             <= uq_wptr + {{(TAGE_UPDATE_Q_PTR_W-1){1'b0}},1'b1};
         end
         if (tage_update_dequeue)
@@ -424,8 +462,6 @@ always @(posedge clk) begin
         uq_count <= uq_count_next;
 
         t0_valid     <= train_read_grant && uq_head_meta_valid;
-        t0_ghr_valid <= train_valid_i;
-        t0_ghr_taken <= train_taken_i;
         if (train_read_grant) begin
             t0_pc      <= uq_head_pc;
             t0_taken   <= uq_head_taken;
@@ -439,12 +475,10 @@ always @(posedge clk) begin
             t1_taken   <= t0_taken;
             t1_mispred <= t0_mispred;
             t1_meta    <= t0_meta;
-            t1_base_idx <= t0_pc[2 +: BASE_IDXW];
             for (pk = 0; pk < 4; pk = pk + 1) begin
                 t1_alloc_idx[pk]  <= tidx_h(t0_pc, pk, t0_ghr);
-                t1_alloc_tag[pk]  <= ttag_h(t0_pc, pk, t0_ghr);
+                t1_alloc_tag[pk]  <= ttag_h(t0_pc[13:2], pk, t0_ghr);
                 t1_rd_entry[pk]   <= t_train_rdata[pk];
-                t1_rd_tag[pk]     <= t_train_rdata[pk][TENTRY_W-2 -: `TAGE_TAG_W];
             end
         end
         t2_valid <= t1_valid;
@@ -452,172 +486,43 @@ always @(posedge clk) begin
             t2_taken    <= t1_taken;
             t2_mispred  <= t1_mispred;
             t2_meta     <= t1_meta;
-            t2_base_idx <= t1_base_idx;
             for (pk = 0; pk < 4; pk = pk + 1) begin
                 t2_alloc_idx[pk] <= t1_alloc_idx[pk];
                 t2_alloc_tag[pk] <= t1_alloc_tag[pk];
                 t2_rd_entry[pk]  <= t1_rd_entry[pk];
             end
         end
-        if (train_valid_i)
-            ghr <= {ghr[`GHR_LEN-2:0], train_taken_i};
     end
 end
 
-// lint 吸收
-wire tage_lint = (|m_hits) | t0_mispred | (|t0_ptag) | (|base_train_rdata)
-               | t0_meta_valid | t0_pvalid | (|t0_pid) | (|t0_pidx)
-               | train_meta_valid;
+// 在 P1 更新前保存历史；非阻塞赋值保证同拍保存和移位读取旧的 spec_ghr。
+always @(posedge clk) begin
+    if (!reset && hist_checkpoint_save_i && !hist_restore_i && !flush_i)
+        hist_checkpoint[hist_checkpoint_id_i] <= spec_ghr;
+end
 
 `ifdef SYNTHESIS
 // synthesis translate_off
-reg tage_useful_clear_fire;
-integer stat_tk;
-always @(*) begin
-    tage_useful_clear_fire = 1'b0;
-    if (t2_valid && t2_mispred && !alloc_any) begin
-        for (stat_tk = 0; stat_tk < 4; stat_tk = stat_tk + 1) begin
-            if ((!m_pvalid || (stat_tk[1:0] > m_pid)) &&
-                (t2_rd_entry[stat_tk][1:0] != 2'b00)) begin
-                tage_useful_clear_fire = 1'b1;
-            end
-        end
-    end
-end
-
-wire stat_provider_update_fire =
-    t2_valid && m_pvalid && t_we[m_pid];
-wire stat_allocation_fire =
-    t2_valid && t2_mispred && alloc_any && !(m_pvalid && (alloc_sel == m_pid)) && t_we[alloc_sel];
-wire tage_update_complete = t2_valid || (train_read_grant && !uq_head_meta_valid);
 wire [1:0] tage_update_pipeline_pending_w = {1'b0, t0_valid}
                                           + {1'b0, t1_valid}
                                           + {1'b0, t2_valid};
 
-reg [63:0] tage_query_total;
-reg [63:0] tage_query_suppressed_by_train;
-reg [63:0] tage_response_total;
-reg [63:0] tage_train_total;                 // training request count
-reg [63:0] tage_mispred_train_total;
-reg [63:0] tage_train_request_count;
-reg [63:0] tage_train_meta_valid_count;
-reg [63:0] tage_train_meta_invalid_count;
-reg [63:0] tage_train_accepted_count;
-reg [63:0] tage_base_update_count;
-reg [63:0] tage_provider_update_count;
-reg [63:0] tage_allocation_count;
-reg [63:0] tage_useful_clear_count;
-reg [63:0] tage_provider_tag_check_count;
-reg [63:0] tage_provider_tag_match_count;
-reg [63:0] tage_provider_tag_mismatch_count;
-reg [63:0] tage_update_request_count;
-reg [63:0] tage_update_enqueue_count;
-reg [63:0] tage_update_dequeue_count;
-reg [63:0] tage_update_complete_count;
 reg [63:0] tage_update_overflow_count;
-reg [63:0] tage_update_queue_pending_count;
 reg [63:0] tage_update_queue_max_occupancy;
-reg [63:0] tage_update_pipeline_pending_count;
 reg [63:0] tage_update_pipeline_max_pending_count;
-reg [63:0] tage_query_while_update_arrives_count;
-reg [63:0] tage_train_read_grant_count;
-reg [63:0] tage_train_wait_cycle_count;
-reg [63:0] tage_train_max_wait_cycle_count;
-reg [63:0] tage_train_wait_current_count;
 
 always @(posedge clk) begin
     if (reset) begin
-        tage_query_total               <= 64'd0;
-        tage_query_suppressed_by_train <= 64'd0;
-        tage_response_total            <= 64'd0;
-        tage_train_total               <= 64'd0;
-        tage_mispred_train_total       <= 64'd0;
-        tage_train_request_count       <= 64'd0;
-        tage_train_meta_valid_count    <= 64'd0;
-        tage_train_meta_invalid_count  <= 64'd0;
-        tage_train_accepted_count      <= 64'd0;
-        tage_base_update_count         <= 64'd0;
-        tage_provider_update_count     <= 64'd0;
-        tage_allocation_count          <= 64'd0;
-        tage_useful_clear_count        <= 64'd0;
-        tage_provider_tag_check_count  <= 64'd0;
-        tage_provider_tag_match_count  <= 64'd0;
-        tage_provider_tag_mismatch_count <= 64'd0;
-        tage_update_request_count      <= 64'd0;
-        tage_update_enqueue_count      <= 64'd0;
-        tage_update_dequeue_count      <= 64'd0;
-        tage_update_complete_count     <= 64'd0;
         tage_update_overflow_count     <= 64'd0;
-        tage_update_queue_pending_count <= 64'd0;
         tage_update_queue_max_occupancy <= 64'd0;
-        tage_update_pipeline_pending_count <= 64'd0;
         tage_update_pipeline_max_pending_count <= 64'd0;
-        tage_query_while_update_arrives_count <= 64'd0;
-        tage_train_read_grant_count <= 64'd0;
-        tage_train_wait_cycle_count <= 64'd0;
-        tage_train_max_wait_cycle_count <= 64'd0;
-        tage_train_wait_current_count <= 64'd0;
     end else begin
-        if (query_valid_i)
-            tage_query_total <= tage_query_total + 64'd1;
-        if (q_valid_r)
-            tage_response_total <= tage_response_total + 64'd1;
-        if (train_valid_i) begin
-            tage_train_total <= tage_train_total + 64'd1;
-            tage_train_request_count <= tage_train_request_count + 64'd1;
-            tage_update_request_count <= tage_update_request_count + 64'd1;
-            if (train_meta_i[META_TAGE_VALID_BIT])
-                tage_train_meta_valid_count <= tage_train_meta_valid_count + 64'd1;
-            else
-                tage_train_meta_invalid_count <= tage_train_meta_invalid_count + 64'd1;
-        end
-        if (query_valid_i && train_valid_i)
-            tage_query_while_update_arrives_count <= tage_query_while_update_arrives_count + 64'd1;
-        if (tage_update_enqueue)
-            tage_update_enqueue_count <= tage_update_enqueue_count + 64'd1;
-        if (tage_update_dequeue)
-            tage_update_dequeue_count <= tage_update_dequeue_count + 64'd1;
-        if (tage_update_complete)
-            tage_update_complete_count <= tage_update_complete_count + 64'd1;
-        if (tage_update_overflow) begin
+        if (tage_update_overflow)
             tage_update_overflow_count <= tage_update_overflow_count + 64'd1;
-            // 与 FTB 一致：仿真只累计，不 $error/$stop（队列满时丢新训练）
-        end
         if (uq_count_next_64 > tage_update_queue_max_occupancy)
             tage_update_queue_max_occupancy <= uq_count_next_64;
-        tage_update_queue_pending_count <= uq_count_next_64;
-        tage_update_pipeline_pending_count <= {62'd0, tage_update_pipeline_pending_w};
         if ({62'd0, tage_update_pipeline_pending_w} > tage_update_pipeline_max_pending_count)
             tage_update_pipeline_max_pending_count <= {62'd0, tage_update_pipeline_pending_w};
-        if (train_read_grant)
-            tage_train_read_grant_count <= tage_train_read_grant_count + 64'd1;
-        if (!tage_update_queue_empty && !train_read_grant) begin
-            tage_train_wait_cycle_count <= tage_train_wait_cycle_count + 64'd1;
-            tage_train_wait_current_count <= tage_train_wait_current_count + 64'd1;
-            if ((tage_train_wait_current_count + 64'd1) > tage_train_max_wait_cycle_count)
-                tage_train_max_wait_cycle_count <= tage_train_wait_current_count + 64'd1;
-        end else if (train_read_grant || tage_update_queue_empty) begin
-            tage_train_wait_current_count <= 64'd0;
-        end
-        if (train_valid_i && train_mispred_i)
-            tage_mispred_train_total <= tage_mispred_train_total + 64'd1;
-        if (t0_valid)
-            tage_train_accepted_count <= tage_train_accepted_count + 64'd1;
-        if (base_we)
-            tage_base_update_count <= tage_base_update_count + 64'd1;
-        if (stat_provider_update_fire)
-            tage_provider_update_count <= tage_provider_update_count + 64'd1;
-        if (stat_allocation_fire)
-            tage_allocation_count <= tage_allocation_count + 64'd1;
-        if (tage_useful_clear_fire)
-            tage_useful_clear_count <= tage_useful_clear_count + 64'd1;
-        if (t2_valid && m_pvalid) begin
-            tage_provider_tag_check_count <= tage_provider_tag_check_count + 64'd1;
-            if (provider_tag_match)
-                tage_provider_tag_match_count <= tage_provider_tag_match_count + 64'd1;
-            else
-                tage_provider_tag_mismatch_count <= tage_provider_tag_mismatch_count + 64'd1;
-        end
     end
 end
 // synthesis translate_on
@@ -632,23 +537,30 @@ endmodule
 module tage_base_ram(
     input  wire        clk,
     input  wire [12:0] q_raddr,
-    output reg  [1:0]  q_rdata,
-    input  wire [12:0] t_raddr,
-    output reg  [1:0]  t_rdata,
+    output wire [1:0]  q_rdata,
     input  wire        we,
     input  wire [12:0] waddr,
     input  wire [1:0]  wdata
 );
-reg [1:0] mem [0:`TAGE_BASE_DEPTH-1];
+// 两份保持一致的 BRAM 副本实现双读口，写入同时广播到两份副本。
+(* ram_style = "block" *) reg [1:0] q_mem [0:`TAGE_BASE_DEPTH-1];
+reg [1:0] q_rdata_ram;
+reg [1:0] q_bypass_data;
+reg       q_bypass_valid;
 integer i;
 initial begin
-    for (i = 0; i < `TAGE_BASE_DEPTH; i = i + 1) mem[i] = 2'b01;  // 弱不跳初值
+    for (i = 0; i < `TAGE_BASE_DEPTH; i = i + 1) begin
+        q_mem[i] = 2'b01;
+    end
 end
 always @(posedge clk) begin
-    q_rdata <= (we && (waddr == q_raddr)) ? wdata : mem[q_raddr];
-    t_rdata <= (we && (waddr == t_raddr)) ? wdata : mem[t_raddr];
-    if (we) mem[waddr] <= wdata;
+    q_rdata_ram <= q_mem[q_raddr];
+    q_bypass_valid <= we && (waddr == q_raddr);
+    q_bypass_data <= wdata;
+    if (we)
+        q_mem[waddr] <= wdata;
 end
+assign q_rdata = q_bypass_valid ? q_bypass_data : q_rdata_ram;
 endmodule
 
 module tage_tag_ram #(
@@ -656,22 +568,37 @@ module tage_tag_ram #(
 )(
     input  wire        clk,
     input  wire [9:0] q_raddr,
-    output reg  [ENTRY_W-1:0] q_rdata,
+    output wire [ENTRY_W-1:0] q_rdata,
     input  wire [9:0] t_raddr,
-    output reg  [ENTRY_W-1:0] t_rdata,
+    output wire [ENTRY_W-1:0] t_rdata,
     input  wire        we,
     input  wire [9:0]  waddr,
     input  wire [ENTRY_W-1:0] wdata
 );
-reg [ENTRY_W-1:0] mem [0:`TAGE_TAG_DEPTH-1];
+(* ram_style = "block" *) reg [ENTRY_W-1:0] q_mem [0:`TAGE_TAG_DEPTH-1];
+(* ram_style = "block" *) reg [ENTRY_W-1:0] t_mem [0:`TAGE_TAG_DEPTH-1];
+reg [ENTRY_W-1:0] q_rdata_ram, t_rdata_ram;
+reg [ENTRY_W-1:0] q_bypass_data, t_bypass_data;
+reg               q_bypass_valid, t_bypass_valid;
 integer i;
 initial begin
-    for (i = 0; i < `TAGE_TAG_DEPTH; i = i + 1) mem[i] = {ENTRY_W{1'b0}};
+    for (i = 0; i < `TAGE_TAG_DEPTH; i = i + 1) begin
+        q_mem[i] = {ENTRY_W{1'b0}};
+        t_mem[i] = {ENTRY_W{1'b0}};
+    end
 end
 always @(posedge clk) begin
-    q_rdata <= (we && (waddr == q_raddr)) ? wdata : mem[q_raddr];
-    t_rdata <= (we && (waddr == t_raddr)) ? wdata : mem[t_raddr];
-    if (we) mem[waddr] <= wdata;
+    q_rdata_ram <= q_mem[q_raddr];
+    t_rdata_ram <= t_mem[t_raddr];
+    q_bypass_valid <= we && (waddr == q_raddr);
+    t_bypass_valid <= we && (waddr == t_raddr);
+    q_bypass_data <= wdata;
+    t_bypass_data <= wdata;
+    if (we) begin
+        q_mem[waddr] <= wdata;
+        t_mem[waddr] <= wdata;
+    end
 end
+assign q_rdata = q_bypass_valid ? q_bypass_data : q_rdata_ram;
+assign t_rdata = t_bypass_valid ? t_bypass_data : t_rdata_ram;
 endmodule
-

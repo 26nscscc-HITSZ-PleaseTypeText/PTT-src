@@ -20,11 +20,10 @@ myCPU/
 ├── backend/   ——后端（2 宽乱序）
 │   ├── decode/
 │   │   ├── decoder.v                单条译码器（顶层例化 ×2）
-│   │   ├── inst_dec.v                 内含：指令识别独热
+│   │   ├── inst_dec.v                 内含：按字段比较生成指令识别标志
 │   │   ├── op_dec.v                   内含：操作码生成
 │   │   ├── imm_generator.v            内含：立即数/分支偏移
-│   │   ├── get_reg_read_addr.v        内含：源寄存器地址
-│   │   └── decode_tools.v             内含：通用 one-hot 译码器
+│   │   └── get_reg_read_addr.v        内含：源寄存器地址
 │   ├── rename/
 │   │   ├── rename.v                  重命名级（ROB 编号=标签，恒成对分配）
 │   │   └── rat.v                     寄存器别名表 32×{busy,robid}

@@ -4,8 +4,7 @@
 // 功能：
 // - 缓存等待操作数的 ALU/分支指令；监听 4 路写回唤醒总线捕获操作数；
 //   每拍从"两个操作数都就绪"的项中选出"最老的"一条发射给 fu_alu。
-// - 乱序发射是本架构 IPC 的最大来源（mariver 实证 +17%）：
-//   后进入的指令只要操作数先就绪就可以先执行。
+// - 后进入的指令只要操作数先就绪即可先执行，提高执行端利用率。
 // - "唤醒"与"数据"分离的概念（重要！）：
 //   * 唤醒（wakeup）：得知"某 robid 的结果即将/已经可用"，置 ready 位；
 //   * 数据捕获（capture）：从写回总线上把 32bit 数据真正存进本项。
@@ -35,7 +34,7 @@ module rs_alu(
     input  wire                       push_valid_i,
     input  wire [`ROB_W-1:0]          push_robid_i,
     input  wire [31:0]                push_pc_i,
-    input  wire [`ALU_OP_NUM-1:0]     push_alu_op_i,
+    input  wire [14:0]                push_alu_op_i,
     input  wire [`BR_OP_NUM-1:0]      push_br_op_i,
     input  wire                       push_src0_ready_i,
     input  wire [31:0]                push_src0_val_i,
@@ -69,14 +68,14 @@ module rs_alu(
     input  wire [`ROB_W-1:0]          early0_robid_i,
     input  wire                       early1_valid_i,    // fu_alu1 发射拍唤醒
     input  wire [`ROB_W-1:0]          early1_robid_i,
-    input  wire                       early2_valid_i,    // lsu DC 命中限定唤醒（V3.4）
+    input  wire                       early2_valid_i,    // LSU DC 命中限定唤醒
     input  wire [`ROB_W-1:0]          early2_robid_i,
 
     // ---------------- 发射口（到 fu_alu，组合）----------------
     output wire                       issue_valid_o,
     output wire [`ROB_W-1:0]          issue_robid_o,
     output wire [31:0]                issue_pc_o,
-    output wire [`ALU_OP_NUM-1:0]     issue_alu_op_o,
+    output wire [14:0]                issue_alu_op_o,
     output wire [`BR_OP_NUM-1:0]      issue_br_op_o,
     output wire [31:0]                issue_src0_o,      // 已捕获的最终操作数值
     output wire [31:0]                issue_src1_o,
@@ -85,11 +84,10 @@ module rs_alu(
     output wire [31:0]                issue_br_offs_o
 );
 
-// 设计说明（已实现，参考 mariver station.v 的 ALU 保留站部分：
-//      prior 时间戳选择 388~398 行、唤醒 659~666 行、旁路 479~533 行）
+// 设计说明：保留站按 prior 年龄选择，监听写回与提前唤醒总线，并在发射口旁路数据。
 //
 // 存储结构（每项，全 reg）：
-//      valid, robid[`ROB_W], pc[32], alu_op[`ALU_OP_NUM], br_op[`BR_OP_NUM],
+//      valid、robid、pc、紧凑 alu_op、br_op、两个源和立即数字段。
 //      s0_ready/s0_val_valid, s0_val[32], s0_robid[`ROB_W]（s1 同理），
 //      imm[32], use_imm, br_offs[32],
 //      prior[1:0]   // 年龄时间戳：新入站项=3，有项发射后其余项-1（数值小=老）
@@ -102,7 +100,7 @@ module rs_alu(
 //      wb 命中：置 sX_ready 并捕获数据；early 命中：只置 ready（val_valid=0），
 //      数据在下拍 WB 旁路补齐。
 //      同拍入站+唤醒：push 数据进来的同拍总线上恰有它等的 robid ——
-//      入站数据要先过一遍同样的旁路比较再写入（mariver 的 bypassin 逻辑），
+//      入站数据要先经过同样的旁路比较再写入，
 //      否则错过唤醒永远等不到（经典死锁坑！）。
 //
 // 发射选择（组合，oldest-first）：
@@ -113,7 +111,7 @@ module rs_alu(
 reg                     valid [0:`RS_ALU_SIZE-1];
 reg [`ROB_W-1:0]        robid [0:`RS_ALU_SIZE-1];
 reg [31:0]              pc [0:`RS_ALU_SIZE-1];
-reg [`ALU_OP_NUM-1:0]   alu_op [0:`RS_ALU_SIZE-1];
+reg [14:0]              alu_op [0:`RS_ALU_SIZE-1];
 reg [`BR_OP_NUM-1:0]    br_op [0:`RS_ALU_SIZE-1];
 reg                     s0_ready [0:`RS_ALU_SIZE-1];
 reg                     s0_val_valid [0:`RS_ALU_SIZE-1];
@@ -214,8 +212,8 @@ always @(*) begin
 end
 assign occupancy_o = occ_cnt;
 assign can_accept_o = (occupancy_o != `RS_ALU_SIZE);
-wire [`RS_ALU_OCC_W-1:0] push_prior_next = occupancy_o
-                                         - {{(`RS_ALU_OCC_W-1){1'b0}}, issue_sel_valid};
+wire [`RS_ALU_IDX_W-1:0] push_prior_next =
+    occupancy_o[`RS_ALU_IDX_W-1:0] - {{(`RS_ALU_IDX_W-1){1'b0}}, issue_sel_valid};
 
 always @(*) begin : find_free
     integer fi;
@@ -312,7 +310,7 @@ always @(posedge clk) begin
             imm[free_idx] <= push_imm_i;
             use_imm[free_idx] <= push_use_imm_i;
             br_offs[free_idx] <= push_br_offs_i;
-            prior[free_idx] <= push_prior_next[`RS_ALU_IDX_W-1:0];
+            prior[free_idx] <= push_prior_next;
         end
     end
 end

@@ -40,6 +40,7 @@ module dispatch(
     input  wire [`WB_SRC_NUM-1:0]     dis0_wb_src_op_i,
     input  wire [13:0]                dis0_csr_num_i,
     input  wire                       dis0_is_cacop_i,
+    input  wire [4:3]                 dis0_cacop_op_i,
     input  wire                       dis0_src0_ready_i,
     input  wire [31:0]                dis0_src0_val_i,
     input  wire [`ROB_W-1:0]          dis0_src0_robid_i,
@@ -63,6 +64,7 @@ module dispatch(
     input  wire [`WB_SRC_NUM-1:0]     dis1_wb_src_op_i,
     input  wire [13:0]                dis1_csr_num_i,
     input  wire                       dis1_is_cacop_i,
+    input  wire [4:3]                 dis1_cacop_op_i,
     input  wire                       dis1_src0_ready_i,
     input  wire [31:0]                dis1_src0_val_i,
     input  wire [`ROB_W-1:0]          dis1_src0_robid_i,
@@ -110,7 +112,7 @@ module dispatch(
     output wire                       rs_alu0_push_valid_o,
     output wire [`ROB_W-1:0]          rs_alu0_push_robid_o,
     output wire [31:0]                rs_alu0_push_pc_o,
-    output wire [`ALU_OP_NUM-1:0]     rs_alu0_push_alu_op_o,
+    output wire [14:0]                rs_alu0_push_alu_op_o, // {PCADD,ORN,ANDN,LUI..ADD}
     output wire [`BR_OP_NUM-1:0]      rs_alu0_push_br_op_o,
     output wire                       rs_alu0_push_src0_ready_o,
     output wire [31:0]                rs_alu0_push_src0_val_o,
@@ -128,7 +130,7 @@ module dispatch(
     output wire                       rs_alu1_push_valid_o,
     output wire [`ROB_W-1:0]          rs_alu1_push_robid_o,
     output wire [31:0]                rs_alu1_push_pc_o,
-    output wire [`ALU_OP_NUM-1:0]     rs_alu1_push_alu_op_o,
+    output wire [14:0]                rs_alu1_push_alu_op_o,
     output wire [`BR_OP_NUM-1:0]      rs_alu1_push_br_op_o,
     output wire                       rs_alu1_push_src0_ready_o,
     output wire [31:0]                rs_alu1_push_src0_val_o,
@@ -144,9 +146,9 @@ module dispatch(
     input  wire                       rs_mem_can_accept_i,
     output wire                       rs_mem_push_valid_o,
     output wire [`ROB_W-1:0]          rs_mem_push_robid_o,
-    output wire [31:0]                rs_mem_push_pc_o,
     output wire [`MEM_OP_NUM-1:0]     rs_mem_push_mem_op_o,
     output wire                       rs_mem_push_is_cacop_o,
+    output wire [4:3]                 rs_mem_push_cacop_op_o,
     output wire                       rs_mem_push_src0_ready_o,
     output wire [31:0]                rs_mem_push_src0_val_o,
     output wire [`ROB_W-1:0]          rs_mem_push_src0_robid_o,
@@ -159,11 +161,11 @@ module dispatch(
     input  wire                       rs_mdu_can_accept_i,
     output wire                       rs_mdu_push_valid_o,
     output wire [`ROB_W-1:0]          rs_mdu_push_robid_o,
-    output wire [`ALU_OP_NUM-1:0]     rs_mdu_push_alu_op_o,    // 乘除位有效
+    output wire [18:12]               rs_mdu_push_alu_op_o,    // MUL..MOD_WU
     output wire [`CSR_OP_NUM-1:0]     rs_mdu_push_csr_op_o,
     output wire [13:0]                rs_mdu_push_csr_num_o,
     output wire [`TLB_OP_NUM-1:0]     rs_mdu_push_tlb_op_o,
-    output wire [`WB_SRC_NUM-1:0]     rs_mdu_push_wb_src_op_o,
+    output wire [`WB_SRC_NUM-1:0]     rs_mdu_push_wb_src_op_o, // {TID,CNTVH,CNTVL,ALU}
     output wire                       rs_mdu_push_src0_ready_o,
     output wire [31:0]                rs_mdu_push_src0_val_o,
     output wire [`ROB_W-1:0]          rs_mdu_push_src0_robid_o,
@@ -172,7 +174,7 @@ module dispatch(
     output wire [`ROB_W-1:0]          rs_mdu_push_src1_robid_o
 );
 
-// 设计说明（已实现；纯组合，参考 mariver dispatch.v 137~243 行）
+// 设计说明（纯组合）：
 //
 // 第一步——读 ROB 补操作数：
 //      rob_raddr0~3 直接接 4 个源的 robid；
@@ -221,8 +223,6 @@ wire [31:0] dis1_src0_val;
 wire [31:0] dis1_src1_val;
 
 wire two_alu;
-wire two_mem;
-wire two_mdu;
 wire single_alu_to_alu0;
 wire slot0_to_alu0;
 wire slot0_to_alu1;
@@ -267,9 +267,6 @@ assign dis1_src1_val = dis1_src1_ready_i ? dis1_src1_val_i :
                        !dis_rat_rbusy3_i ? dis_arf_rdata3_i :
                        rob_rrdy3_i ? rob_rdata3_i : 32'b0;
 
-assign dis0_ops_ready = dis0_src0_ready && dis0_src1_ready;
-assign dis1_ops_ready = dis1_src0_ready && dis1_src1_ready;
-
 assign dis0_is_alu = dis0_valid_i && dis0_futype_i[`FU_ALU];
 assign dis0_is_mem = dis0_valid_i && dis0_futype_i[`FU_MEM];
 assign dis0_is_mdu = dis0_valid_i && dis0_futype_i[`FU_MDU];
@@ -278,8 +275,6 @@ assign dis1_is_mem = dis1_valid_i && dis1_futype_i[`FU_MEM];
 assign dis1_is_mdu = dis1_valid_i && dis1_futype_i[`FU_MDU];
 
 assign two_alu = dis0_is_alu && dis1_is_alu;
-assign two_mem = dis0_is_mem && dis1_is_mem;
-assign two_mdu = dis0_is_mdu && dis1_is_mdu;
 
 // 双 ALU 且两站都有空：固定程序序 槽0→rs_alu0、槽1→rs_alu1（同拍各压一条）
 wire dual_alu_ok = two_alu && rs_alu0_can_accept_i && rs_alu1_can_accept_i;
@@ -335,7 +330,9 @@ wire rs_mdu_from_slot1  = slot1_to_mdu && dis1_fire_o;
 assign rs_alu0_push_valid_o = (slot0_to_alu0 && dis0_fire_o) || (slot1_to_alu0 && dis1_fire_o);
 assign rs_alu0_push_robid_o = rs_alu0_from_slot1 ? dis1_robid_i : dis0_robid_i;
 assign rs_alu0_push_pc_o = rs_alu0_from_slot1 ? dis1_pc_i : dis0_pc_i;
-assign rs_alu0_push_alu_op_o = rs_alu0_from_slot1 ? dis1_alu_op_i : dis0_alu_op_i;
+assign rs_alu0_push_alu_op_o = rs_alu0_from_slot1
+                             ? {dis1_alu_op_i[21:19], dis1_alu_op_i[11:0]}
+                             : {dis0_alu_op_i[21:19], dis0_alu_op_i[11:0]};
 assign rs_alu0_push_br_op_o = rs_alu0_from_slot1 ? dis1_br_op_i : dis0_br_op_i;
 assign rs_alu0_push_src0_ready_o = rs_alu0_from_slot1 ? dis1_src0_ready : dis0_src0_ready;
 assign rs_alu0_push_src0_val_o = rs_alu0_from_slot1 ? dis1_src0_val : dis0_src0_val;
@@ -350,7 +347,9 @@ assign rs_alu0_push_br_offs_o = rs_alu0_from_slot1 ? dis1_br_offs_i : dis0_br_of
 assign rs_alu1_push_valid_o = (slot0_to_alu1 && dis0_fire_o) || (slot1_to_alu1 && dis1_fire_o);
 assign rs_alu1_push_robid_o = rs_alu1_from_slot1 ? dis1_robid_i : dis0_robid_i;
 assign rs_alu1_push_pc_o = rs_alu1_from_slot1 ? dis1_pc_i : dis0_pc_i;
-assign rs_alu1_push_alu_op_o = rs_alu1_from_slot1 ? dis1_alu_op_i : dis0_alu_op_i;
+assign rs_alu1_push_alu_op_o = rs_alu1_from_slot1
+                             ? {dis1_alu_op_i[21:19], dis1_alu_op_i[11:0]}
+                             : {dis0_alu_op_i[21:19], dis0_alu_op_i[11:0]};
 assign rs_alu1_push_br_op_o = rs_alu1_from_slot1 ? dis1_br_op_i : dis0_br_op_i;
 assign rs_alu1_push_src0_ready_o = rs_alu1_from_slot1 ? dis1_src0_ready : dis0_src0_ready;
 assign rs_alu1_push_src0_val_o = rs_alu1_from_slot1 ? dis1_src0_val : dis0_src0_val;
@@ -364,9 +363,9 @@ assign rs_alu1_push_br_offs_o = rs_alu1_from_slot1 ? dis1_br_offs_i : dis0_br_of
 
 assign rs_mem_push_valid_o = (slot0_to_mem && dis0_fire_o) || (slot1_to_mem && dis1_fire_o);
 assign rs_mem_push_robid_o = rs_mem_from_slot1 ? dis1_robid_i : dis0_robid_i;
-assign rs_mem_push_pc_o = rs_mem_from_slot1 ? dis1_pc_i : dis0_pc_i;
 assign rs_mem_push_mem_op_o = rs_mem_from_slot1 ? dis1_mem_op_i : dis0_mem_op_i;
 assign rs_mem_push_is_cacop_o = rs_mem_from_slot1 ? dis1_is_cacop_i : dis0_is_cacop_i;
+assign rs_mem_push_cacop_op_o = rs_mem_from_slot1 ? dis1_cacop_op_i : dis0_cacop_op_i;
 assign rs_mem_push_src0_ready_o = rs_mem_from_slot1 ? dis1_src0_ready : dis0_src0_ready;
 assign rs_mem_push_src0_val_o = rs_mem_from_slot1 ? dis1_src0_val : dis0_src0_val;
 assign rs_mem_push_src0_robid_o = rs_mem_from_slot1 ? dis1_src0_robid_i : dis0_src0_robid_i;
@@ -377,7 +376,7 @@ assign rs_mem_push_imm_o = rs_mem_from_slot1 ? dis1_imm_i : dis0_imm_i;
 
 assign rs_mdu_push_valid_o = (slot0_to_mdu && dis0_fire_o) || (slot1_to_mdu && dis1_fire_o);
 assign rs_mdu_push_robid_o = rs_mdu_from_slot1 ? dis1_robid_i : dis0_robid_i;
-assign rs_mdu_push_alu_op_o = rs_mdu_from_slot1 ? dis1_alu_op_i : dis0_alu_op_i;
+assign rs_mdu_push_alu_op_o = rs_mdu_from_slot1 ? dis1_alu_op_i[18:12] : dis0_alu_op_i[18:12];
 assign rs_mdu_push_csr_op_o = rs_mdu_from_slot1 ? dis1_csr_op_i : dis0_csr_op_i;
 assign rs_mdu_push_csr_num_o = rs_mdu_from_slot1 ? dis1_csr_num_i : dis0_csr_num_i;
 assign rs_mdu_push_tlb_op_o = rs_mdu_from_slot1 ? dis1_tlb_op_i : dis0_tlb_op_i;

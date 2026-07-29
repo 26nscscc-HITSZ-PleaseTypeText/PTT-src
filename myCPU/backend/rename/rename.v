@@ -8,7 +8,7 @@
 //   * 目的寄存器：向 RAT 写占用（ROB 编号即重命名标签）。
 //   * 同拍 RAW 旁路：槽 1 的源 == 槽 0 的目的 -> 直接用槽 0 的 ROB 编号（表外旁路）。
 // - 向 ROB 申请一对表项（恒成对分配：槽 0 -> {1'b0,tail}，槽 1 -> {1'b1,tail}，
-//   即使只有 1 条有效也占一对 —— mariver 奇偶分体方案，简单且双发射对齐）。
+//   即使只有 1 条有效也占一对，以保持奇偶槽位和双发射对齐）。
 // - 把静态信息写入 ROB（pc/we/rd/futype/分支预测信息/priv/异常等），
 //   把执行所需信息锁存到 rename/dispatch 流水寄存器。
 // - NOP 消除：is_nop 指令只入 ROB（分配时即标完成），不送分发级。
@@ -145,7 +145,6 @@ module rename(
     output wire [31:0]                rob_a0_inst_o,
     output wire                       rob_a0_rf_we_o,
     output wire [4:0]                 rob_a0_rd_o,
-    output wire [`FU_NUM-1:0]         rob_a0_futype_o,
     output wire                       rob_a0_is_load_o,
     output wire                       rob_a0_is_store_o,
     output wire                       rob_a0_is_branch_o,
@@ -165,7 +164,6 @@ module rename(
     output wire [31:0]                rob_a1_inst_o,
     output wire                       rob_a1_rf_we_o,
     output wire [4:0]                 rob_a1_rd_o,
-    output wire [`FU_NUM-1:0]         rob_a1_futype_o,
     output wire                       rob_a1_is_load_o,
     output wire                       rob_a1_is_store_o,
     output wire                       rob_a1_is_branch_o,
@@ -219,6 +217,7 @@ module rename(
     output reg  [`WB_SRC_NUM-1:0]     dis0_wb_src_op_o,
     output reg  [13:0]                dis0_csr_num_o,
     output reg                        dis0_is_cacop_o,
+    output reg  [4:3]                 dis0_cacop_op_o,
     output reg                        dis0_src0_ready_o,     // 1=val 有效；0=等 robid 唤醒
     output reg  [31:0]                dis0_src0_val_o,
     output reg  [`ROB_W-1:0]          dis0_src0_robid_o,
@@ -241,6 +240,7 @@ module rename(
     output reg  [`WB_SRC_NUM-1:0]     dis1_wb_src_op_o,
     output reg  [13:0]                dis1_csr_num_o,
     output reg                        dis1_is_cacop_o,
+    output reg  [4:3]                 dis1_cacop_op_o,
     output reg                        dis1_src0_ready_o,
     output reg  [31:0]                dis1_src0_val_o,
     output reg  [`ROB_W-1:0]          dis1_src0_robid_o,
@@ -258,7 +258,7 @@ module rename(
     output wire [4:0]                 dis1_src1_addr_o
 );
 
-// 设计说明（已实现，参考 mariver rename.v 145~254 行，结构几乎一一对应）
+// 设计说明：
 //
 wire can_go;  // 本拍放行条件（组合）：IB 有效 && ROB 未满 && 分发级可接收 && !flush
 
@@ -307,9 +307,9 @@ wire ib0_eff_v = ib0_valid_i && !ib0_is_nop_i;
 wire ib1_eff_v = ib1_valid_i && !ib1_is_nop_i;
 // L0 CSR 写：单独成对进入 ROB，并闸住后续 rename，直至提交（免 flush 时防在途 csrrd）
 wire ib0_l0_csr_wr = ib0_eff_v && ib0_priv_vec_i[`PRIV_CSR_WR]
-                  && `CSR_NUM_IS_L0_NOFLUSH(ib0_csr_num_i[11:0]);
+                  && `CSR_NUM_IS_L0_NOFLUSH(ib0_csr_num_i);
 wire ib1_l0_csr_wr = ib1_eff_v && ib1_priv_vec_i[`PRIV_CSR_WR]
-                  && `CSR_NUM_IS_L0_NOFLUSH(ib1_csr_num_i[11:0]);
+                  && `CSR_NUM_IS_L0_NOFLUSH(ib1_csr_num_i);
 reg l0_csr_drain_r;
 wire dual_issue_ok = !((ib0_eff_v && ib1_eff_v && ib0_futype_i[`FU_MEM] && ib1_futype_i[`FU_MEM]) ||
                        (ib0_eff_v && ib1_eff_v && ib0_futype_i[`FU_MDU] && ib1_futype_i[`FU_MDU]) ||
@@ -344,7 +344,7 @@ assign ib1_writes_rf = ib1_valid_i && ib1_rf_we_i && (ib1_rd_addr_i != 5'b0);
 
 // 第二步——RAT/ARF 读地址（组合直连）：
 //      rat_raddr0/1 = 槽0 的 src0/src1 地址；rat_raddr2/3 = 槽1 的；
-//      arf_raddr0~3 同地址（RAT 与 ARF 共用读地址，mariver 同款）。
+//      arf_raddr0~3 与 RAT 查询使用同一组逻辑寄存器地址。
 //
 assign rat_raddr0_o = ib0_src0_addr_i;
 assign rat_raddr1_o = ib0_src1_addr_i;
@@ -369,7 +369,6 @@ assign ib1_src0_raw_from_ib0 = ib1_use_src0_i && ib0_writes_rf &&
                                (ib1_src0_addr_i == ib0_rd_addr_i);
 assign ib1_src1_raw_from_ib0 = ib1_use_src1_i && ib0_writes_rf &&
                                (ib1_src1_addr_i == ib0_rd_addr_i);
-wire ib1_raw_from_ib0 = ib1_src0_raw_from_ib0 || ib1_src1_raw_from_ib0;
 
 assign src0_0_ready = !ib0_use_src0_i || !rat_rbusy0_i;
 assign src0_0_val = ib0_use_src0_i ? arf_rdata0_i : 32'b0;
@@ -405,7 +404,7 @@ assign rat_waddr1_o = ib1_rd_addr_i;
 assign rat_wnum1_o = robid1;
 
 // 第五步——ROB 静态信息（组合直通 rob_a0_*/rob_a1_*）：
-//      pc/inst/rf_we/rd/futype/is_load/is_store/is_branch/br_type/pred_taken/
+//      pc/inst/rf_we/rd/is_load/is_store/is_branch/br_type/pred_taken/
 //      is_last/ftq_id/priv_vec/csr_num/cacop_code/excp/is_nop 全部从 ib*_ 输入透传。
 //      ROB 在 alloc_en 时把这些锁进表项（valid 置位、complete 按 is_nop 置位）。
 //
@@ -414,7 +413,6 @@ assign rob_a0_pc_o = ib0_pc_i;
 assign rob_a0_inst_o = ib0_inst_i;
 assign rob_a0_rf_we_o = ib0_rf_we_i;
 assign rob_a0_rd_o = ib0_rd_addr_i;
-assign rob_a0_futype_o = ib0_futype_i;
 assign rob_a0_is_load_o = ib0_is_load_i;
 assign rob_a0_is_store_o = ib0_is_store_i;
 assign rob_a0_is_branch_o = ib0_is_branch_i;
@@ -434,7 +432,6 @@ assign rob_a1_pc_o = ib1_pc_i;
 assign rob_a1_inst_o = ib1_inst_i;
 assign rob_a1_rf_we_o = ib1_rf_we_i;
 assign rob_a1_rd_o = ib1_rd_addr_i;
-assign rob_a1_futype_o = ib1_futype_i;
 assign rob_a1_is_load_o = ib1_is_load_i;
 assign rob_a1_is_store_o = ib1_is_store_i;
 assign rob_a1_is_branch_o = ib1_is_branch_i;
@@ -457,7 +454,7 @@ assign rob_a1_is_nop_o = ib1_is_nop_i | ib1_null_bubble;
 //
 // 坑点提示：
 //      1. "恒成对分配"意味着 IB 只有 1 条时也消耗一对 ROB 槽（编号浪费一半），
-//         mariver 实测影响极小；好处是 ROB 编号的奇偶位天然指示提交槽位。
+//         代价是单条指令也占一对；好处是 ROB 编号奇偶位天然指示提交槽位。
 //      2. is_nop 指令必须照常分配 ROB + 写 RAT？——NOP 不写寄存器（rf_we=0），
 //         不会写 RAT；但 priv 类伪 NOP（dbar/ibar）带 priv_vec 要进 ROB 走提交流程。
 //      3. flush_i 优先级最高：当拍 can_go 必须为 0（不得向 ROB/RAT 发任何写）。
@@ -479,6 +476,7 @@ always @(posedge clk) begin
         dis0_wb_src_op_o <= ib0_wb_src_op_i;
         dis0_csr_num_o <= ib0_csr_num_i;
         dis0_is_cacop_o <= ib0_priv_vec_i[`PRIV_CACOP];
+        dis0_cacop_op_o <= ib0_cacop_code_i[4:3];
         dis0_src0_ready_o <= src0_0_ready;
         dis0_src0_val_o <= src0_0_val;
         dis0_src0_robid_o <= src0_0_robid;
@@ -505,6 +503,7 @@ always @(posedge clk) begin
         dis1_wb_src_op_o <= ib1_wb_src_op_i;
         dis1_csr_num_o <= ib1_csr_num_i;
         dis1_is_cacop_o <= ib1_priv_vec_i[`PRIV_CACOP];
+        dis1_cacop_op_o <= ib1_cacop_code_i[4:3];
         dis1_src0_ready_o <= src1_0_ready;
         dis1_src0_val_o <= src1_0_val;
         dis1_src0_robid_o <= src1_0_robid;

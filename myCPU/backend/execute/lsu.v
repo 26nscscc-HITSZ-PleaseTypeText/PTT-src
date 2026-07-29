@@ -28,9 +28,9 @@ module lsu(
     // ---------------- 发射入口（来自 rs_mem）----------------
     input  wire                       issue_valid_i,
     input  wire [`ROB_W-1:0]          issue_robid_i,
-    input  wire [31:0]                issue_pc_i,
     input  wire [`MEM_OP_NUM-1:0]     issue_mem_op_i,
     input  wire                       issue_is_cacop_i,
+    input  wire [4:3]                 issue_cacop_op_i,
     input  wire [31:0]                issue_base_i,        // rj 值
     input  wire [31:0]                issue_wdata_i,       // rd 值（store 数据）
     input  wire [31:0]                issue_imm_i,         // 偏移
@@ -42,12 +42,16 @@ module lsu(
     output wire                       mmu_d_is_store_o,    // 区分 PIL/PIS 与 PME
     input  wire [31:0]                mmu_d_paddr_i,
     input  wire [1:0]                 mmu_d_mat_i,
-    input  wire [`TLB_EX_NUM-1:0]     mmu_d_tlb_ex_i,      // TLBR/PIL/PIS/PPI/PME
+    input  wire                       mmu_d_excp_tlbr_i,
+    input  wire                       mmu_d_excp_pil_i,
+    input  wire                       mmu_d_excp_pis_i,
+    input  wire                       mmu_d_excp_ppi_i,
+    input  wire                       mmu_d_excp_pme_i,
     input  wire                       mmu_d_excp_adem_i,
 
     // ---------------- DCache load 访问口 ----------------
     output wire                       dc_req_o,            // load 请求（保持至 addr_ok）
-    output wire [31:0]                dc_vaddr_o,          // 虚地址（VIPT 索引）
+    output wire [11:5]                dc_vindex_o,         // 虚地址页内索引（VIPT）
     output wire [31:0]                dc_paddr_o,          // 物理地址（tag 比对）
     output wire [2:0]                 dc_size_o,           // 0=B 1=H 2=W
     output wire                       dc_uncached_o,
@@ -63,7 +67,7 @@ module lsu(
     input  wire [`ROB_W-1:0]          dc_mshr_robid_i,     // 与 data_ok 同拍
 
     // ---------------- store buffer 前递查询（DC 级组合）----------------
-    output wire [31:0]                sb_query_paddr_o,
+    output wire [31:2]                sb_query_paddr_o,
     output wire                       sb_query_uncached_o, // 本查询来自 uncached load
     input  wire                       sb_query_hit_i,      // 整字可由 SB 合并前递
     input  wire [31:0]                sb_query_data_i,
@@ -72,6 +76,9 @@ module lsu(
     // ---------------- uncached load 许可（与 ROB head 比较）----------------
     input  wire [`ROB_W-1:0]          rob_head_robid_i,    // 编码：MSB=槽0 仍未提交，低位=head 对指针（顶层拼装，见 mycpu_top）
     input  wire                       rob_head_valid_i,
+    // store 提交释放 STQ：与 SB push 同源；LSU 再打一拍，保证 SB valid 已可见
+    input  wire                       st_retire_valid_i,
+    input  wire [`ROB_W-1:0]          st_retire_robid_i,
     output wire                       uncached_ld_inflight_o, // 有 uncached load 在飞（commit 屏蔽中断用）
 
     // ---------------- 写回 ROB ----------------
@@ -85,7 +92,7 @@ module lsu(
     output wire                       wb_uncached_o,       // 非缓存访问
     output wire [`EXCP_NUM-1:0]       wb_excp_o,           // 动态异常（ALE/ADEM/TLBR_M/PIL/PIS/PPI_M/PME）
 
-    // ---------------- DC 级命中限定早唤醒（V3.4：early2；顶层可 `LSU_EARLY2_PIPE` 打拍）----------------
+    // ---------------- DC 级命中限定早唤醒（顶层可选择打一拍）----------------
     output wire                       early_wakeup_valid_o,
     output wire [`ROB_W-1:0]          early_wakeup_robid_o
 );
@@ -97,6 +104,7 @@ reg                    a_valid;
 reg [`ROB_W-1:0]       a_robid;
 reg [`MEM_OP_NUM-1:0]  a_mem_op;
 reg                    a_is_cacop;
+reg [4:3]              a_cacop_op;
 reg [31:0]             a_base, a_wdata, a_imm;
 
 wire [31:0] a_vaddr = a_base + a_imm;
@@ -107,30 +115,40 @@ wire a_is_load_op  = a_mem_op[`MEM_OP_LD_W] | a_mem_op[`MEM_OP_LD_B]
                    | a_mem_op[`MEM_OP_LD_H] | a_mem_op[`MEM_OP_LD_BU]
                    | a_mem_op[`MEM_OP_LD_HU]| a_mem_op[`MEM_OP_LL_W];
 
-// MMU 翻译（组合）
-assign mmu_d_req_o      = a_valid;
-assign mmu_d_vaddr_o    = a_vaddr;
-assign mmu_d_is_store_o = a_is_store_op;
-
-// LoongArch MAT：2'b01=coherent cached，其余按 uncached 访问
-wire a_uncached = (mmu_d_mat_i != 2'b01);
-
-// ALE 检测（H 类要求 vaddr[0]==0，W 类要求 vaddr[1:0]==00）
+// MMU 翻译（组合）：ALE / Index-cacop 抑制翻译请求
+// ALE 检测（H 类要求 vaddr[0]==0，W/LL/SC 要求 vaddr[1:0]==00）
+// VA 对齐先于地址翻译：ALE 时不得发 MMU，否则会与 TLBR 同拍置位，
+// 否则 ALE 会与 TLBR 同拍置位，破坏异常优先级。
+// 注意：cacop 的 Index 类用 rj+si12 编码 way/index，低位可非对齐，不能一律按字对齐报 ALE。
 wire a_size_h = a_mem_op[`MEM_OP_LD_H] | a_mem_op[`MEM_OP_LD_HU] | a_mem_op[`MEM_OP_ST_H];
 wire a_size_w = a_mem_op[`MEM_OP_LD_W] | a_mem_op[`MEM_OP_ST_W]
               | a_mem_op[`MEM_OP_LL_W] | a_mem_op[`MEM_OP_SC_W];
 wire a_ale = (a_size_h && (a_vaddr[0] != 1'b0))
            | (a_size_w && (a_vaddr[1:0] != 2'b00));
 
-// 异常合并（cacop 与访存共用翻译异常通路）
+// Index/StoreTag（op[4:3]=00/01）使用虚地址编码 way/index，不走地址翻译。
+// 否则 Index cacop 会在 PG 下误报 TLBR，difftest 见 CRMD DA↔PG / TLBR vs ALE。
+wire a_cacop_di = a_is_cacop && ((a_cacop_op == 2'b00) || (a_cacop_op == 2'b01));
+wire a_no_trans = a_ale | a_cacop_di;
+
+assign mmu_d_req_o      = a_valid && !a_no_trans;
+assign mmu_d_vaddr_o    = a_vaddr;
+assign mmu_d_is_store_o = a_is_store_op;
+
+// LoongArch MAT：2'b01=coherent cached，其余按 uncached 访问
+wire a_uncached = (mmu_d_mat_i != 2'b01);
+// Index cacop：paddr=vaddr（作 way/index），无 MAT 语义
+wire [31:0] a_paddr = a_cacop_di ? a_vaddr : mmu_d_paddr_i;
+
+// 异常合并；ALE / Index-cacop 屏蔽翻译类异常
 wire [`EXCP_NUM-1:0] a_excp =
-      ({{(`EXCP_NUM-1){1'b0}}, a_ale}                          << `EXCP_ALE)
-    | ({{(`EXCP_NUM-1){1'b0}}, mmu_d_excp_adem_i}              << `EXCP_ADEM)
-    | ({{(`EXCP_NUM-1){1'b0}}, mmu_d_tlb_ex_i[`TLB_EX_TLBR]}   << `EXCP_TLBR_M)
-    | ({{(`EXCP_NUM-1){1'b0}}, mmu_d_tlb_ex_i[`TLB_EX_PIL]}    << `EXCP_PIL)
-    | ({{(`EXCP_NUM-1){1'b0}}, mmu_d_tlb_ex_i[`TLB_EX_PIS]}    << `EXCP_PIS)
-    | ({{(`EXCP_NUM-1){1'b0}}, mmu_d_tlb_ex_i[`TLB_EX_PPI]}    << `EXCP_PPI_M)
-    | ({{(`EXCP_NUM-1){1'b0}}, mmu_d_tlb_ex_i[`TLB_EX_PME]}    << `EXCP_PME);
+      ({{(`EXCP_NUM-1){1'b0}}, a_ale}                                    << `EXCP_ALE)
+    | ({{(`EXCP_NUM-1){1'b0}}, !a_no_trans & mmu_d_excp_adem_i}          << `EXCP_ADEM)
+    | ({{(`EXCP_NUM-1){1'b0}}, !a_no_trans & mmu_d_excp_tlbr_i} << `EXCP_TLBR_M)
+    | ({{(`EXCP_NUM-1){1'b0}}, !a_no_trans & mmu_d_excp_pil_i}  << `EXCP_PIL)
+    | ({{(`EXCP_NUM-1){1'b0}}, !a_no_trans & mmu_d_excp_pis_i}  << `EXCP_PIS)
+    | ({{(`EXCP_NUM-1){1'b0}}, !a_no_trans & mmu_d_excp_ppi_i}  << `EXCP_PPI_M)
+    | ({{(`EXCP_NUM-1){1'b0}}, !a_no_trans & mmu_d_excp_pme_i}  << `EXCP_PME);
 
 // store 数据按地址对齐 + wstrb
 wire [1:0] a_off = a_vaddr[1:0];
@@ -249,23 +267,30 @@ reg                  stq_uc   [0:STQ_N-1];
 wire [`ROB_PAIR_W-1:0] head_pair   = rob_head_robid_i[`ROB_PAIR_W-1:0];
 wire                   head_s0_live= rob_head_robid_i[`ROB_W-1];
 
-wire [`ROB_PAIR_W-1:0] stq_d    [0:STQ_N-1];
+// STQ 释放：仅在 store 真正提交进 SB 的下一拍清项（避免 age-wrap 误释放，
+// 以及提交当拍 SB valid 尚未打拍导致的错载窗口）。
+reg                    st_ret_v_r;
+reg [`ROB_W-1:0]       st_ret_id_r;
+always @(posedge clk) begin
+    if (reset || flush_i) begin
+        st_ret_v_r  <= 1'b0;
+        st_ret_id_r <= {`ROB_W{1'b0}};
+    end else begin
+        st_ret_v_r  <= st_retire_valid_i;
+        st_ret_id_r <= st_retire_robid_i;
+    end
+end
+
 wire                   stq_done [0:STQ_N-1];
 genvar si;
 generate
 for (si = 0; si < STQ_N; si = si + 1) begin : g_stq_cm
-    assign stq_d[si] = stq_id[si][`ROB_PAIR_W-1:0] - head_pair;
-    assign stq_done[si] = stq_v[si] && (
-        !rob_head_valid_i
-        || (stq_d[si] >= `ROB_WRAP_THR)
-        || ((stq_d[si] == {`ROB_PAIR_W{1'b0}})
-            && (stq_id[si][`ROB_W-1] == 1'b0) && !head_s0_live)
-    );
+    assign stq_done[si] = stq_v[si] && st_ret_v_r && (stq_id[si] == st_ret_id_r);
 end
 endgenerate
 
 // load 访问字节掩码（实现见 mycpu.h）
-wire [3:0] d_ld_bytes = mem_load_byte_mask(d_mem_op, d_vaddr[1:0]);
+wire [3:0] d_ld_bytes = mem_load_byte_mask(d_mem_op[7:4], d_vaddr[1:0]);
 
 wire stq_any;
 wire stq_any_uc;
@@ -274,7 +299,7 @@ wire [STQ_N-1:0] stq_hit_one;
 generate
 for (si = 0; si < STQ_N; si = si + 1) begin : g_stq_hz
     assign stq_hit_one[si] = stq_v[si] && !stq_done[si]
-        && mem_st_ld_overlap(stq_pa[si], stq_strb[si], d_paddr, d_ld_bytes);
+        && mem_st_ld_overlap(stq_pa[si][31:2], stq_strb[si], d_paddr[31:2], d_ld_bytes);
 end
 endgenerate
 
@@ -311,7 +336,7 @@ wire store_order_block = d_uncached ? stq_any : (stq_overlap || stq_any_uc);
 wire d_excp_any = |d_excp;
 
 // SB 前递查询（DC 级持续驱动）
-assign sb_query_paddr_o    = d_paddr;
+assign sb_query_paddr_o    = d_paddr[31:2];
 assign sb_query_uncached_o = d_valid && d_is_load && d_uncached;
 
 // uncached load 许可：自己是最老未提交指令
@@ -337,7 +362,7 @@ wire d_need_dc = d_valid && d_is_load && !d_excp_any && !d_sb_hit && !d_sb_parti
 
 // DCache 请求（保持至 addr_ok）
 assign dc_req_o      = d_need_dc && d_ld_gate && !d_req_sent && !d_drop && !flush_i;
-assign dc_vaddr_o    = d_vaddr;
+assign dc_vindex_o   = d_vaddr[11:5];
 assign dc_paddr_o    = d_paddr;
 assign dc_size_o     = d_size;
 assign dc_uncached_o = d_uncached;
@@ -350,6 +375,18 @@ wire dc_return = d_req_sent && dc_data_ok_i && !d_drop;
 wire dc_return_drop = d_req_sent && dc_data_ok_i && d_drop;
 wire dc_missed = d_req_sent && dc_miss_i;
 
+// D$ miss 通知与 MSHR 分配保持同拍；完成条件寄存一拍，隔离
+// req_paddr→miss→lsu_ready→rs_mem 组合路径。
+reg dc_miss_done_r;
+always @(posedge clk) begin
+    if (reset)
+        dc_miss_done_r <= 1'b0;
+    else if (flush_i)
+        dc_miss_done_r <= 1'b0;
+    else
+        dc_miss_done_r <= dc_missed && (d_drop || m_has_free);
+end
+
 // MSHR 重填返回（按 robid 配对；m_drop 时静默消费）
 wire mshr_return      = m_match_vld && !m_drop[m_match_idx];
 wire mshr_return_drop = m_match_vld &&  m_drop[m_match_idx];
@@ -357,7 +394,7 @@ wire mshr_return_drop = m_match_vld &&  m_drop[m_match_idx];
 // ---------------- load 数据整形 ----------------
 function [31:0] shape_load;
     input [31:0] word;
-    input [`MEM_OP_NUM-1:0] op;
+    input [7:4] op;
     input [1:0] off;
     reg [7:0]  b;
     reg [15:0] h;
@@ -381,18 +418,11 @@ wire dcst_ok       = !wb_mshr_case && !h_valid;         // DC 级静态源可用
 wire wb_excp_case  = dcst_ok && d_valid && d_excp_any;
 wire wb_st_case    = dcst_ok && d_valid && !d_excp_any && (d_is_store || d_is_cacop)
                   && !(d_is_store && stq_full);
-// Phase F(100MHz 攻坚):SB 命中不再"同拍组合写回"。原关键路径
-//   store_buffer/tail → 逐字节年龄优先前递合并(8 项)→ sb_query_data_i → shape_load
-//   → wb_data_o → 旁路网络 → rs_alu/s1_val 捕获(实测 post-route 22ns/32 级,WNS 主凶)
-// 一律经既有 hold 暂存槽打一拍:h_data 在 T 拍锁存 shape_load(sb_query_data_i),
-// T+1 拍由 wb_hold_case 从寄存器写回。于是 h_data 这个 FF 把 22ns 长链在中点切成
-//   (a) SB 合并 → h_data/D   与   (b) h_data/Q → wb → RS 捕获   两条 ~11ns 半链。
-// 正确性:LSU 流水里的在途 load 恒比 commit 级 flush 触发指令年轻,flush 拍丢弃 hold
-// 内容永远安全(与原 hold_cap_sb 依据同);SB 命中延后一拍写回只是延迟,无序问题
-// (store→load 顺序由 store_order_block 在 sb_ready 前已保证)。SB 命中少见,IPC 影响微小。
+// SB 命中结果经 hold 暂存一拍，隔离逐字节前递合并到写回旁路的长组合路径。
+// flush 会丢弃尚未提交的 hold 内容；store_order_block 保证 store→load 顺序。
 wire sb_ready      = d_sb_hit && d_ld_gate && !store_order_block; // d_ld_gate 已含 !h_valid
-wire wb_ld_sb_case = 1'b0;                               // SB 命中仍走 hold（SB→RS 曾为时序主凶）
-// V3.4：`LSU_DC_HIT_BYPASS` 时 D$ 命中同拍写回；MSHR 抢口时仍进 hold
+wire wb_ld_sb_case = 1'b0;                               // SB 命中仍走 hold，切断 SB→RS 组合路径
+// 启用 `LSU_DC_HIT_BYPASS` 时 D$ 命中同拍写回；MSHR 抢口时仍进入 hold。
 wire wb_ld_dc_case = (`LSU_DC_HIT_BYPASS != 0) && dcst_ok && dc_return;
 wire hold_cap_dc   = dc_return && ((`LSU_DC_HIT_BYPASS != 0) ? wb_mshr_case : 1'b1);
 // 所有就绪 SB 命中都进 hold(与 hold_cap_dc 互斥:同一 d 级 load 不会既 SB 命中又 DC 返回)
@@ -404,10 +434,10 @@ assign wb_valid_o = (wb_mshr_case || wb_hold_case
 assign wb_robid_o = wb_mshr_case ? m_robid[m_match_idx]
                   : wb_hold_case ? h_robid
                   : d_robid;
-assign wb_data_o  = wb_mshr_case  ? shape_load(dc_mshr_rdata_i, m_mem_op[m_match_idx], m_vaddr[m_match_idx][1:0])
+assign wb_data_o  = wb_mshr_case  ? shape_load(dc_mshr_rdata_i, m_mem_op[m_match_idx][7:4], m_vaddr[m_match_idx][1:0])
                   : wb_hold_case  ? h_data
-                  : wb_ld_sb_case ? shape_load(sb_query_data_i, d_mem_op, d_vaddr[1:0])
-                  : wb_ld_dc_case ? shape_load(dc_rdata_i,      d_mem_op, d_vaddr[1:0])
+                  : wb_ld_sb_case ? shape_load(sb_query_data_i, d_mem_op[7:4], d_vaddr[1:0])
+                  : wb_ld_dc_case ? shape_load(dc_rdata_i,      d_mem_op[7:4], d_vaddr[1:0])
                   : d_st_data;
 assign wb_paddr_o = wb_mshr_case ? m_paddr[m_match_idx] : wb_hold_case ? h_paddr : d_paddr;
 assign wb_vaddr_o = wb_mshr_case ? m_vaddr[m_match_idx] : wb_hold_case ? h_vaddr : d_vaddr;
@@ -417,18 +447,14 @@ assign wb_uncached_o = (!wb_mshr_case && !wb_hold_case) && d_uncached;
 assign wb_excp_o  = (!wb_mshr_case && !wb_hold_case) ? d_excp : {`EXCP_NUM{1'b0}};
 
 // ---------------- 流水推进 ----------------
-// DC 级本拍腾空：写回成功 / 移入 miss 槽 / 被抢口但已捕获进 hold
+// DC 级本拍腾空：写回成功、miss 完成条件到达，或已捕获进 hold。
 wire d_done  = wb_excp_case || wb_st_case || wb_ld_sb_case || wb_ld_dc_case
-             || (dc_missed && (d_drop || m_has_free)) || dc_return_drop
+             || dc_miss_done_r || dc_return_drop
              || hold_cap_dc || hold_cap_sb;
 
 // 年轻 UC park（宽版）：仅对【比 DC 中 UC 更老】的 AGU 让位。
 // 勿对更年轻 AGU 让位（会覆盖 u / 堵 RS）；u_valid 期间禁更年轻进 DC。
-// digftest 曾用此版到 /#；窄版（仅 a_at_head）在 account_user_time 错载。
-// V2.3 探索注记（p2-park，已回退）：曾放行「年轻 cached load/cacop」越过
-// 停车的 u——探针实测该路径在 lab19/Linux 全程 0 次触发（RS_MEM 的
-// store/ll/sc/cacop 屏障使年轻 cached load 根本到不了 AGU），Linux 软门
-// 周期数逐位相同，故撤销保持绿版原样。
+// u_valid 期间禁止年轻请求进入 DC，避免覆盖停车槽或破坏程序序。
 wire d_uc_yield = d_is_unc_load && !d_at_head && !d_req_sent && !d_drop;
 wire u_at_head = u_valid
               && (u_robid[`ROB_PAIR_W-1:0] == head_pair)
@@ -513,8 +539,8 @@ always @(posedge clk) begin
         if (hold_cap_dc || hold_cap_sb) begin
             h_valid <= 1'b1;
             h_robid <= d_robid;
-            h_data  <= hold_cap_dc ? shape_load(dc_rdata_i,      d_mem_op, d_vaddr[1:0])
-                                   : shape_load(sb_query_data_i, d_mem_op, d_vaddr[1:0]);
+            h_data  <= hold_cap_dc ? shape_load(dc_rdata_i,      d_mem_op[7:4], d_vaddr[1:0])
+                                   : shape_load(sb_query_data_i, d_mem_op[7:4], d_vaddr[1:0]);
             h_vaddr <= d_vaddr;
             h_paddr <= d_paddr;
             h_size  <= d_size;
@@ -580,7 +606,7 @@ always @(posedge clk) begin
             d_is_store <= a_is_store_op && !a_is_cacop;
             d_is_load  <= a_is_load_op  && !a_is_cacop;
             d_vaddr    <= a_vaddr;
-            d_paddr    <= mmu_d_paddr_i;
+            d_paddr    <= a_paddr;
             d_st_data  <= a_st_data;
             d_st_strb  <= a_st_strb;
             d_size     <= a_size;
@@ -595,8 +621,9 @@ always @(posedge clk) begin
             a_valid    <= 1'b1;
             a_robid    <= issue_robid_i;
             a_mem_op   <= issue_mem_op_i;
-            a_is_cacop <= issue_is_cacop_i;
-            a_base     <= issue_base_i;
+            a_is_cacop    <= issue_is_cacop_i;
+            a_cacop_op    <= issue_cacop_op_i;
+            a_base        <= issue_base_i;
             a_wdata    <= issue_wdata_i;
             a_imm      <= issue_imm_i;
         end
@@ -612,24 +639,38 @@ wire d_early_ok = (`LSU_EARLY2_ENABLE != 0)
 assign early_wakeup_valid_o = d_early_ok && !flush_i && !reset;
 assign early_wakeup_robid_o = d_robid;
 
-// lint 吸收
-wire lsu_lint = (|issue_pc_i) | (|mmu_d_mat_i[1:1]);
-
 `ifdef SYNTHESIS
 // synthesis translate_off
 reg [63:0] lsu_store_order_stall_cyc;
 reg [63:0] lsu_dc_wait_cyc;
+reg [63:0] lsu_stq_full_cyc;
+reg [7:0]  lsu_stq_occ_now;
+reg [7:0]  lsu_stq_occ_max;
+reg [63:0] lsu_stq_occ_sum;
+integer    lsu_stq_pc_i;
+always @(*) begin
+    lsu_stq_occ_now = 8'd0;
+    for (lsu_stq_pc_i = 0; lsu_stq_pc_i < STQ_N; lsu_stq_pc_i = lsu_stq_pc_i + 1)
+        if (stq_v[lsu_stq_pc_i] && !stq_done[lsu_stq_pc_i])
+            lsu_stq_occ_now = lsu_stq_occ_now + 8'd1;
+end
 always @(posedge clk) begin
     if (reset) begin
         lsu_store_order_stall_cyc <= 64'd0;
         lsu_dc_wait_cyc           <= 64'd0;
+        lsu_stq_full_cyc          <= 64'd0;
+        lsu_stq_occ_max           <= 8'd0;
+        lsu_stq_occ_sum           <= 64'd0;
     end else if (!flush_i) begin
         if (d_valid && d_is_load && !d_excp_any && store_order_block)
             lsu_store_order_stall_cyc <= lsu_store_order_stall_cyc + 64'd1;
         if (d_valid && d_req_sent && !d_drop)
             lsu_dc_wait_cyc <= lsu_dc_wait_cyc + 64'd1;
-        // orphan：冲刷后 kill 竞态可能残留；功能已忽略，勿刷屏
-        // if (dc_mshr_data_ok_i && !m_match_vld) $display(...);
+        if (stq_full)
+            lsu_stq_full_cyc <= lsu_stq_full_cyc + 64'd1;
+        lsu_stq_occ_sum <= lsu_stq_occ_sum + {56'd0, lsu_stq_occ_now};
+        if (lsu_stq_occ_now > lsu_stq_occ_max)
+            lsu_stq_occ_max <= lsu_stq_occ_now;
         if (dc_missed && !d_drop && !m_has_free)
             $error("[%0t] LSU: miss with full miss-slots", $time);
     end

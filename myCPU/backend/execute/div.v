@@ -3,14 +3,14 @@
 // ------------------------------------------------------------
 // 功能：
 // - 完成 32/32 位有符号/无符号除法与取模，供 div.w/div.wu/mod.w/mod.wu。
-// - 核心优化（满洋/mariver 实证路线）：朴素恢复余数除法固定 32 拍；
+// - 相比固定 32 拍的朴素恢复余数除法，先用 CLZ 确定有效迭代次数；
 //   先用 CLZ（前导零计数）把除数对齐到被除数的最高位，跳过无效迭代，
 //   则迭代次数 = clz(divisor) - clz(dividend) + 1 ——
 //   竞赛 benchmark 中操作数普遍很小，常见 5~10 拍出结果，IPC 收益明显。
 //
 // 端口：
 // - valid_i / 操作数 / is_signed_i ：启动一次除法
-// - quotient_o / remainder_o / done_o / busy_o
+// - quotient_o / remainder_o / done_o
 // - flush_i：全局冲刷时打断迭代（必须支持！）
 // ============================================================
 
@@ -26,8 +26,7 @@ module div(
 
     output wire [31:0]   quotient_o,     // 商
     output wire [31:0]   remainder_o,    // 余数
-    output wire          done_o,         // 结果有效一拍
-    output wire          busy_o          // 迭代中
+    output wire          done_o          // 结果有效一拍
 );
 
 function [5:0] clz32;
@@ -210,8 +209,4 @@ end
 assign quotient_o  = quotient_r;
 assign remainder_o = remainder_r;
 assign done_o      = done_r;
-// prep 拍也算忙:此拍已锁存操作数但结果未出,须让 fu_mdu 视为占用(不再接新 div、
-// 不误采 done)。busy 从 accept_new 后的 prep 拍一直拉到迭代结束。
-assign busy_o      = busy_r | prep_r;
-
 endmodule
