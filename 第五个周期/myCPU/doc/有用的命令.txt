@@ -1,0 +1,19 @@
+在tcl导出时序报告：
+report_timing -file E:/360MoveData/Users/admin/Desktop/timing.txt
+
+在PowerShell执行xsim仿真：
+cd E:\Loongarch_cpu\output\vivado_cpu_origin\soc_verify\soc_axi\run_vivado\project\loongson.sim\sim_1\behav\xsim
+$env:PATH='E:\Xilinx\Vivado\2023.2\bin;' + $env:PATH
+.\compile.bat
+.\elaborate.bat
+xsim tb_top_behav --runall --log simulate.log
+
+在vivado tcl创建工程
+cd e:
+cd /Loongarch_cpu/output/vivado_cpu_origin/soc_verify/soc_axi/run_vivado
+source create_project.tcl
+
+一键脚本，流程与手册里的 run_func_test.tcl 一致，并额外在仿真时导出 VCD
+cd [get_property DIRECTORY [current_project]]
+cd ..
+source run_func_test_vcd.tcl
