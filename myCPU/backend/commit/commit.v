@@ -366,8 +366,14 @@ wire cmt0_retire = int_take ||
                     (!cmt0_store_block && !cmt0_ibar_block && !cmt0_cacop_block)));
 wire cmt0_effect = cmt0_ready && !int_take && !cmt0_has_excp &&
                    !cmt0_store_block && !cmt0_ibar_block && !cmt0_cacop_block;
+`ifdef CACOP_NO_REFETCH
+wire cmt0_priv_needs_flush = cmt0_has_priv && !cmt0_csr_nofush
+                           && !cmt0_priv_vec_i[`PRIV_CACOP];
+`else
+wire cmt0_priv_needs_flush = cmt0_has_priv && !cmt0_csr_nofush;
+`endif
 wire cmt0_flush = int_take || (cmt0_ready && cmt0_has_excp) ||
-                  (cmt0_effect && cmt0_has_priv && !cmt0_csr_nofush) || cmt0_mispred;
+                  (cmt0_effect && cmt0_priv_needs_flush) || cmt0_mispred;
 
 wire cmt1_head_retire = (!cmt0_valid_i) &&
                         (cmt1_ready && (cmt1_has_excp ||
@@ -379,8 +385,13 @@ wire cmt0_taken_br = cmt0_effect && cmt0_is_branch_i && cmt0_br_taken_i && !cmt0
 // cmt1_br_hard：CALL/RET、跨块分支、或误预测；cmt1_mispred：含脏预测（非分支 pred）
 // cmt0_is_branch：同拍双分支仍禁（单 FTQ 训练口）
 // 双 store：SB 单写口，槽1 经 cmt1_store_block 串行
+// A correctly predicted slot-0 branch does not by itself require single
+// retirement.  Slot 1 may retire with it when slot 1 is a normal instruction;
+// dual branches remain serialized because the predictor has one training
+// source.  A slot-0 redirect is already excluded by cmt0_flush below.
 wire cmt1_single_limit = cmt1_has_excp || cmt1_has_priv || cmt1_br_hard || cmt1_mispred ||
-                         cmt0_is_branch_i || cmt0_taken_br;
+                         cmt0_has_priv || (cmt0_is_branch_i && cmt1_is_branch_i) ||
+                         cmt0_taken_br;
 wire cmt1_dual_effect = cmt0_effect && !cmt0_flush && cmt1_ready &&
                         !cmt1_single_limit && !cmt1_store_block &&
                         !cmt1_ibar_block && !cmt1_cacop_block;
@@ -412,7 +423,13 @@ wire selected_effect = take_slot1_for_csr ? cmt1_head_effect : cmt0_effect;
 wire selected_excp_take = int_take || (take_slot1_for_csr ? (cmt1_ready && cmt1_has_excp)
                                                           : (cmt0_ready && cmt0_has_excp));
 wire selected_csr_nofush = take_slot1_for_csr ? cmt1_csr_nofush : cmt0_csr_nofush;
+`ifdef CACOP_NO_REFETCH
+wire selected_priv_flush = selected_effect && (|sel_priv)
+                         && !selected_csr_nofush
+                         && !sel_priv[`PRIV_CACOP];
+`else
 wire selected_priv_flush = selected_effect && (|sel_priv) && !selected_csr_nofush;
+`endif
 wire selected_mispred = take_slot1_for_csr ? cmt1_mispred_head : cmt0_mispred;
 
 wire mem_excp = sel_excp[`EXCP_ADEM] | sel_excp[`EXCP_ALE] |

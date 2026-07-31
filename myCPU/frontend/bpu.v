@@ -7,8 +7,7 @@
 // - PC 更新优先级：flush > predec > P1 覆盖 > ftq_full 冻结 > P0 顺序；
 // - 训练：FTB 全分支、TAGE 仅 COND、uBTB 仅向回跳（模块内过滤）；
 // - RAS 双栈：P1 预测 CALL/RET 维护推测栈，flush 复制提交栈；
-// - JTC 仅记录普通 JIRL；预译码可提前训练 uBTB/FTB，并通过单项 skid
-//   与优先级更高的提交训练仲裁。
+// - 预译码可提前训练 uBTB/FTB，并通过单项 skid 与优先级更高的提交训练仲裁。
 // ============================================================
 `include "mycpu.h"
 
@@ -45,6 +44,8 @@ module bpu(
 
     output wire                       p1_valid_o,
     output wire                       p1_meta_valid_o,
+    output wire                       p1_desc_valid_o,
+    output wire                       p0_retry_pending_o,
     output wire [`BLK_LEN_W-1:0]      p1_length_o,
     output wire                       p1_taken_o,
     output wire [31:0]                p1_target_o,
@@ -57,7 +58,6 @@ module bpu(
     input  wire                       train_mispred_i,
     input  wire [31:0]                train_target_i,
     input  wire [`BR_TYPE_W-1:0]      train_br_type_i,
-    input  wire                       train_is_direct_b_i,  // JTC 不训练直接跳转 B
     input  wire [`BLK_LEN_W+1:2]      train_fall_through_i, // 顺序出口的块内字偏移
     input  wire [`BPU_META_W-1:0]     train_meta_i,
 
@@ -85,14 +85,18 @@ reg [`BLK_LEN_W-1:0] p0_length_r;
 reg        p0_taken_r;
 reg [31:0] p0_target_r;
 reg        p0_ubtb_hit_r;
+reg        p0_fallback_hit_r;
+reg        p0_fallback_predict_r;
 reg [`BR_TYPE_W-1:0] p0_btype_r;
+reg        p0_retry_pending_r;
 wire                       ubtb_hit;
-wire                       jtc_hit;
-wire                       p0_jtc_select;
+wire                       fallback_use;
+wire                       fallback_predict;
 wire [`BR_TYPE_W-1:0]      p0_btype_c;
 
 initial begin
     pc = 32'h1c000000;
+    p0_retry_pending_r = 1'b0;
 end
 
 // FTQ almost-full（留 2 槽）采用两拍冻结：首拍照常查询和写入，
@@ -113,18 +117,34 @@ always @(posedge clk) begin
         p0_taken_r  <= p0_taken_o;
         p0_target_r <= p0_target_o;
         p0_ubtb_hit_r <= ubtb_hit;
+        p0_fallback_hit_r <= fallback_use;
+        p0_fallback_predict_r <= fallback_predict;
         p0_btype_r    <= p0_btype_c;
     end
     pc_r <= pc;
 end
 
-// ---------------- 子模块：uBTB / JTC / FTB / TAGE / RAS ----------------
+// ---------------- 子模块：uBTB / FTB / TAGE / RAS ----------------
 wire                       ubtb_taken;
 wire [31:0]                ubtb_target;
 wire [`BLK_LEN_W-1:0]      ubtb_length;
 wire [`BR_TYPE_W-1:0]      ubtb_btype;
-wire [31:0]                jtc_target;
-wire [`BLK_LEN_W-1:0]      jtc_length;
+wire                       fallback_hit;
+wire                       fallback_taken;
+wire [31:0]                fallback_target;
+wire [`BLK_LEN_W-1:0]      fallback_length;
+wire [`BR_TYPE_W-1:0]      fallback_btype;
+wire                       fallback_strong_taken;
+wire                       fallback_static_direct;
+assign fallback_use = !ubtb_hit && fallback_hit;
+// The direct-mapped fallback is allowed to steer P0 only for descriptors
+// that are safe or highly confident.  All hits may still supply block length.
+assign fallback_predict =
+    fallback_use &&
+    (((fallback_btype == `BR_TYPE_COND) && fallback_strong_taken) ||
+     (((fallback_btype == `BR_TYPE_UNCOND) ||
+       (fallback_btype == `BR_TYPE_CALL)) && fallback_static_direct) ||
+     ((fallback_btype == `BR_TYPE_RET) && !ras_empty));
 
 wire                       ftb_hit;
 wire                       ftb_resp_valid;
@@ -164,77 +184,136 @@ always @(posedge clk) begin
         ras_ftq_alloc_ptr <= ras_ftq_alloc_ptr + 1'b1;
 end
 
-wire query_en = ~ftq_freeze && ~flush_i;
+// Keep predictor lookups independent of FTQ backpressure.  While frozen the
+// PC is held and p0_valid_o is suppressed, so these responses are discarded;
+// allowing the harmless lookup prevents ftq_full (which depends on the ROB
+// release side) from entering fallback-hit/block-length/next-PC logic.
+wire predictor_query_en = ~flush_i;
+wire query_en = predictor_query_en && ~ftq_freeze;
 
 wire [`BLK_LEN_W-1:0] ubtb_train_len =
     train_fall_through_i - train_pc_i[`BLK_LEN_W+1:2];
 
-// IFU 预译码可在提交前给出可信描述符。
-// 一拍 skid 在与单口 commit 训练冲突时保留；commit 无损优先。
-// skid 已占时再来的第二拍预译码直接丢弃（不堵前端）。
-reg                        predec_train_pending;
-reg [31:0]                 predec_train_pc_r;
-reg [31:0]                 predec_train_target_r;
-reg [`BLK_LEN_W-1:0]       predec_train_length_r;
-reg                        predec_train_taken_r;
-reg [`BR_TYPE_W-1:0]       predec_train_btype_r;
+// IFU predecode can provide a trustworthy descriptor before commit.  Commit
+// remains lossless and has priority; a two-entry FIFO absorbs consecutive
+// collisions.  Repeated updates to the newest queued block are coalesced.
+localparam PREDEC_TRAIN_Q_DEPTH = 2;
+localparam PREDEC_TRAIN_Q_PTR_W = 1;
+localparam PREDEC_TRAIN_Q_CNT_W = 2;
+
+reg [31:0]                 predec_q_pc [0:PREDEC_TRAIN_Q_DEPTH-1];
+reg [31:0]                 predec_q_target [0:PREDEC_TRAIN_Q_DEPTH-1];
+reg [`BLK_LEN_W-1:0]       predec_q_length [0:PREDEC_TRAIN_Q_DEPTH-1];
+reg                        predec_q_taken [0:PREDEC_TRAIN_Q_DEPTH-1];
+reg [`BR_TYPE_W-1:0]       predec_q_btype [0:PREDEC_TRAIN_Q_DEPTH-1];
+reg [PREDEC_TRAIN_Q_PTR_W-1:0] predec_q_rptr;
+reg [PREDEC_TRAIN_Q_PTR_W-1:0] predec_q_wptr;
+reg [PREDEC_TRAIN_Q_CNT_W-1:0] predec_q_count;
 
 wire commit_btb_update = train_valid_i && train_is_branch_i;
 wire predec_btb_update = predec_redirect_i;
-wire service_predec_pending = predec_train_pending && !commit_btb_update;
-wire service_predec_current = !predec_train_pending &&
-                              predec_btb_update && !commit_btb_update;
-// 预译码早期训练与 JTC 的 P0 选择相互独立。
+wire predec_q_empty =
+    (predec_q_count == {PREDEC_TRAIN_Q_CNT_W{1'b0}});
+wire predec_q_full = (predec_q_count == PREDEC_TRAIN_Q_DEPTH);
+wire service_predec_pending = !predec_q_empty && !commit_btb_update;
+// Always register IFU predecode training in the small FIFO before it reaches
+// uBTB/fallback/FTB write enables.  The former empty-queue direct service made
+// IFU tail/predecode logic drive hundreds of predictor array CEs in one cycle.
+wire service_predec_current = 1'b0;
 wire btb_update_early = service_predec_pending || service_predec_current;
 wire btb_update_valid = commit_btb_update || btb_update_early;
 wire [31:0] btb_update_pc =
     commit_btb_update      ? train_pc_i :
-    service_predec_pending ? predec_train_pc_r : predec_block_pc_i;
+    service_predec_pending ? predec_q_pc[predec_q_rptr] : 32'b0;
 wire [31:0] btb_update_target =
     commit_btb_update      ? train_target_i :
-    service_predec_pending ? predec_train_target_r :
-                             predec_branch_target_i;
+    service_predec_pending ? predec_q_target[predec_q_rptr] :
+                             32'b0;
 wire [`BLK_LEN_W-1:0] btb_update_length =
     commit_btb_update      ? ubtb_train_len :
-    service_predec_pending ? predec_train_length_r : predec_length_i;
+    service_predec_pending ? predec_q_length[predec_q_rptr] :
+                             {`BLK_LEN_W{1'b0}};
 wire btb_update_taken =
     commit_btb_update      ? train_taken_i :
-    service_predec_pending ? predec_train_taken_r : predec_taken_i;
+    service_predec_pending ? predec_q_taken[predec_q_rptr] : 1'b0;
 wire [`BR_TYPE_W-1:0] btb_update_btype =
     commit_btb_update      ? train_br_type_i :
-    service_predec_pending ? predec_train_btype_r : predec_br_type_i;
+    service_predec_pending ? predec_q_btype[predec_q_rptr] :
+                             {`BR_TYPE_W{1'b0}};
 wire [`BLK_LEN_W+1:2] btb_update_fall_through =
     btb_update_pc[`BLK_LEN_W+1:2] + btb_update_length;
 
+wire predec_q_dequeue = service_predec_pending;
+wire predec_needs_queue = predec_btb_update && !service_predec_current;
+wire [PREDEC_TRAIN_Q_PTR_W-1:0] predec_q_tail_ptr =
+    predec_q_wptr - {{(PREDEC_TRAIN_Q_PTR_W-1){1'b0}}, 1'b1};
+wire predec_matches_tail =
+    !predec_q_empty &&
+    (predec_q_pc[predec_q_tail_ptr] == predec_block_pc_i);
+wire predec_tail_is_dequeue =
+    predec_q_dequeue &&
+    (predec_q_count == {{(PREDEC_TRAIN_Q_CNT_W-1){1'b0}}, 1'b1});
+wire predec_q_merge_tail =
+    predec_needs_queue && predec_matches_tail && !predec_tail_is_dequeue;
+wire predec_q_enqueue =
+    predec_needs_queue && !predec_q_merge_tail &&
+    (!predec_q_full || predec_q_dequeue);
+wire predec_q_overflow =
+    predec_needs_queue && !predec_q_merge_tail &&
+    predec_q_full && !predec_q_dequeue;
+wire [PREDEC_TRAIN_Q_CNT_W-1:0] predec_q_count_next =
+    (predec_q_enqueue && !predec_q_dequeue) ?
+        predec_q_count + {{(PREDEC_TRAIN_Q_CNT_W-1){1'b0}}, 1'b1} :
+    (!predec_q_enqueue && predec_q_dequeue) ?
+        predec_q_count - {{(PREDEC_TRAIN_Q_CNT_W-1){1'b0}}, 1'b1} :
+        predec_q_count;
+
+// FTB entries describe the static branch position/type/target.  Rewriting an
+// already-hit conditional branch or RET on every commit only consumes update
+// bandwidth; uBTB still receives every commit below to train its direction
+// counter.  Keep all misses, early-predecode fills and potentially dynamic
+// UNCOND/CALL targets.
+wire commit_ftb_known_hit =
+    train_meta_i[META_FTB_RESP_BIT] && train_meta_i[META_FTB_HIT_BIT];
+wire commit_ftb_static_descriptor =
+    (train_br_type_i == `BR_TYPE_COND) ||
+    (train_br_type_i == `BR_TYPE_RET);
+wire ftb_commit_update_filtered =
+    commit_btb_update && commit_ftb_known_hit && commit_ftb_static_descriptor;
+wire ftb_update_valid = btb_update_valid && !ftb_commit_update_filtered;
+
 always @(posedge clk) begin
     if (reset) begin
-        predec_train_pending <= 1'b0;
-    end else if (commit_btb_update) begin
-        if (predec_btb_update && !predec_train_pending) begin
-            predec_train_pending  <= 1'b1;
-            predec_train_pc_r     <= predec_block_pc_i;
-            predec_train_target_r <= predec_branch_target_i;
-            predec_train_length_r <= predec_length_i;
-            predec_train_taken_r  <= predec_taken_i;
-            predec_train_btype_r  <= predec_br_type_i;
+        predec_q_rptr  <= {PREDEC_TRAIN_Q_PTR_W{1'b0}};
+        predec_q_wptr  <= {PREDEC_TRAIN_Q_PTR_W{1'b0}};
+        predec_q_count <= {PREDEC_TRAIN_Q_CNT_W{1'b0}};
+    end else begin
+        if (predec_q_merge_tail) begin
+            predec_q_pc[predec_q_tail_ptr]     <= predec_block_pc_i;
+            predec_q_target[predec_q_tail_ptr] <= predec_branch_target_i;
+            predec_q_length[predec_q_tail_ptr] <= predec_length_i;
+            predec_q_taken[predec_q_tail_ptr]  <= predec_taken_i;
+            predec_q_btype[predec_q_tail_ptr]  <= predec_br_type_i;
+        end else if (predec_q_enqueue) begin
+            predec_q_pc[predec_q_wptr]     <= predec_block_pc_i;
+            predec_q_target[predec_q_wptr] <= predec_branch_target_i;
+            predec_q_length[predec_q_wptr] <= predec_length_i;
+            predec_q_taken[predec_q_wptr]  <= predec_taken_i;
+            predec_q_btype[predec_q_wptr]  <= predec_br_type_i;
+            predec_q_wptr <= predec_q_wptr +
+                {{(PREDEC_TRAIN_Q_PTR_W-1){1'b0}}, 1'b1};
         end
-    end else if (predec_train_pending) begin
-        if (predec_btb_update) begin
-            predec_train_pending  <= 1'b1;
-            predec_train_pc_r     <= predec_block_pc_i;
-            predec_train_target_r <= predec_branch_target_i;
-            predec_train_length_r <= predec_length_i;
-            predec_train_taken_r  <= predec_taken_i;
-            predec_train_btype_r  <= predec_br_type_i;
-        end else begin
-            predec_train_pending <= 1'b0;
-        end
+        if (predec_q_dequeue)
+            predec_q_rptr <= predec_q_rptr +
+                {{(PREDEC_TRAIN_Q_PTR_W-1){1'b0}}, 1'b1};
+        predec_q_count <= predec_q_count_next;
     end
 end
 
 ubtb u_ubtb(
     .clk               (clk),
     .reset             (reset),
+    .query_valid_i     (query_en),
     .query_pc_i        (pc),
     .hit_o             (ubtb_hit),
     .taken_o           (ubtb_taken),
@@ -250,21 +329,29 @@ ubtb u_ubtb(
     .update_early_i    (btb_update_early)
 );
 
-// 普通 JIRL 目标缓存，仅由 commit 训练，并排除直接跳转 B。
-jirl_target_cache u_jirl_target_cache(
+fallback_btb u_fallback_btb(
     .clk               (clk),
     .reset             (reset),
-    .query_valid_i     (query_en),
-    .query_pc_i        (pc[31:2]),
-    .hit_o             (jtc_hit),
-    .target_o          (jtc_target),
-    .length_o          (jtc_length),
-    .update_valid_i    (commit_btb_update &&
-                        (train_br_type_i == `BR_TYPE_UNCOND) &&
-                        !train_is_direct_b_i),
-    .update_block_pc_i (train_pc_i[31:2]),
-    .update_target_i   (train_target_i),
-    .update_length_i   (ubtb_train_len)
+    // This small two-way table also supplies P0's fast block length.  Keep
+    // its lookup independent of the fully-associative uBTB hit so the
+    // sequential next-PC path never waits for the uBTB length mux.
+    .query_valid_i     (predictor_query_en),
+    .query_pc_i        (pc),
+    .hit_o             (fallback_hit),
+    .taken_o           (fallback_taken),
+    .target_o          (fallback_target),
+    .length_o          (fallback_length),
+    .br_type_o         (fallback_btype),
+    .strong_taken_o    (fallback_strong_taken),
+    .static_direct_o   (fallback_static_direct),
+    // Training remains independent of FTB filtering.
+    .update_valid_i    (btb_update_valid),
+    .update_block_pc_i (btb_update_pc),
+    .update_taken_i    (btb_update_taken),
+    .update_target_i   (btb_update_target),
+    .update_length_i   (btb_update_length),
+    .update_br_type_i  (btb_update_btype),
+    .update_early_i    (btb_update_early)
 );
 
 ftb u_ftb(
@@ -278,7 +365,7 @@ ftb u_ftb(
     .jump_target_o       (ftb_target),
     .fall_through_o      (ftb_fall),
     .br_type_o           (ftb_btype),
-    .update_valid_i      (btb_update_valid),
+    .update_valid_i      (ftb_update_valid),
     .update_block_pc_i   (btb_update_pc[31:2]),
     .update_jump_target_i(btb_update_target),
     .update_fall_through_i(btb_update_fall_through),
@@ -340,26 +427,30 @@ wire [3:0] words_to_eol = `CACHE_LINE_WORDS - {1'b0, pc[`CACHE_LINE_W-1:2]};
 wire [`BLK_LEN_W-1:0] base_len = (words_to_eol > `FETCH_WIDTH) ? `FETCH_WIDTH
                                  : words_to_eol[`BLK_LEN_W-1:0];
 
-// uBTB 未命中时，JTC 命中可把 P0 预测为跳向缓存目标。该选择默认关闭：
-// 当前间接跳恢复路径尚未满足全量 Linux difftest，启用前必须重新完成该回归。
-`ifndef JIRL_TC_P0_ENABLE
-`define JIRL_TC_P0_ENABLE 0
-`endif
-assign p0_jtc_select = (`JIRL_TC_P0_ENABLE != 0) && !ubtb_hit && jtc_hit &&
-                       (jtc_length != {`BLK_LEN_W{1'b0}}) &&
-                       (jtc_length <= base_len);
+// The uBTB still owns direction/target selection, but its 16-way length mux
+// is deliberately excluded from next-PC generation.  The larger fallback
+// table is trained by the same updates and provides a short two-way length
+// lookup; on a miss, fetching to the line/fetch boundary is always safe and
+// P1/FTB will correct the descriptor if necessary.
+wire fast_length_hit = fallback_hit && (fallback_length <= base_len);
 wire [`BLK_LEN_W-1:0] p0_len_raw =
-    (ubtb_hit && (ubtb_length <= base_len)) ? ubtb_length :
-    p0_jtc_select                            ? jtc_length : base_len;
+    fast_length_hit ? fallback_length : base_len;
 wire [`BLK_LEN_W-1:0] p0_len_c = (p0_len_raw === 3'd0 || p0_len_raw === 3'bx || p0_len_raw === 3'dz)
                                  ? 3'd1 : p0_len_raw;
-wire                  p0_taken_c = ubtb_hit ? ubtb_taken : p0_jtc_select;
+wire                  p0_taken_c =
+    ubtb_hit ? ubtb_taken :
+    fallback_predict && fallback_taken;
+wire [`BR_TYPE_W-1:0] p0_selected_btype =
+    ubtb_hit          ? ubtb_btype :
+    fallback_predict  ? fallback_btype :
+                        `BR_TYPE_COND;
 wire [31:0]           p0_target_c =
-    (ubtb_hit && (ubtb_btype == `BR_TYPE_RET) && !ras_empty) ? ras_top :
-    ubtb_hit                                                   ? ubtb_target :
-                                                                 jtc_target;
-assign p0_btype_c = ubtb_hit ? ubtb_btype :
-                      p0_jtc_select ? `BR_TYPE_UNCOND : `BR_TYPE_COND;
+    ((ubtb_hit || fallback_predict) &&
+     (p0_selected_btype == `BR_TYPE_RET) && !ras_empty) ? ras_top :
+    ubtb_hit                                             ? ubtb_target :
+    fallback_predict                                     ? fallback_target :
+                                                           32'b0;
+assign p0_btype_c = p0_selected_btype;
 
 // P1 覆盖拍必须压掉 P0：此拍的 pc 是被 P1 否定的错误路径延续，
 // 若照写会在 FTQ 中留下一个"元数据不跳、取指流却已跳走"的幽灵块，
@@ -382,7 +473,8 @@ wire [`BLK_LEN_W-1:0] p1_len_mid   = (p1_len_raw === 3'd0) ? 3'd1 :
                                    (p1_len_raw > `FETCH_WIDTH) ? `FETCH_WIDTH : p1_len_raw;
 wire [`BLK_LEN_W-1:0] p1_len_c   = (p1_len_mid === 3'bx || p1_len_mid === 3'dz) ? 3'd1 : p1_len_mid;
 
-wire p1_taken_c = (ftb_btype == `BR_TYPE_COND) ? tage_taken : 1'b1;
+wire p1_taken_c = (ftb_btype == `BR_TYPE_COND)
+                ? tage_taken : 1'b1;
 wire [31:0] p1_target_c = (ftb_btype == `BR_TYPE_RET && !ras_empty) ? ras_top :
                           (ftb_btype == `BR_TYPE_RET) ? ftb_fall : ftb_target;
 
@@ -409,10 +501,30 @@ end
 
 assign p1_valid_o   = p1_diff;
 assign p1_meta_valid_o = p1_result_valid; // 保持每次 P1 结果写 meta（训练覆盖优于收窄）
-assign p1_length_o  = p1_len_c;
-assign p1_taken_o   = p1_taken_c;
-assign p1_target_o  = p1_target_c;
+// Settle one descriptor for every allocated P0 block.  FTB hits use the P1
+// descriptor; misses retain the registered P0 descriptor.  FTQ can therefore
+// write its descriptor array only at this fixed P1 point, independent of
+// p1_diff, instead of multiplexing P0 and correction writes with TAGE control.
+wire p1_desc_use_ftb = ftb_resp_valid && ftb_hit;
+assign p1_desc_valid_o = p1_result_valid;
+assign p1_length_o  = p1_desc_use_ftb ? p1_len_c    : p0_length_r;
+assign p1_taken_o   = p1_desc_use_ftb ? p1_taken_c  : p0_taken_r;
+assign p1_target_o  = p1_desc_use_ftb ? p1_target_c : p0_target_r;
 assign p1_meta_o    = p1_meta_pack;
+
+// A correction may coincide with a speculative P0 for the wrong path.  FTQ
+// reserves that P0 slot immediately and overwrites it with the corrected P0
+// on the next available query cycle.  Export the cancellation as registered
+// state so p1_diff no longer drives FTQ pointer/array controls combinationally.
+always @(posedge clk) begin
+    if (reset || flush_i || predec_redirect_i)
+        p0_retry_pending_r <= 1'b0;
+    else if (p1_diff && p0_valid_o)
+        p0_retry_pending_r <= 1'b1;
+    else if (p0_retry_pending_r && p0_valid_o)
+        p0_retry_pending_r <= 1'b0;
+end
+assign p0_retry_pending_o = p0_retry_pending_r;
 
 wire [31:0] p1_next = p1_taken_c ? p1_target_c : ftb_fall;
 
@@ -420,8 +532,9 @@ wire [31:0] p1_next = p1_taken_c ? p1_target_c : ftb_fall;
 // FTB 未命中时，FTQ 保留 P0 的 uBTB 描述符，因此用该描述符执行同样的更新。
 wire p1_ras_settle = p1_result_valid && !reset;
 wire p1_ftb_branch_valid = p1_ras_settle && ftb_resp_valid && ftb_hit;
-wire p1_ubtb_branch_valid = p1_ras_settle && !p1_ftb_branch_valid && p0_ubtb_hit_r;
-wire p1_ras_event_valid = p1_ftb_branch_valid || p1_ubtb_branch_valid;
+wire p1_p0_branch_valid = p1_ras_settle && !p1_ftb_branch_valid &&
+                          (p0_ubtb_hit_r || p0_fallback_predict_r);
+wire p1_ras_event_valid = p1_ftb_branch_valid || p1_p0_branch_valid;
 wire [`BR_TYPE_W-1:0] p1_ras_btype =
     p1_ftb_branch_valid ? ftb_btype : p0_btype_r;
 wire [31:0] p1_ras_fall_through =
@@ -439,9 +552,27 @@ assign ras_checkpoint_id   = ras_ftq_alloc_ptr - 1'b1;
 assign ras_spec_push       = p1_ras_push;
 assign ras_spec_push_addr  = p1_ras_fall_through;
 assign ras_spec_pop        = p1_ras_pop;
-assign p1_hist_update_valid = p1_ras_event_valid &&
-                              (p1_ras_btype == `BR_TYPE_COND);
-assign p1_hist_update_taken = p1_ftb_branch_valid ? p1_taken_c : p0_taken_r;
+// History forwarding is used only to form the next TAGE query index.  Keep it
+// independent of IFU predecode cancellation: a redirect suppresses the current
+// P0 allocation, and TAGE restores the checkpoint with higher sequential
+// priority, so that cycle's query response is discarded.  Using the registered
+// P1 event here cuts the IF-line -> predecoder -> folded-history timing cone.
+wire p1_hist_settle = p0_wrote_r && !ftq_freeze_r && !flush_r &&
+                      !flush_i && tage_resp_valid && !reset;
+wire p1_hist_ftb_branch_valid =
+    p1_hist_settle && ftb_resp_valid && ftb_hit;
+wire p1_hist_p0_branch_valid =
+    p1_hist_settle && !p1_hist_ftb_branch_valid &&
+    (p0_ubtb_hit_r || p0_fallback_predict_r);
+wire p1_hist_event_valid =
+    p1_hist_ftb_branch_valid || p1_hist_p0_branch_valid;
+wire [`BR_TYPE_W-1:0] p1_hist_btype =
+    p1_hist_ftb_branch_valid ? ftb_btype : p0_btype_r;
+
+assign p1_hist_update_valid = p1_hist_event_valid &&
+                              (p1_hist_btype == `BR_TYPE_COND);
+assign p1_hist_update_taken =
+    p1_hist_ftb_branch_valid ? p1_taken_c : p0_taken_r;
 
 
 `ifdef SYNTHESIS
@@ -451,6 +582,24 @@ reg [63:0] commit_cond_mispred_count;
 // mycpu_top 使用：训练口全分支与条件分支精度。
 reg [63:0] commit_all_branch_count;
 reg [63:0] commit_all_mispred_count;
+// P1 correction来源统计：uBTB命中/未命中，以及方向、目标、块长差异。
+reg [63:0] p1_correction_count;
+reg [63:0] p1_correction_from_ubtb_hit_count;
+reg [63:0] p1_correction_from_ubtb_miss_count;
+reg [63:0] p1_correction_direction_count;
+reg [63:0] p1_correction_target_count;
+reg [63:0] p1_correction_length_count;
+reg [63:0] ftb_commit_update_request_count;
+reg [63:0] ftb_commit_update_filtered_count;
+reg [63:0] ftb_update_sent_count;
+reg [63:0] ftb_predec_update_sent_count;
+reg [63:0] predec_train_request_count;
+reg [63:0] predec_train_direct_count;
+reg [63:0] predec_train_enqueue_count;
+reg [63:0] predec_train_merge_count;
+reg [63:0] predec_train_dequeue_count;
+reg [63:0] predec_train_overflow_count;
+reg [63:0] predec_train_queue_max_occupancy;
 
 wire stat_commit_cond = train_valid_i && train_is_branch_i && (train_br_type_i == `BR_TYPE_COND);
 wire stat_commit_br   = train_valid_i && train_is_branch_i;
@@ -461,7 +610,51 @@ always @(posedge clk) begin
         commit_cond_mispred_count <= 64'd0;
         commit_all_branch_count <= 64'd0;
         commit_all_mispred_count <= 64'd0;
+        p1_correction_count <= 64'd0;
+        p1_correction_from_ubtb_hit_count <= 64'd0;
+        p1_correction_from_ubtb_miss_count <= 64'd0;
+        p1_correction_direction_count <= 64'd0;
+        p1_correction_target_count <= 64'd0;
+        p1_correction_length_count <= 64'd0;
+        ftb_commit_update_request_count <= 64'd0;
+        ftb_commit_update_filtered_count <= 64'd0;
+        ftb_update_sent_count <= 64'd0;
+        ftb_predec_update_sent_count <= 64'd0;
+        predec_train_request_count <= 64'd0;
+        predec_train_direct_count <= 64'd0;
+        predec_train_enqueue_count <= 64'd0;
+        predec_train_merge_count <= 64'd0;
+        predec_train_dequeue_count <= 64'd0;
+        predec_train_overflow_count <= 64'd0;
+        predec_train_queue_max_occupancy <= 64'd0;
     end else begin
+        if (predec_btb_update)
+            predec_train_request_count <= predec_train_request_count + 64'd1;
+        if (service_predec_current)
+            predec_train_direct_count <= predec_train_direct_count + 64'd1;
+        if (predec_q_enqueue)
+            predec_train_enqueue_count <= predec_train_enqueue_count + 64'd1;
+        if (predec_q_merge_tail)
+            predec_train_merge_count <= predec_train_merge_count + 64'd1;
+        if (predec_q_dequeue)
+            predec_train_dequeue_count <= predec_train_dequeue_count + 64'd1;
+        if (predec_q_overflow)
+            predec_train_overflow_count <= predec_train_overflow_count + 64'd1;
+        if ({{(64-PREDEC_TRAIN_Q_CNT_W){1'b0}}, predec_q_count_next} >
+            predec_train_queue_max_occupancy)
+            predec_train_queue_max_occupancy <=
+                {{(64-PREDEC_TRAIN_Q_CNT_W){1'b0}}, predec_q_count_next};
+        if (commit_btb_update)
+            ftb_commit_update_request_count <=
+                ftb_commit_update_request_count + 64'd1;
+        if (ftb_commit_update_filtered)
+            ftb_commit_update_filtered_count <=
+                ftb_commit_update_filtered_count + 64'd1;
+        if (ftb_update_valid)
+            ftb_update_sent_count <= ftb_update_sent_count + 64'd1;
+        if (ftb_update_valid && btb_update_early)
+            ftb_predec_update_sent_count <=
+                ftb_predec_update_sent_count + 64'd1;
         if (stat_commit_br) begin
             commit_all_branch_count <= commit_all_branch_count + 64'd1;
             if (train_mispred_i)
@@ -471,6 +664,24 @@ always @(posedge clk) begin
             commit_cond_branch_count <= commit_cond_branch_count + 64'd1;
             if (train_mispred_i)
                 commit_cond_mispred_count <= commit_cond_mispred_count + 64'd1;
+        end
+        if (p1_diff) begin
+            p1_correction_count <= p1_correction_count + 64'd1;
+            if (p0_ubtb_hit_r)
+                p1_correction_from_ubtb_hit_count <=
+                    p1_correction_from_ubtb_hit_count + 64'd1;
+            else
+                p1_correction_from_ubtb_miss_count <=
+                    p1_correction_from_ubtb_miss_count + 64'd1;
+            if (p1_direction_diff)
+                p1_correction_direction_count <=
+                    p1_correction_direction_count + 64'd1;
+            if (p1_target_diff)
+                p1_correction_target_count <=
+                    p1_correction_target_count + 64'd1;
+            if (p1_block_len_diff)
+                p1_correction_length_count <=
+                    p1_correction_length_count + 64'd1;
         end
     end
 end
@@ -492,95 +703,5 @@ always @(posedge clk) begin
     else if (!ftq_freeze)
         pc <= p0_next;
 end
-
-endmodule
-
-// ============================================================
-// jirl_target_cache 模块（普通 JIRL 目标缓存）
-// ------------------------------------------------------------
-// 直接映射、组合读，使其可参与 BPU P0 预测。目标连续观察两次后才可用，
-// 以一次预热为代价降低多态或快速变化的间接目标造成的错误预测。
-// RAS 处理 CALL/RET；JTC 只处理 BR_TYPE_UNCOND 且非 direct_b 的普通 JIRL。
-// ============================================================
-module jirl_target_cache(
-    input  wire                       clk,
-    input  wire                       reset,
-    input  wire                       query_valid_i,
-    input  wire [31:2]                query_pc_i,
-    output wire                       hit_o,
-    output wire [31:0]                target_o,
-    output wire [`BLK_LEN_W-1:0]      length_o,
-    input  wire                       update_valid_i,
-    input  wire [31:2]                update_block_pc_i,
-    input  wire [31:0]                update_target_i,
-    input  wire [`BLK_LEN_W-1:0]      update_length_i
-);
-
-localparam JTC_TAG_W = 32 - 2 - `JIRL_TC_INDEX_W;
-
-reg [`JIRL_TC_SIZE-1:0] valid;
-(* ram_style = "distributed" *)
-reg [JTC_TAG_W-1:0] tag [0:`JIRL_TC_SIZE-1];
-(* ram_style = "distributed" *)
-reg [31:0] target [0:`JIRL_TC_SIZE-1];
-reg [`BLK_LEN_W-1:0] length [0:`JIRL_TC_SIZE-1];
-reg [1:0] confidence [0:`JIRL_TC_SIZE-1];
-
-wire [`JIRL_TC_INDEX_W-1:0] q_idx =
-    query_pc_i[2 +: `JIRL_TC_INDEX_W];
-wire [JTC_TAG_W-1:0] q_tag =
-    query_pc_i[31 -: JTC_TAG_W];
-wire q_tag_hit = valid[q_idx] && (tag[q_idx] == q_tag);
-
-assign hit_o = query_valid_i && q_tag_hit && confidence[q_idx][1];
-assign target_o = target[q_idx];
-assign length_o = length[q_idx];
-
-wire [`JIRL_TC_INDEX_W-1:0] u_idx =
-    update_block_pc_i[2 +: `JIRL_TC_INDEX_W];
-wire [JTC_TAG_W-1:0] u_tag =
-    update_block_pc_i[31 -: JTC_TAG_W];
-wire u_tag_hit = valid[u_idx] && (tag[u_idx] == u_tag);
-wire u_target_same = u_tag_hit && (target[u_idx] == update_target_i);
-
-always @(posedge clk) begin
-    if (reset) begin
-        valid <= {`JIRL_TC_SIZE{1'b0}};
-    end else if (update_valid_i) begin
-        valid[u_idx]  <= 1'b1;
-        tag[u_idx]    <= u_tag;
-        target[u_idx] <= update_target_i;
-        length[u_idx] <= update_length_i;
-        if (!u_tag_hit || !u_target_same)
-            confidence[u_idx] <= 2'd1;
-        else if (confidence[u_idx] != 2'd3)
-            confidence[u_idx] <= confidence[u_idx] + 2'd1;
-    end
-end
-
-`ifdef SYNTHESIS
-// synthesis translate_off
-// 性能计数：JTC 查询命中、未命中与训练次数。
-reg [63:0] jtc_query_hit;
-reg [63:0] jtc_query_miss;
-reg [63:0] jtc_train_updates;
-always @(posedge clk) begin
-    if (reset) begin
-        jtc_query_hit     <= 64'd0;
-        jtc_query_miss    <= 64'd0;
-        jtc_train_updates <= 64'd0;
-    end else begin
-        if (query_valid_i) begin
-            if (hit_o)
-                jtc_query_hit  <= jtc_query_hit + 64'd1;
-            else
-                jtc_query_miss <= jtc_query_miss + 64'd1;
-        end
-        if (update_valid_i)
-            jtc_train_updates <= jtc_train_updates + 64'd1;
-    end
-end
-// synthesis translate_on
-`endif
 
 endmodule

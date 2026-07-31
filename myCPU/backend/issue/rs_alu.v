@@ -59,6 +59,11 @@ module rs_alu(
     input  wire                       wb2_valid_i,       // lsu 写回
     input  wire [`ROB_W-1:0]          wb2_robid_i,
     input  wire [31:0]                wb2_data_i,
+    // LSU 命中拍专用旁路：只参与“本拍无普通可发项”时的 issue，
+    // 不写 RS 状态，下一拍仍由已寄存 wb2 正常捕获。
+    input  wire                       fast2_valid_i,
+    input  wire [`ROB_W-1:0]          fast2_robid_i,
+    input  wire [31:0]                fast2_data_i,
     input  wire                       wb3_valid_i,       // fu_mdu 写回
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
@@ -130,6 +135,10 @@ integer i;
 reg [`RS_ALU_IDX_W-1:0] free_idx;
 reg [`RS_ALU_IDX_W-1:0] issue_idx;
 reg                     issue_sel_valid;
+reg [`RS_ALU_IDX_W-1:0] base_issue_idx;
+reg [`RS_ALU_IDX_W-1:0] fast_issue_idx;
+reg                     base_issue_valid;
+reg                     fast_issue_valid;
 
 // 每项唤醒命中/旁路数据用【generate 预计算 wire 数组】而非 function 调用：
 // xsim 在 continuous assign 里对"带可变下标的 function"存在求值缺陷（见 rob.v），
@@ -140,6 +149,8 @@ wire            s0_wbhit [0:`RS_ALU_SIZE-1];
 wire            s1_wbhit [0:`RS_ALU_SIZE-1];
 wire            s0_earlyhit [0:`RS_ALU_SIZE-1];
 wire            s1_earlyhit [0:`RS_ALU_SIZE-1];
+wire            s0_fasttag [0:`RS_ALU_SIZE-1];
+wire            s1_fasttag [0:`RS_ALU_SIZE-1];
 wire [31:0]     s0_wbdat [0:`RS_ALU_SIZE-1];
 wire [31:0]     s1_wbdat [0:`RS_ALU_SIZE-1];
 genvar gw;
@@ -166,6 +177,13 @@ for (gw = 0; gw < `RS_ALU_SIZE; gw = gw + 1) begin : g_wake
                              ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
                               (early1_valid_i && (early1_robid_i == s1_robid[gw])) ||
                               (early2_valid_i && (early2_robid_i == s1_robid[gw])));
+    // Tag matching and the fast-candidate priority tree are independent of
+    // fast2_valid_i.  The D$ hit signal is applied only after the candidate
+    // index has been chosen, keeping it out of the oldest-first cascade.
+    assign s0_fasttag[gw] = !s0_val_valid[gw] &&
+                            (fast2_robid_i == s0_robid[gw]);
+    assign s1_fasttag[gw] = !s1_val_valid[gw] &&
+                            (fast2_robid_i == s1_robid[gw]);
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :
@@ -229,16 +247,43 @@ end
 always @(*) begin
     issue_idx = {`RS_ALU_IDX_W{1'b0}};
     issue_sel_valid = 1'b0;
+    base_issue_idx = {`RS_ALU_IDX_W{1'b0}};
+    fast_issue_idx = {`RS_ALU_IDX_W{1'b0}};
+    base_issue_valid = 1'b0;
+    fast_issue_valid = 1'b0;
     for (i = 0; i < `RS_ALU_SIZE; i = i + 1) begin
-        // 可发：已有真值，或本拍 WB 旁路可补。仅 early 的 ready 不够（无数据）。
+        // Ordinary candidates use only captured values or registered WBs.
         if (valid[i] &&
             ((s0_ready[i] && s0_val_valid[i]) || s0_wbhit[i]) &&
             ((s1_ready[i] && s1_val_valid[i]) || s1_wbhit[i]) &&
-            (!issue_sel_valid || (prior[i] < prior[issue_idx]))) begin
-            issue_idx = i[`RS_ALU_IDX_W-1:0];
-            issue_sel_valid = 1'b1;
+            (!base_issue_valid || (prior[i] < prior[base_issue_idx]))) begin
+            base_issue_idx = i[`RS_ALU_IDX_W-1:0];
+            base_issue_valid = 1'b1;
+        end
+        // A fast candidate must actually consume the current LSU tag and
+        // have every other source available.  Its priority tree is computed
+        // before fast2_valid_i arrives.
+        if (valid[i] &&
+            (((s0_ready[i] && s0_val_valid[i]) || s0_wbhit[i]) ||
+             s0_fasttag[i]) &&
+            (((s1_ready[i] && s1_val_valid[i]) || s1_wbhit[i]) ||
+             s1_fasttag[i]) &&
+            (s0_fasttag[i] || s1_fasttag[i]) &&
+            (!fast_issue_valid || (prior[i] < prior[fast_issue_idx]))) begin
+            fast_issue_idx = i[`RS_ALU_IDX_W-1:0];
+            fast_issue_valid = 1'b1;
         end
     end
+    // Preserve oldest-first issue across the two independently computed
+    // candidate trees.  fast2_valid_i only controls this final 2:1 choice;
+    // it is still absent from both four-entry priority scans.
+    if (fast2_valid_i && fast_issue_valid &&
+        (!base_issue_valid || (prior[fast_issue_idx] < prior[base_issue_idx])))
+        issue_idx = fast_issue_idx;
+    else
+        issue_idx = base_issue_idx;
+    issue_sel_valid = base_issue_valid ||
+                      (fast2_valid_i && fast_issue_valid);
 end
 
 assign issue_valid_o = issue_sel_valid;
@@ -249,8 +294,17 @@ assign issue_br_op_o = br_op[issue_idx];
 // 真值已捕获 → 用 s_val；仅 early 唤醒（val_valid=0）→ 本拍 WB 旁路补数
 wire s0_issue_wb = s0_wbhit[issue_idx];
 wire s1_issue_wb = s1_wbhit[issue_idx];
-assign issue_src0_o = s0_issue_wb ? s0_wbdat[issue_idx] : s0_val[issue_idx];
-assign issue_src1_o = s1_issue_wb ? s1_wbdat[issue_idx] : s1_val[issue_idx];
+wire issue_uses_fast = fast2_valid_i && fast_issue_valid &&
+                       (!base_issue_valid ||
+                        (prior[fast_issue_idx] < prior[base_issue_idx]));
+wire s0_issue_fast = issue_uses_fast && s0_fasttag[issue_idx] &&
+                     !s0_issue_wb;
+wire s1_issue_fast = issue_uses_fast && s1_fasttag[issue_idx] &&
+                     !s1_issue_wb;
+assign issue_src0_o = s0_issue_fast ? fast2_data_i :
+                      s0_issue_wb ? s0_wbdat[issue_idx] : s0_val[issue_idx];
+assign issue_src1_o = s1_issue_fast ? fast2_data_i :
+                      s1_issue_wb ? s1_wbdat[issue_idx] : s1_val[issue_idx];
 assign issue_imm_o = imm[issue_idx];
 assign issue_use_imm_o = use_imm[issue_idx];
 assign issue_br_offs_o = br_offs[issue_idx];

@@ -144,6 +144,15 @@ reg [IDXW-1:0] s0_index_r;
 reg [IDXW-1:0] s1_index_r;
 reg            s0_index_hit;
 reg            s1_index_hit;
+localparam GROUP_NUM = 4;
+localparam GROUP_SIZE = TLBNUM / GROUP_NUM;
+localparam GROUP_IDX_W = $clog2(GROUP_SIZE);
+reg [GROUP_NUM-1:0] s0_group_hit;
+reg [GROUP_NUM-1:0] s1_group_hit;
+reg [GROUP_NUM-1:0] srch_group_hit;
+reg [GROUP_IDX_W-1:0] s0_group_idx [0:GROUP_NUM-1];
+reg [GROUP_IDX_W-1:0] s1_group_idx [0:GROUP_NUM-1];
+reg [GROUP_IDX_W-1:0] srch_group_idx [0:GROUP_NUM-1];
 
 wire s0_sel_odd;
 wire s1_sel_odd;
@@ -183,26 +192,35 @@ assign inv_match = ((invtlb_op == 5'h0) || (invtlb_op == 5'h1)) ? ALL_ONE :
 assign s0_found = |match0;
 assign s1_found = |match1;
 
-integer idx0;
+// Two-level exact priority encoder.  Each quarter is encoded independently,
+// then the lowest matching quarter wins.  This preserves the original
+// lowest-index rule while avoiding a TLBNUM-entry serial priority chain.
+integer grp0;
+integer ent0;
 always @(*) begin
-    s0_index_r   = {IDXW{1'b0}};
-    s0_index_hit = 1'b0;
-    for (idx0 = 0; idx0 < TLBNUM; idx0 = idx0 + 1) begin
-        if (match0[idx0] && !s0_index_hit) begin
-            s0_index_r   = idx0[IDXW-1:0];
-            s0_index_hit = 1'b1;
+    s0_group_hit = {GROUP_NUM{1'b0}};
+    for (grp0 = 0; grp0 < GROUP_NUM; grp0 = grp0 + 1) begin
+        s0_group_idx[grp0] = {GROUP_IDX_W{1'b0}};
+        for (ent0 = 0; ent0 < GROUP_SIZE; ent0 = ent0 + 1) begin
+            if (match0[grp0*GROUP_SIZE+ent0] && !s0_group_hit[grp0]) begin
+                s0_group_idx[grp0] = ent0[GROUP_IDX_W-1:0];
+                s0_group_hit[grp0] = 1'b1;
+            end
         end
     end
 end
 
-integer idx1;
+integer grp1;
+integer ent1;
 always @(*) begin
-    s1_index_r   = {IDXW{1'b0}};
-    s1_index_hit = 1'b0;
-    for (idx1 = 0; idx1 < TLBNUM; idx1 = idx1 + 1) begin
-        if (match1[idx1] && !s1_index_hit) begin
-            s1_index_r   = idx1[IDXW-1:0];
-            s1_index_hit = 1'b1;
+    s1_group_hit = {GROUP_NUM{1'b0}};
+    for (grp1 = 0; grp1 < GROUP_NUM; grp1 = grp1 + 1) begin
+        s1_group_idx[grp1] = {GROUP_IDX_W{1'b0}};
+        for (ent1 = 0; ent1 < GROUP_SIZE; ent1 = ent1 + 1) begin
+            if (match1[grp1*GROUP_SIZE+ent1] && !s1_group_hit[grp1]) begin
+                s1_group_idx[grp1] = ent1[GROUP_IDX_W-1:0];
+                s1_group_hit[grp1] = 1'b1;
+            end
         end
     end
 end
@@ -210,13 +228,46 @@ end
 // srch 口 index 编码（与 s0/s1 相同的最低命中项优先规则）
 reg [IDXW-1:0] srch_index_r;
 reg            srch_index_hit;
-integer idxs;
+integer grps;
+integer ents;
 always @(*) begin
+    srch_group_hit = {GROUP_NUM{1'b0}};
+    for (grps = 0; grps < GROUP_NUM; grps = grps + 1) begin
+        srch_group_idx[grps] = {GROUP_IDX_W{1'b0}};
+        for (ents = 0; ents < GROUP_SIZE; ents = ents + 1) begin
+            if (match_srch[grps*GROUP_SIZE+ents] && !srch_group_hit[grps]) begin
+                srch_group_idx[grps] = ents[GROUP_IDX_W-1:0];
+                srch_group_hit[grps] = 1'b1;
+            end
+        end
+    end
+end
+
+integer pick0;
+integer pick1;
+integer picks;
+always @(*) begin
+    s0_index_r    = {IDXW{1'b0}};
+    s1_index_r    = {IDXW{1'b0}};
     srch_index_r   = {IDXW{1'b0}};
+    s0_index_hit   = 1'b0;
+    s1_index_hit   = 1'b0;
     srch_index_hit = 1'b0;
-    for (idxs = 0; idxs < TLBNUM; idxs = idxs + 1) begin
-        if (match_srch[idxs] && !srch_index_hit) begin
-            srch_index_r   = idxs[IDXW-1:0];
+    for (pick0 = 0; pick0 < GROUP_NUM; pick0 = pick0 + 1) begin
+        if (s0_group_hit[pick0] && !s0_index_hit) begin
+            s0_index_r   = {pick0[1:0], s0_group_idx[pick0]};
+            s0_index_hit = 1'b1;
+        end
+    end
+    for (pick1 = 0; pick1 < GROUP_NUM; pick1 = pick1 + 1) begin
+        if (s1_group_hit[pick1] && !s1_index_hit) begin
+            s1_index_r   = {pick1[1:0], s1_group_idx[pick1]};
+            s1_index_hit = 1'b1;
+        end
+    end
+    for (picks = 0; picks < GROUP_NUM; picks = picks + 1) begin
+        if (srch_group_hit[picks] && !srch_index_hit) begin
+            srch_index_r   = {picks[1:0], srch_group_idx[picks]};
             srch_index_hit = 1'b1;
         end
     end

@@ -52,6 +52,8 @@ module l1_tlb #(
     output wire [1:0]    plv_o,            // 页特权等级
     // 直发专用纯 CAM 锥：仅命中项缓存副本，不含主表透传腿。
     // 仅 CAM 命中时有意义；供 IFU ftq_direct_req 异常门控摘除主 TLB 归约。
+    output wire [19:0]   cam_ppn_o,
+    output wire [1:0]    cam_mat_o,
     output wire          cam_v_o,
     output wire [1:0]    cam_plv_o,
 
@@ -134,7 +136,10 @@ assign mat_o   = l1_hit ? hit_mat : tlb_mat_i;
 assign v_o     = l1_hit ? hit_v   : tlb_v_i;
 assign d_o     = l1_hit ? hit_d   : tlb_d_i;
 assign plv_o   = l1_hit ? hit_plv : tlb_plv_i;
-// 纯 CAM 锥输出：直接引出命中项缓存，综合器不会把主表 s0_v 独热 mux 算进此锥。
+// 纯 CAM 锥输出：直接引出命中项缓存，综合器不会把主表的全相联
+// 匹配/独热 mux 算进 IFU 同拍直发地址锥。
+assign cam_ppn_o = hit_ppn;
+assign cam_mat_o = hit_mat;
 assign cam_v_o   = hit_v;
 assign cam_plv_o = hit_plv;
 
@@ -145,11 +150,53 @@ wire refill_en = (req_valid_i === 1'b1) && !l1_hit
               && (tlb_found_i === 1'b1) && (tlb_ps_i == PS_4KB)
               && (fence_i !== 1'b1);
 
+// Capture a main-TLB hit before the L1 FIFO write.  The current translation
+// remains combinational; only warming this micro-TLB is delayed by one cycle.
+// This cuts the main-TLB select cone away from every entry write enable.
+reg        refill_q_valid;
+reg [19:0] refill_q_key;
+reg [19:0] refill_q_ppn;
+reg [5:0]  refill_q_ps;
+reg [1:0]  refill_q_mat;
+reg        refill_q_v;
+reg        refill_q_d;
+reg [1:0]  refill_q_plv;
+
+// The valid bit depends only on the short hit reduction.  Page-size filtering
+// and duplicate suppression are deliberately moved to the registered side.
+wire refill_capture = (req_valid_i === 1'b1) && !l1_hit
+                   && (tlb_found_i === 1'b1) && (fence_i !== 1'b1);
+
+integer pi;
+reg refill_q_present;
+always @(*) begin
+    refill_q_present = 1'b0;
+    for (pi = 0; pi < ENTRY_NUM; pi = pi + 1)
+        if (e_valid[pi] && (e_key[pi] == refill_q_key))
+            refill_q_present = 1'b1;
+end
+wire refill_install = refill_q_valid && (refill_q_ps == PS_4KB)
+                   && !refill_q_present;
+
+// Sample the main-TLB data every cycle into plain D-input registers.  Keeping
+// qualification off their CE/R pins prevents the TLB match/select cone from
+// being rebuilt as a register-control critical path.
+always @(posedge clk) begin
+    refill_q_key <= q_key;
+    refill_q_ppn <= tlb_ppn_i;
+    refill_q_ps  <= tlb_ps_i;
+    refill_q_mat <= tlb_mat_i;
+    refill_q_v   <= tlb_v_i;
+    refill_q_d   <= tlb_d_i;
+    refill_q_plv <= tlb_plv_i;
+end
+
 integer ri;
 always @(posedge clk) begin
     if (reset) begin
         e_valid  <= {ENTRY_NUM{1'b0}};
         fifo_ptr <= {PTR_W{1'b0}};
+        refill_q_valid <= 1'b0;
         for (ri = 0; ri < ENTRY_NUM; ri = ri + 1) begin
             e_key[ri] <= 20'b0;
             e_ppn[ri] <= 20'b0;
@@ -162,15 +209,19 @@ always @(posedge clk) begin
         // 整表失效：主表内容/ASID 已变，旧翻译一律作废（宁可多失效）
         e_valid  <= {ENTRY_NUM{1'b0}};
         fifo_ptr <= {PTR_W{1'b0}};
-    end else if (refill_en) begin
-        e_valid[fifo_ptr] <= 1'b1;
-        e_key[fifo_ptr]   <= q_key;
-        e_ppn[fifo_ptr]   <= tlb_ppn_i;
-        e_mat[fifo_ptr]   <= tlb_mat_i;
-        e_v[fifo_ptr]     <= tlb_v_i;
-        e_d[fifo_ptr]     <= tlb_d_i;
-        e_plv[fifo_ptr]   <= tlb_plv_i;
-        fifo_ptr          <= fifo_ptr + {{(PTR_W-1){1'b0}}, 1'b1};
+        refill_q_valid <= 1'b0;
+    end else begin
+        refill_q_valid <= refill_capture;
+        if (refill_install) begin
+            e_valid[fifo_ptr] <= 1'b1;
+            e_key[fifo_ptr]   <= refill_q_key;
+            e_ppn[fifo_ptr]   <= refill_q_ppn;
+            e_mat[fifo_ptr]   <= refill_q_mat;
+            e_v[fifo_ptr]     <= refill_q_v;
+            e_d[fifo_ptr]     <= refill_q_d;
+            e_plv[fifo_ptr]   <= refill_q_plv;
+            fifo_ptr          <= fifo_ptr + {{(PTR_W-1){1'b0}}, 1'b1};
+        end
     end
 end
 

@@ -145,6 +145,8 @@ module core_top #(
     wire [31:0]               bpu_p0_target;
     wire                      bpu_p1_valid;
     wire                      bpu_p1_meta_valid;
+    wire                      bpu_p1_desc_valid;
+    wire                      bpu_p0_retry_pending;
     wire [`BLK_LEN_W-1:0]     bpu_p1_length;
     wire                      bpu_p1_taken;
     wire [31:0]               bpu_p1_target;
@@ -166,7 +168,6 @@ module core_top #(
     wire                      ftq_train_mispred;
     wire [31:0]               ftq_train_target;
     wire [`BR_TYPE_W-1:0]     ftq_train_br_type;
-    wire                      ftq_train_is_direct_b;  // JTC 训练类型
     wire [`BLK_LEN_W+1:2]     ftq_train_fall_through;
     wire [`BPU_META_W-1:0]    ftq_train_meta;
     // IFU 预译码自重定向（-> BPU + FTQ）
@@ -194,6 +195,8 @@ module core_top #(
     wire                      mmu_i_adef;
     wire [`TLB_EX_NUM-1:0]    mmu_i_tlb_ex;
     wire                      mmu_i_direct_ok;
+    wire [31:0]               mmu_i_direct_paddr;
+    wire [1:0]                mmu_i_direct_mat;
     wire                      mmu_i_direct_excp; // 直发路径异常（仅 CAM 口径）
     // IFU <-> ICache
     wire                      ifu_ic_req;
@@ -233,7 +236,6 @@ module core_top #(
     wire [31:0]               cmt_ftq_pc;
     wire [`FTQ_W-1:0]         cmt_ftq_query_id;
     wire [31:0]               ftq_cmt_blk_target;
-    wire                      cmt_ftq_is_direct_b_stat; // JTC 提交统计
     wire                      cmt_ras_call;
     wire                      cmt_ras_ret;
     wire [31:0]               cmt_ras_retaddr;
@@ -270,6 +272,8 @@ module core_top #(
         .p0_target_o          (bpu_p0_target),
         .p1_valid_o           (bpu_p1_valid),
         .p1_meta_valid_o      (bpu_p1_meta_valid),
+        .p1_desc_valid_o      (bpu_p1_desc_valid),
+        .p0_retry_pending_o   (bpu_p0_retry_pending),
         .p1_length_o          (bpu_p1_length),
         .p1_taken_o           (bpu_p1_taken),
         .p1_target_o          (bpu_p1_target),
@@ -281,7 +285,6 @@ module core_top #(
         .train_mispred_i      (ftq_train_mispred),
         .train_target_i       (ftq_train_target),
         .train_br_type_i      (ftq_train_br_type),
-        .train_is_direct_b_i  (ftq_train_is_direct_b),
         .train_fall_through_i (ftq_train_fall_through),
         .train_meta_i         (ftq_train_meta),
         .cmt_is_call_i        (cmt_ras_call),
@@ -306,6 +309,8 @@ module core_top #(
         .p0_target_i          (bpu_p0_target),
         .p1_valid_i           (bpu_p1_valid),
         .p1_meta_valid_i      (bpu_p1_meta_valid),
+        .p1_desc_valid_i      (bpu_p1_desc_valid),
+        .p0_retry_pending_i   (bpu_p0_retry_pending),
         .p1_length_i          (bpu_p1_length),
         .p1_taken_i           (bpu_p1_taken),
         .p1_target_i          (bpu_p1_target),
@@ -332,7 +337,6 @@ module core_top #(
         .cmt_mispred_i        (cmt_ftq_mispred),
         .cmt_target_i         (cmt_ftq_target),
         .cmt_br_type_i        (cmt_ftq_br_type),
-        .cmt_is_direct_b_i    (cmt_ftq_is_direct_b_stat),
         .cmt_pc_word_i        (cmt_ftq_pc[`BLK_LEN_W+1:2]),
         .cmt_query_id_i       (cmt_ftq_query_id),
         .cmt_blk_target_o     (ftq_cmt_blk_target),
@@ -343,7 +347,6 @@ module core_top #(
         .train_mispred_o      (ftq_train_mispred),
         .train_target_o       (ftq_train_target),
         .train_br_type_o      (ftq_train_br_type),
-        .train_is_direct_b_o  (ftq_train_is_direct_b),
         .train_fall_through_o (ftq_train_fall_through),
         .train_meta_o         (ftq_train_meta)
     );
@@ -371,6 +374,8 @@ module core_top #(
         .mmu_i_excp_adef_i    (mmu_i_adef),
         .mmu_i_tlb_ex_i       (mmu_i_tlb_ex),
         .mmu_i_direct_ok_i    (mmu_i_direct_ok),
+        .mmu_i_direct_paddr_i (mmu_i_direct_paddr),
+        .mmu_i_direct_mat_i   (mmu_i_direct_mat),
         .mmu_i_direct_excp_i  (mmu_i_direct_excp),
         .ic_req_o             (ifu_ic_req),
         .ic_vindex_o          (ifu_ic_vindex),
@@ -379,6 +384,7 @@ module core_top #(
         .ic_addr_ok_i         (ic_ifu_addr_ok),
         .ic_data_ok_i         (ic_ifu_data_ok),
         .ic_rline_i           (ic_ifu_rline),
+        .ic_invalidate_i      (cmt_icacop_valid),
         .predec_redirect_o    (predec_redirect),
         .predec_fixup_only_o  (predec_fixup_only),
         .predec_update_pc_o   (predec_update_pc),
@@ -1073,6 +1079,12 @@ module core_top #(
     wire [2:0]                mem_wb_size_raw, mem_wb_size;
     wire                      mem_wb_uncached_raw, mem_wb_uncached;
     wire [`EXCP_NUM-1:0]      mem_wb_excp_raw, mem_wb_excp;
+    wire                      mem_fast_wb_valid;
+    wire [`ROB_W-1:0]         mem_fast_wb_robid;
+    wire [31:0]               mem_fast_wb_data;
+    wire                      mem_hold_wb_valid;
+    wire [`ROB_W-1:0]         mem_hold_wb_robid;
+    wire [31:0]               mem_hold_wb_data;
     wire [31:0]               mdu_wb_data2;
     // 提前唤醒总线（3 路：alu0/alu1 发射拍 + lsu DC 命中限定 early2）
     wire                      alu0_early_valid, alu1_early_valid;
@@ -1332,6 +1344,9 @@ module core_top #(
         .wb2_valid_i    (mem_wb_valid),
         .wb2_robid_i    (mem_wb_robid),
         .wb2_data_i     (mem_wb_data),
+        .fast2_valid_i  (mem_fast_wb_valid),
+        .fast2_robid_i  (mem_fast_wb_robid),
+        .fast2_data_i   (mem_fast_wb_data),
         .wb3_valid_i    (mdu_wb_valid),
         .wb3_robid_i    (mdu_wb_robid),
         .wb3_data_i     (mdu_wb_data),
@@ -1382,6 +1397,9 @@ module core_top #(
         .wb2_valid_i    (mem_wb_valid),
         .wb2_robid_i    (mem_wb_robid),
         .wb2_data_i     (mem_wb_data),
+        .fast2_valid_i  (mem_fast_wb_valid),
+        .fast2_robid_i  (mem_fast_wb_robid),
+        .fast2_data_i   (mem_fast_wb_data),
         .wb3_valid_i    (mdu_wb_valid),
         .wb3_robid_i    (mdu_wb_robid),
         .wb3_data_i     (mdu_wb_data),
@@ -1433,6 +1451,9 @@ module core_top #(
         .wb2_valid_i    (mem_wb_valid),
         .wb2_robid_i    (mem_wb_robid),
         .wb2_data_i     (mem_wb_data),
+        .fast2_valid_i  (mem_fast_wb_valid),
+        .fast2_robid_i  (mem_fast_wb_robid),
+        .fast2_data_i   (mem_fast_wb_data),
         .wb3_valid_i    (mdu_wb_valid),
         .wb3_robid_i    (mdu_wb_robid),
         .wb3_data_i     (mdu_wb_data),
@@ -1481,6 +1502,11 @@ module core_top #(
         .wb2_valid_i    (mem_wb_valid),
         .wb2_robid_i    (mem_wb_robid),
         .wb2_data_i     (mem_wb_data),
+        // MDU dependencies use the registered LSU hold result.  Feeding the
+        // raw DCache-hit path here created the 13.27 ns DCache->MDU cone.
+        .fast2_valid_i  (mem_hold_wb_valid),
+        .fast2_robid_i  (mem_hold_wb_robid),
+        .fast2_data_i   (mem_hold_wb_data),
         .wb3_valid_i    (mdu_wb_valid),
         .wb3_robid_i    (mdu_wb_robid),
         .wb3_data_i     (mdu_wb_data),
@@ -1605,6 +1631,8 @@ module core_top #(
     wire        dc_lsu_addr_ok;
     wire        dc_lsu_data_ok;
     wire [31:0] dc_lsu_rdata;
+    wire [`ROB_W-1:0] dc_lsu_resp_robid;
+    wire        lsu_dc_resp_ready;
     wire        lsu_dc_cancel;
     wire        dc_lsu_miss;         // load 移入 MSHR；D$ 组合产生，LSU 寄存完成状态
     wire        dc_lsu_mshr_ok;      // MSHR 重填数据返回（CWF-lite 提前回）
@@ -1668,6 +1696,8 @@ module core_top #(
         .dc_addr_ok_i     (dc_lsu_addr_ok),
         .dc_data_ok_i     (dc_lsu_data_ok),
         .dc_rdata_i       (dc_lsu_rdata),
+        .dc_resp_robid_i  (dc_lsu_resp_robid),
+        .dc_resp_ready_o  (lsu_dc_resp_ready),
         .dc_cancel_o      (lsu_dc_cancel),
         .dc_miss_i        (dc_lsu_miss),
         .dc_mshr_data_ok_i(dc_lsu_mshr_ok),
@@ -1692,6 +1722,12 @@ module core_top #(
         .wb_size_o        (mem_wb_size_raw),
         .wb_uncached_o    (mem_wb_uncached_raw),
         .wb_excp_o        (mem_wb_excp_raw),
+        .fast_wb_valid_o  (mem_fast_wb_valid),
+        .fast_wb_robid_o  (mem_fast_wb_robid),
+        .fast_wb_data_o   (mem_fast_wb_data),
+        .hold_wb_valid_o  (mem_hold_wb_valid),
+        .hold_wb_robid_o  (mem_hold_wb_robid),
+        .hold_wb_data_o   (mem_hold_wb_data),
         .early_wakeup_valid_o(lsu_early_valid_raw),
         .early_wakeup_robid_o(lsu_early_robid_raw)
     );
@@ -1750,6 +1786,29 @@ module core_top #(
         assign mem_wb_uncached = mem_wb_uncached_raw;
         assign mem_wb_excp     = mem_wb_excp_raw;
     end endgenerate
+
+    // ROB completion does not participate in reservation-station wakeup.
+    // Capture the LSU's final result before the optional RS writeback pipe so
+    // independent loads/stores can retire one cycle earlier while all RS
+    // consumers continue to see the timing-isolated mem_wb_* bus.
+    wire                      mem_rob_wb_valid =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_valid_raw : mem_wb_valid;
+    wire [`ROB_W-1:0]         mem_rob_wb_robid =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_robid_raw : mem_wb_robid;
+    wire [31:0]               mem_rob_wb_data =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_data_raw : mem_wb_data;
+    wire [31:0]               mem_rob_wb_paddr =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_paddr_raw : mem_wb_paddr;
+    wire [31:0]               mem_rob_wb_vaddr =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_vaddr_raw : mem_wb_vaddr;
+    wire [3:0]                mem_rob_wb_wstrb =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_wstrb_raw : mem_wb_wstrb;
+    wire [2:0]                mem_rob_wb_size =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_size_raw : mem_wb_size;
+    wire                      mem_rob_wb_uncached =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_uncached_raw : mem_wb_uncached;
+    wire [`EXCP_NUM-1:0]      mem_rob_wb_excp =
+        (`LSU_ROB_EARLY_COMPLETE != 0) ? mem_wb_excp_raw : mem_wb_excp;
 
     // `LSU_EARLY2_PIPE` 打开时，early2 打一拍再进三 RS，切断 D$ hit→RS ready 组合链。
     // 与 hold 写回同拍到达时 early2 退化为与 WB 同位（仍正确）；未打拍则保持同拍早唤醒。
@@ -1845,20 +1904,6 @@ module core_top #(
     wire [`TLB_OP_NUM-1:0] rob_cmt0_tlb_op, rob_cmt1_tlb_op;
     wire [4:0]  rob_cmt0_cacop_code, rob_cmt1_cacop_code;
     wire [`EXCP_NUM-1:0] rob_cmt0_excp, rob_cmt1_excp;
-
-    // 把 FTQ 提交包回配到 ROB 头槽，读取 is_direct_b。
-    // （区分 direct B vs ordinary JIRL，供 JTC 训练）。
-    wire cmt_ftq_match_rob0 =
-        cmt_ftq_valid && (cmt_ftq_pc == rob_cmt0_pc) &&
-        (cmt_ftq_id == rob_cmt0_ftq_id);
-    wire cmt_ftq_match_rob1 =
-        cmt_ftq_valid && (cmt_ftq_pc == rob_cmt1_pc) &&
-        (cmt_ftq_id == rob_cmt1_ftq_id);
-    assign cmt_ftq_is_direct_b_stat =
-        cmt_ftq_valid && cmt_ftq_is_branch &&
-        (cmt_ftq_br_type == `BR_TYPE_UNCOND) &&
-        ((cmt_ftq_match_rob0 && rob_cmt0_is_direct_b) ||
-         (cmt_ftq_match_rob1 && rob_cmt1_is_direct_b));
 
     // commit -> ROB 推进
     wire        cmt_rob_pop, cmt_rob_clear0, cmt_rob_clear1;
@@ -1963,15 +2008,18 @@ module core_top #(
         .alu1_wb_data_i   (alu1_wb_data),
         .alu1_wb_br_taken_i(alu1_wb_br_taken),
         .alu1_wb_br_target_i(alu1_wb_br_target),
-        .mem_wb_valid_i   (mem_wb_valid),
-        .mem_wb_robid_i   (mem_wb_robid),
-        .mem_wb_data_i    (mem_wb_data),
-        .mem_wb_paddr_i   (mem_wb_paddr),
-        .mem_wb_vaddr_i   (mem_wb_vaddr),
-        .mem_wb_wstrb_i   (mem_wb_wstrb),
-        .mem_wb_size_i    (mem_wb_size),
-        .mem_wb_uncached_i(mem_wb_uncached),
-        .mem_wb_excp_i    (mem_wb_excp),
+        .mem_wb_valid_i   (mem_rob_wb_valid),
+        .mem_wb_robid_i   (mem_rob_wb_robid),
+        .mem_wb_data_i    (mem_rob_wb_data),
+        .mem_wb_paddr_i   (mem_rob_wb_paddr),
+        .mem_wb_vaddr_i   (mem_rob_wb_vaddr),
+        .mem_wb_wstrb_i   (mem_rob_wb_wstrb),
+        .mem_wb_size_i    (mem_rob_wb_size),
+        .mem_wb_uncached_i(mem_rob_wb_uncached),
+        .mem_wb_excp_i    (mem_rob_wb_excp),
+        .mem_fwd_valid_i  (mem_wb_valid),
+        .mem_fwd_robid_i  (mem_wb_robid),
+        .mem_fwd_data_i   (mem_wb_data),
         .mdu_wb_valid_i   (mdu_wb_valid),
         .mdu_wb_robid_i   (mdu_wb_robid),
         .mdu_wb_data_i    (mdu_wb_data),
@@ -2227,6 +2275,8 @@ module core_top #(
     wire        tlbm_inst_ex_adef;   // PLV3 取指越界（ADEF 特权子情形）
     wire        tlbm_inst_ex_tlbr, tlbm_inst_ex_pif, tlbm_inst_ex_ppi;
     wire        tlbm_inst_direct_ok;
+    wire [31:0] tlbm_inst_direct_paddr;
+    wire [1:0]  tlbm_inst_direct_mat;
     wire        tlbm_inst_direct_excp; // 直发路径专用（仅 CAM 口径）
     wire [31:0] tlbm_data_paddr;
     wire [1:0]  tlbm_data_mat;
@@ -2256,6 +2306,8 @@ module core_top #(
         .i_excp_adef_o     (mmu_i_adef),
         .i_tlb_ex_o        (mmu_i_tlb_ex),
         .i_direct_ok_o     (mmu_i_direct_ok),
+        .i_direct_paddr_o  (mmu_i_direct_paddr),
+        .i_direct_mat_o    (mmu_i_direct_mat),
         .i_direct_excp_o   (mmu_i_direct_excp),
         .d_req_i           (lsu_mmu_req),
         .d_is_store_i      (lsu_mmu_is_store),
@@ -2280,6 +2332,8 @@ module core_top #(
         .tlbm_inst_ex_pif_i(tlbm_inst_ex_pif),
         .tlbm_inst_ex_ppi_i(tlbm_inst_ex_ppi),
         .tlbm_inst_direct_ok_i(tlbm_inst_direct_ok),
+        .tlbm_inst_direct_paddr_i(tlbm_inst_direct_paddr),
+        .tlbm_inst_direct_mat_i(tlbm_inst_direct_mat),
         .tlbm_inst_direct_excp_i(tlbm_inst_direct_excp),
         .tlbm_data_paddr_i (tlbm_data_paddr),
         .tlbm_data_mat_i   (tlbm_data_mat),
@@ -2344,6 +2398,8 @@ module core_top #(
         .inst_ex_pif    (tlbm_inst_ex_pif),
         .inst_ex_ppi    (tlbm_inst_ex_ppi),
         .inst_direct_ok (tlbm_inst_direct_ok),
+        .inst_direct_paddr(tlbm_inst_direct_paddr),
+        .inst_direct_mat(tlbm_inst_direct_mat),
         .inst_direct_excp(tlbm_inst_direct_excp),
         .data_paddr     (tlbm_data_paddr),
         .data_mat       (tlbm_data_mat),
@@ -2563,6 +2619,8 @@ module core_top #(
         .ld_addr_ok_o   (dc_lsu_addr_ok),
         .ld_data_ok_o   (dc_lsu_data_ok),
         .ld_rdata_o     (dc_lsu_rdata),
+        .ld_resp_robid_o(dc_lsu_resp_robid),
+        .ld_resp_ready_i(lsu_dc_resp_ready),
         .ld_cancel_i    (lsu_dc_cancel),
         .ld_miss_o      (dc_lsu_miss),
         .ld_mshr_data_ok_o(dc_lsu_mshr_ok),
@@ -3443,6 +3501,20 @@ endfunction
 final begin
     $display("");
     $display("==================== myCPU PERF (sim) ====================");
+    $display("IFU diag:           ftq_valid=%0d accept=%0d pre_stall=%0d",
+             u_ifu.diag_ftq_valid, u_ifu.diag_ftq_accept,
+             u_ifu.diag_ftq_pre_stall);
+    $display("  pre_wait_req=%0d pre_wait_if=%0d if_wait_data=%0d if_wait_ib=%0d",
+             u_ifu.diag_pre_wait_req, u_ifu.diag_pre_wait_if,
+             u_ifu.diag_if_wait_data, u_ifu.diag_if_wait_ib);
+    $display("  I$ outstanding=%0d req=%0d addr_ok=%0d data_ok=%0d mismatch=%0d/%0d",
+             u_ifu.diag_ic_outstanding, u_ifu.diag_ic_req,
+             u_ifu.diag_ic_addr_ok, u_ifu.diag_ic_data_ok,
+             u_ifu.diag_pre_rsp_mismatch, u_ifu.diag_if_rsp_mismatch);
+    $display("  I$ uncached=%0d direct/pre/replay=%0d/%0d/%0d first/last=%08x/%08x",
+             u_ifu.diag_ic_uncached, u_ifu.diag_ic_uncached_direct,
+             u_ifu.diag_ic_uncached_pre, u_ifu.diag_ic_uncached_replay,
+             u_ifu.diag_first_uncached_pc, u_ifu.diag_last_uncached_pc);
     $display("Commit IPC:         retire=%0d  cycles=%0d  IPC=%.6f",
              perf_retire_count, perf_cycle_count,
              perf_ipc(perf_retire_count, perf_cycle_count));
@@ -3544,7 +3616,7 @@ final begin
              u_rs_mem.rsm_lsu_stall_cyc, perf_rate(u_rs_mem.rsm_lsu_stall_cyc, perf_cycle_count));
     $display("RS_MEM full stall:  %0d  (%.2f%%)",
              u_rs_mem.rsm_full_stall_cyc, perf_rate(u_rs_mem.rsm_full_stall_cyc, perf_cycle_count));
-    // MPKI / RAS-predec / JTC / IB-FTQ / D$ outstanding / flush-redirect
+    // MPKI / RAS-predec / IB-FTQ / D$ outstanding / flush-redirect
     $display("---- frontend / branch / D$ outstanding ----");
     $display("Branch MPKI:        all=%.3f  cond=%.3f  (mispred*1000/retire)",
              perf_mpki(u_bpu.commit_all_mispred_count, perf_retire_count),
@@ -3552,13 +3624,6 @@ final begin
     $display("RAS/predec:         ras_call=%0d  ras_ret=%0d  flush=%0d  predec_redirect=%0d",
              perf_predec_ras_call, perf_predec_ras_ret,
              perf_flush_cyc, perf_predec_redirect_cyc);
-    $display("JTC:                hit=%0d  miss=%0d  train=%0d  hit_rate=%.2f%%",
-             u_bpu.u_jirl_target_cache.jtc_query_hit,
-             u_bpu.u_jirl_target_cache.jtc_query_miss,
-             u_bpu.u_jirl_target_cache.jtc_train_updates,
-             perf_rate(u_bpu.u_jirl_target_cache.jtc_query_hit,
-                       u_bpu.u_jirl_target_cache.jtc_query_hit
-                     + u_bpu.u_jirl_target_cache.jtc_query_miss));
     $display("IB frontend:        empty=%0d  (%.2f%%)  push_stall=%0d  (%.2f%%)  full_occ=%0d",
              perf_ib_empty_cyc, perf_rate(perf_ib_empty_cyc, perf_cycle_count),
              perf_ib_push_stall_cyc, perf_rate(perf_ib_push_stall_cyc, perf_cycle_count),
@@ -3566,6 +3631,10 @@ final begin
     $display("FTQ settle/pending: settle=%0d  (%.2f%%)  pending=%0d  (%.2f%%)",
              perf_ftq_settle_cyc, perf_rate(perf_ftq_settle_cyc, perf_cycle_count),
              perf_ftq_pending_cyc, perf_rate(perf_ftq_pending_cyc, perf_cycle_count));
+    $display("FTQ P1 bypass:      offer=%0d  accept=%0d  corrected=%0d",
+             u_ftq.p1_head_bypass_offer_count,
+             u_ftq.p1_head_bypass_accept_count,
+             u_ftq.p1_head_correction_bypass_count);
     $display("D$ AXI OS:          N/A (dual-OS not in tree; dc_os_* absent)");
     $display("Flush/redirect:     flush=%0d  (%.2f%%)  predec_redirect=%0d  (%.2f%%)",
              perf_flush_cyc, perf_rate(perf_flush_cyc, perf_cycle_count),
@@ -3616,10 +3685,77 @@ final begin
     $display("FTB update queue:   max=%0d/%0d  overflow=%0d",
              u_bpu.u_ftb.ftb_update_queue_max_occupancy, `FTB_UPDATE_Q_DEPTH,
              u_bpu.u_ftb.ftb_update_overflow_count);
+    $display("  update traffic:   request=%0d  enqueue=%0d  tail_merge=%0d  dequeue=%0d  real_write=%0d",
+             u_bpu.u_ftb.ftb_update_request_count,
+             u_bpu.u_ftb.ftb_update_enqueue_count,
+             u_bpu.u_ftb.ftb_update_tail_merge_count,
+             u_bpu.u_ftb.ftb_update_dequeue_count,
+             u_bpu.u_ftb.ftb_update_write_count);
+    $display("FTB update filter:  commit_req=%0d  skipped_hit=%0d  sent=%0d  predec_sent=%0d",
+             u_bpu.ftb_commit_update_request_count,
+             u_bpu.ftb_commit_update_filtered_count,
+             u_bpu.ftb_update_sent_count,
+             u_bpu.ftb_predec_update_sent_count);
+    $display("P0 fallback BTB:    query=%0d  hit=%0d  hit_rate=%.2f%%  taken=%0d",
+             u_bpu.u_fallback_btb.fallback_query_count,
+             u_bpu.u_fallback_btb.fallback_hit_count,
+             perf_rate(u_bpu.u_fallback_btb.fallback_hit_count,
+                       u_bpu.u_fallback_btb.fallback_query_count),
+             u_bpu.u_fallback_btb.fallback_taken_count);
+    $display("  fallback types:   cond=%0d  uncond=%0d  call=%0d  ret=%0d",
+             u_bpu.u_fallback_btb.fallback_cond_hit_count,
+             u_bpu.u_fallback_btb.fallback_uncond_hit_count,
+             u_bpu.u_fallback_btb.fallback_call_hit_count,
+             u_bpu.u_fallback_btb.fallback_ret_hit_count);
+    $display("  fallback train:   update=%0d  direction=%0d  replacement=%0d",
+             u_bpu.u_fallback_btb.fallback_update_count,
+             u_bpu.u_fallback_btb.fallback_direction_train_count,
+             u_bpu.u_fallback_btb.fallback_replacement_count);
+    $display("P1 correction:      total=%0d  uBTB_hit=%0d  uBTB_miss=%0d  direction=%0d  target=%0d  length=%0d",
+             u_bpu.p1_correction_count,
+             u_bpu.p1_correction_from_ubtb_hit_count,
+             u_bpu.p1_correction_from_ubtb_miss_count,
+             u_bpu.p1_correction_direction_count,
+             u_bpu.p1_correction_target_count,
+             u_bpu.p1_correction_length_count);
+    $display("Predecode train Q:  max=%0d/2  request=%0d  direct=%0d  enqueue=%0d  merge=%0d  dequeue=%0d  overflow=%0d",
+             u_bpu.predec_train_queue_max_occupancy,
+             u_bpu.predec_train_request_count,
+             u_bpu.predec_train_direct_count,
+             u_bpu.predec_train_enqueue_count,
+             u_bpu.predec_train_merge_count,
+             u_bpu.predec_train_dequeue_count,
+             u_bpu.predec_train_overflow_count);
     $display("TAGE update queue:  max=%0d/%0d  overflow=%0d  pipe_max=%0d",
              u_bpu.u_tage.tage_update_queue_max_occupancy, `TAGE_UPDATE_Q_DEPTH,
              u_bpu.u_tage.tage_update_overflow_count,
              u_bpu.u_tage.tage_update_pipeline_max_pending_count);
+    $display("TAGE providers:     base=%0d/%0d  t0=%0d/%0d  t1=%0d/%0d  t2=%0d/%0d  t3=%0d/%0d",
+             u_bpu.u_tage.tage_provider_base_correct_count,
+             u_bpu.u_tage.tage_provider_base_count,
+             u_bpu.u_tage.tage_provider_t0_correct_count,
+             u_bpu.u_tage.tage_provider_t0_count,
+             u_bpu.u_tage.tage_provider_t1_correct_count,
+             u_bpu.u_tage.tage_provider_t1_count,
+             u_bpu.u_tage.tage_provider_t2_correct_count,
+             u_bpu.u_tage.tage_provider_t2_count,
+             u_bpu.u_tage.tage_provider_t3_correct_count,
+             u_bpu.u_tage.tage_provider_t3_count);
+    $display("TAGE weak/alt:      weak=%0d/%0d  disagree=%0d  provider_better=%0d  alt_better=%0d",
+             u_bpu.u_tage.tage_weak_provider_correct_count,
+             u_bpu.u_tage.tage_weak_provider_count,
+             u_bpu.u_tage.tage_provider_alt_disagree_count,
+             u_bpu.u_tage.tage_provider_better_count,
+             u_bpu.u_tage.tage_alt_better_count);
+    $display("  weak disagree:    total=%0d  provider_better=%0d  alt_better=%0d",
+             u_bpu.u_tage.tage_weak_disagree_count,
+             u_bpu.u_tage.tage_weak_provider_better_count,
+             u_bpu.u_tage.tage_weak_alt_better_count);
+    $display("TAGE allocation:    success=%0d  failure=%0d  provider_update_lost=%0d  train=%0d",
+             u_bpu.u_tage.tage_allocation_success_count,
+             u_bpu.u_tage.tage_allocation_failure_count,
+             u_bpu.u_tage.tage_provider_update_lost_count,
+             u_bpu.u_tage.tage_train_count);
     $display("==========================================================");
     $display("");
 end

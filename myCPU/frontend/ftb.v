@@ -79,8 +79,25 @@ wire update_queue_empty = (uq_count == {FTB_UPDATE_Q_CNT_W{1'b0}});
 wire update_queue_full  = (uq_count == FTB_UPDATE_Q_DEPTH_C);
 wire service_update     = !initing && !query_valid_i && !update_queue_empty;
 wire update_accept      = !initing && update_valid_i;
-wire update_enqueue     = update_accept && (!update_queue_full || service_update);
-wire update_overflow    = update_accept && update_queue_full && !service_update;
+wire [FTB_UPDATE_Q_PTR_W-1:0] uq_tail_ptr =
+    uq_wptr - {{(FTB_UPDATE_Q_PTR_W-1){1'b0}}, 1'b1};
+wire update_matches_tail =
+    !update_queue_empty &&
+    (uq_pc_word[uq_tail_ptr] == update_block_pc_i);
+// If the queue contains only one entry and that entry is leaving now, U0
+// samples its old payload on this edge.  Do not overwrite it as a "merge";
+// enqueue the new request into the newly freed slot instead.
+wire update_tail_is_dequeue =
+    service_update &&
+    (uq_count == {{(FTB_UPDATE_Q_CNT_W-1){1'b0}}, 1'b1});
+wire update_merge_tail =
+    update_accept && update_matches_tail && !update_tail_is_dequeue;
+wire update_enqueue =
+    update_accept && !update_merge_tail &&
+    (!update_queue_full || service_update);
+wire update_overflow =
+    update_accept && !update_merge_tail &&
+    update_queue_full && !service_update;
 wire update_dequeue     = service_update;
 wire [FTB_UPDATE_Q_CNT_W-1:0] uq_count_next =
     (update_enqueue && !update_dequeue) ? (uq_count + {{(FTB_UPDATE_Q_CNT_W-1){1'b0}},1'b1}) :
@@ -197,7 +214,11 @@ always @(posedge clk) begin
         u0_valid  <= 1'b0;
         u1_valid  <= 1'b0;
         victim_rr <= 2'd0;
+`ifdef FTB_POWERUP_INIT
+        initing   <= 1'b0;
+`else
         initing   <= 1'b1;
+`endif
         init_set  <= {`FTB_INDEX_W{1'b0}};
         uq_rptr   <= {FTB_UPDATE_Q_PTR_W{1'b0}};
         uq_wptr   <= {FTB_UPDATE_Q_PTR_W{1'b0}};
@@ -209,7 +230,15 @@ always @(posedge clk) begin
         if (init_set == {`FTB_INDEX_W{1'b1}}) initing <= 1'b0;
     end else begin
         // 更新请求先进入 FIFO；空闲周期再借读口进入 U0
-        if (update_enqueue) begin
+        if (update_merge_tail) begin
+            // Same block is already the newest pending request.  Retain its
+            // queue position but replace the payload so indirect targets
+            // (ordinary JIRL/CALL) still train with the latest observation.
+            uq_pc_word[uq_tail_ptr]    <= update_block_pc_i;
+            uq_target[uq_tail_ptr]     <= update_jump_target_i;
+            uq_ft_wordoff[uq_tail_ptr] <= update_fall_through_i;
+            uq_btype[uq_tail_ptr]      <= update_br_type_i;
+        end else if (update_enqueue) begin
             uq_pc_word[uq_wptr]  <= update_block_pc_i;
             uq_target[uq_wptr]   <= update_jump_target_i;
             uq_ft_wordoff[uq_wptr] <= update_fall_through_i;
@@ -253,6 +282,7 @@ reg [63:0] ftb_update_enqueue_count;
 reg [63:0] ftb_update_dequeue_count;
 reg [63:0] ftb_update_write_count;
 reg [63:0] ftb_update_overflow_count;
+reg [63:0] ftb_update_tail_merge_count;
 reg [63:0] ftb_update_queue_max_occupancy;
 reg [63:0] ftb_query_while_update_arrives_count;
 reg [63:0] ftb_update_service_idle_cycle_count;
@@ -268,6 +298,7 @@ always @(posedge clk) begin
         ftb_update_dequeue_count      <= 64'd0;
         ftb_update_write_count        <= 64'd0;
         ftb_update_overflow_count     <= 64'd0;
+        ftb_update_tail_merge_count   <= 64'd0;
         ftb_update_queue_max_occupancy <= 64'd0;
         ftb_query_while_update_arrives_count <= 64'd0;
         ftb_update_service_idle_cycle_count  <= 64'd0;
@@ -290,6 +321,9 @@ always @(posedge clk) begin
             ftb_update_write_count <= ftb_update_write_count + 64'd1;
         if (update_overflow)
             ftb_update_overflow_count <= ftb_update_overflow_count + 64'd1;
+        if (update_merge_tail)
+            ftb_update_tail_merge_count <=
+                ftb_update_tail_merge_count + 64'd1;
         if (uq_count_next_64 > ftb_update_queue_max_occupancy)
             ftb_update_queue_max_occupancy <= uq_count_next_64;
         if (query_valid_i && update_valid_i && !initing)
@@ -317,6 +351,13 @@ module ftb_way_ram #(
     input  wire [ENTRY_W-1:0]        wdata
 );
 reg [ENTRY_W-1:0] mem [0:`FTB_NSET-1];
+`ifdef FTB_POWERUP_INIT
+integer init_i;
+initial begin
+    for (init_i = 0; init_i < `FTB_NSET; init_i = init_i + 1)
+        mem[init_i] = {ENTRY_W{1'b0}};
+end
+`endif
 always @(posedge clk) begin
     rdata <= mem[raddr];
     if (we) mem[waddr] <= wdata;

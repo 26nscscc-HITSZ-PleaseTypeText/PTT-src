@@ -82,6 +82,8 @@ module dcache (
     output wire        ld_addr_ok_o,
     output wire        ld_data_ok_o,     // 命中/uncached 完成（快速通道）
     output wire [31:0] ld_rdata_o,
+    output wire [`ROB_W-1:0] ld_resp_robid_o, // 命中/前端 miss 对应请求标签
+    input  wire        ld_resp_ready_i,  // LSU 命中响应暂存槽可接收
     input  wire        ld_cancel_i,      // 冲刷：在飞 load MSHR 置 killed 记账（data_ok 仍发，LSU m_drop 收槽，见头注契约）
     // ---- 非阻塞 miss 扩展（配合 LSU miss 槽）----
     output wire        ld_miss_o,        // 本 load 已移入 MSHR（LOOKUP 拍一拍脉冲）
@@ -233,6 +235,21 @@ wire wb_all_idle = (wb_state == W_IDLE) && !wb_valid;
 // —— 二维 reg 数组 Vivado 推断不出分布式 RAM，会落成 ~10k FF + 巨型读 mux。
 reg [NSET-1:0] valid_arr [0:NWAY-1];
 reg [NSET-1:0] dirty_arr [0:NWAY-1];
+// valid/dirty 是大扇出的逐位 FF 阵列。把 LOOKUP/INSTALL 的动态下标写先
+// 收敛到两个很小的更新包，下一拍再落阵列，可避免 req_paddr/tag-hit 组合锥
+// 直接跨越布局区域驱动数百个阵列 D 端。下一条请求最早在本拍被接受、再下
+// 一拍进入 LOOKUP，因此延后一拍落元数据不会改变其可见性。
+reg                 meta_install_pend;
+reg [1:0]           meta_install_way;
+reg [IDXW-1:0]      meta_install_set;
+reg                 meta_install_dirty;
+reg                 meta_front_pend;
+reg [1:0]           meta_front_way;
+reg [IDXW-1:0]      meta_front_set;
+reg                 meta_front_valid_we;
+reg                 meta_front_valid;
+reg                 meta_front_dirty_we;
+reg                 meta_front_dirty;
 wire [TAGW-1:0] tag_rd [0:NWAY-1];               // 各路 tag 在 req_set 处的异步读值
 
 wire [LINEW-1:0] data_out [0:NWAY-1];
@@ -250,6 +267,7 @@ reg        req_is_ld;
 reg        req_is_cacop;
 reg [1:0]  req_cacop_op;
 reg [31:0] req_paddr;
+reg [N_MSHR-1:0] req_mshr_line_match_r;
 reg [`ROB_W-1:0] req_robid;       // load：随请求锁存，miss 写入 MSHR
 reg [LINEW-1:0] req_wdata;        // 行粒度；UC 时有效字位于 req_word 槽
 reg [31:0]  req_wstrb;            // 行内 32 字节使能
@@ -346,10 +364,27 @@ endgenerate
 wire pend_can_progress = !(|pend_set_match) && mshr_has_free;
 wire pend_drain = (state == S_IDLE) && pend_valid && mshr_has_free && wb_all_idle
                && !mshr_any_install && pend_can_progress;
-wire accept_ok = (state == S_IDLE) && !mshr_any_install && !pend_drain;
+wire lookup_ld_chain;
+// A load hit only consumes the RAM read result; the port is free to start a
+// pending store-buffer lookup in the same cycle.  This overlaps committed
+// store draining with cached loads without adding an AGU/LSU bypass.
+wire accept_ok = ((state == S_IDLE) || lookup_ld_chain)
+              && !mshr_any_install && !pend_drain;
 wire cacop_take = accept_ok && cacop_pend;
 wire st_take    = accept_ok && !cacop_pend && st_req_i;
 wire ld_take    = accept_ok && !cacop_pend && !st_req_i && ld_req_i;
+
+// store 接受拍预比较同行 MSHR，并随请求寄存到 LOOKUP。MSHR 的 line 在 busy
+// 期间不变，因此这与下一拍用 req_paddr 比较等价，却把同行判定从 refill
+// 返回锥中提前切开。pend 只有在无同 set MSHR 时恢复，直接写 0 即可。
+wire [N_MSHR-1:0] st_take_line_match;
+generate
+for (gm = 0; gm < N_MSHR; gm = gm + 1) begin : gen_st_take_line_match
+    assign st_take_line_match[gm] = mshr_busy_oh[gm]
+                                  && (st_paddr_i[31:`CACHE_LINE_W]
+                                   == mshr_paddr[gm][31:`CACHE_LINE_W]);
+end
+endgenerate
 
 assign st_addr_ok_o = st_take;
 assign ld_addr_ok_o = ld_take;
@@ -365,14 +400,15 @@ for (gm = 0; gm < N_MSHR; gm = gm + 1) begin : gen_mshr_set_match
     assign mshr_set_match[gm] = mshr_busy_oh[gm]
                               && (req_set == mshr_paddr[gm][IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W]);
     assign mshr_line_match[gm] = mshr_busy_oh[gm]
-                              && (req_paddr[31:`CACHE_LINE_W] == mshr_paddr[gm][31:`CACHE_LINE_W]);
+                              && req_mshr_line_match_r[gm];
     assign mshr_mergeable[gm] = mshr_line_match[gm]
                              && ((mshr_state[gm] == M_RREQ)
                               || (mshr_state[gm] == M_RDATA)
                               || (mshr_state[gm] == M_INSTALL));
 end
 endgenerate
-wire        lk_st_merge = (state == S_LOOKUP) && req_is_st && !req_is_cacop && !req_uncached
+wire        lk_st_merge = (state == S_LOOKUP) && req_is_st
+                       && !req_is_cacop && !req_uncached
                        && (|mshr_mergeable);
 wire [MSHR_W-1:0] mshr_merge_idx = dc_mshr_prio_low(mshr_mergeable);
 // SB 已给出行级 strb，无需按单字地址再次左移。
@@ -393,6 +429,12 @@ wire lk_ld_hit  = lk_cached_ld && !lk_set_conf && hit_any;
 wire lk_st_hit  = lk_cached_st && !lk_set_conf && !lk_st_merge && hit_any;
 wire lk_ld_miss = lk_cached_ld && !lk_set_conf && !hit_any;
 wire lk_st_miss = lk_cached_st && !lk_set_conf && !lk_st_merge && !hit_any;
+// 只有 LSU 能在本拍接收旧命中响应时才允许再发起下一次 BRAM 查询。
+// 否则保持 LOOKUP 和 req_* 不动，让 data_ok/robid 成为标准 valid/ready
+// 握手，避免负载流水化后因写回碰撞丢响应。
+assign lookup_ld_chain = lk_ld_hit
+                      && !(req_ld_killed || ld_cancel_i)
+                      && ld_resp_ready_i;
 
 // miss 分配：有空槽 +（脏 victim 需 WB 空）；load/store 均可占满 N_MSHR
 // （LSU miss 槽深度 = LSU_MISS_DEPTH = DC_MSHR_DEPTH，返回靠 robid 配对）
@@ -439,7 +481,7 @@ wire         mshr_owner_rdata = axi_mshr_grant_vld
                              && (mshr_state[axi_mshr_grant] == M_RDATA);
 
 wire [LINEW-1:0] refill_line_raw = {axi_ret_data, mshr_rf_b0};
-// 行级 store 叠层：含同拍 lk_st_merge→本 MSHR（避免 NBA 晚一拍丢合并）
+// 同拍 store merge 的同行判断来自接受拍寄存结果，不再经过 req_paddr 比较。
 wire        refill_merge_now = lk_st_merge && (mshr_merge_idx == axi_mshr_grant);
 wire [31:0] refill_stb_eff   = mshr_stb_line[axi_mshr_grant]
                              | (refill_merge_now ? req_stb_line : 32'b0);
@@ -471,10 +513,13 @@ wire mshr_beat1 = mshr_beat &&  axi_ret_last;
 // cancel 不抑制 data_ok：LSU 用 m_drop 丢弃冲刷后返回。
 wire [31:0] beat_word   = axi_ret_data[32*mshr_rf_word[1:0] +: 32];
 wire [31:0] refill_word = refill_line_merged[32*mshr_rf_word +: 32];
-wire        mshr_rf_no_st_merge = (refill_stb_eff == 32'b0);
+wire        mshr_rf_no_st_merge = (mshr_stb_line[axi_mshr_grant] == 32'b0)
+                               && !refill_merge_now;
 wire        mshr_cwf_early = mshr_beat0 && !mshr_rf_word[2] && mshr_rf_no_st_merge;
-assign ld_mshr_data_ok_o = mshr_rf_ld_resp && (mshr_beat1 || mshr_cwf_early);
-assign ld_mshr_rdata_o   = mshr_beat1 ? refill_word : beat_word;
+wire        mshr_resp_fire = mshr_rf_ld_resp && (mshr_beat1 || mshr_cwf_early);
+wire [31:0] mshr_resp_data = mshr_beat1 ? refill_word : beat_word;
+assign ld_mshr_data_ok_o = mshr_resp_fire;
+assign ld_mshr_rdata_o   = mshr_resp_data;
 assign ld_mshr_robid_o   = mshr_robid[axi_mshr_grant];
 
 // MSHR 安装拍：同一拍最多装 1 项（单口 BRAM）
@@ -509,9 +554,11 @@ always @(*) begin
         mshr_inst_line = (mshr_inst_line & ~st_line_be) | (req_wdata & st_line_be);
 end
 // ---------------- 响应输出 ----------------
-assign ld_data_ok_o = lk_ld_hit | (state == S_UC_RESP);
+assign ld_data_ok_o = (lk_ld_hit | (state == S_UC_RESP))
+                    && !(req_ld_killed || ld_cancel_i);
 assign ld_rdata_o   = (state == S_UC_RESP) ? uc_rdata : hit_word;
-assign ld_miss_o    = lk_ld_alloc;
+assign ld_resp_robid_o = req_robid;
+assign ld_miss_o    = lk_ld_alloc && !(req_ld_killed || ld_cancel_i);
 
 // store：命中 / miss 分配 posted / 同行合入在飞 MSHR posted；uncached 等下层
 assign st_done_o    = lk_st_hit | lk_st_alloc | lk_st_merge
@@ -605,11 +652,28 @@ always @(posedge clk) begin
         pend_valid     <= 1'b0;
         pend_ld_killed <= 1'b0;
         req_ld_killed  <= 1'b0;
+        req_mshr_line_match_r <= {N_MSHR{1'b0}};
+        meta_install_pend <= 1'b0;
+        meta_front_pend   <= 1'b0;
         for (s = 0; s < NWAY; s = s + 1) begin
             valid_arr[s] <= {NSET{1'b0}};
             dirty_arr[s] <= {NSET{1'b0}};
         end
     end else begin
+        // 先落上一拍的更新包；front 包在后，保持与原 always 块相同的优先级。
+        if (meta_install_pend) begin
+            valid_arr[meta_install_way][meta_install_set] <= 1'b1;
+            dirty_arr[meta_install_way][meta_install_set] <= meta_install_dirty;
+        end
+        if (meta_front_pend) begin
+            if (meta_front_valid_we)
+                valid_arr[meta_front_way][meta_front_set] <= meta_front_valid;
+            if (meta_front_dirty_we)
+                dirty_arr[meta_front_way][meta_front_set] <= meta_front_dirty;
+        end
+        meta_install_pend <= 1'b0;
+        meta_front_pend   <= 1'b0;
+
         // cacop 暂存（commit 一拍脉冲随时到来）
         if (cacop_en_i) begin
             cacop_pend      <= 1'b1;
@@ -627,8 +691,10 @@ always @(posedge clk) begin
 
         // MSHR 安装：更新 valid/dirty（tag 写在 gen_tag，数据 RAM 写在组合块）
         if (mshr_install_fire) begin
-            valid_arr[mshr_inst_way][mshr_inst_set] <= 1'b1;
-            dirty_arr[mshr_inst_way][mshr_inst_set] <= mshr_inst_is_st;
+            meta_install_pend  <= 1'b1;
+            meta_install_way  <= mshr_inst_way;
+            meta_install_set  <= mshr_inst_set;
+            meta_install_dirty <= mshr_inst_is_st;
         end
 
         case (state)
@@ -640,6 +706,7 @@ always @(posedge clk) begin
                     req_is_ld     <= pend_is_ld;
                     req_ld_killed <= pend_ld_killed;
                     req_paddr     <= pend_paddr;
+                    req_mshr_line_match_r <= {N_MSHR{1'b0}};
                     req_robid     <= pend_robid;
                     req_wdata     <= pend_wdata;
                     req_wstrb     <= pend_wstrb;
@@ -656,6 +723,7 @@ always @(posedge clk) begin
                     req_uncached  <= 1'b0;
                     req_cacop_op  <= cacop_pend_op;
                     req_paddr     <= cacop_pend_addr;
+                    req_mshr_line_match_r <= {N_MSHR{1'b0}};
                     cacop_pend    <= 1'b0;
                     state         <= S_LOOKUP;
                 end else if (st_take) begin
@@ -664,6 +732,7 @@ always @(posedge clk) begin
                     req_is_ld     <= 1'b0;
                     req_ld_killed <= 1'b0;
                     req_paddr     <= st_paddr_i;
+                    req_mshr_line_match_r <= st_take_line_match;
                     req_wdata     <= st_data_i;
                     req_wstrb     <= st_strb_i;
                     req_size      <= st_size_i;
@@ -675,6 +744,7 @@ always @(posedge clk) begin
                     req_is_ld     <= 1'b1;
                     req_ld_killed <= ld_cancel_i; // 同拍冲刷：直接 killed
                     req_paddr     <= ld_paddr_i;
+                    req_mshr_line_match_r <= {N_MSHR{1'b0}};
                     req_robid     <= ld_robid_i;
                     req_size      <= ld_size_i;
                     req_uncached  <= ld_uncached_i;
@@ -705,8 +775,13 @@ always @(posedge clk) begin
                     case (req_cacop_op)
                         `CACOP_OP_IDX_INV: begin
                             // op0 StoreTag：直接无效化（无写回）
-                            valid_arr[cac_way][cac_set] <= 1'b0;
-                            dirty_arr[cac_way][cac_set] <= 1'b0;
+                            meta_front_pend     <= 1'b1;
+                            meta_front_way      <= cac_way;
+                            meta_front_set      <= cac_set;
+                            meta_front_valid_we <= 1'b1;
+                            meta_front_valid    <= 1'b0;
+                            meta_front_dirty_we <= 1'b1;
+                            meta_front_dirty    <= 1'b0;
                             state <= S_IDLE;
                         end
                         `CACOP_OP_HIT_INV: begin
@@ -714,12 +789,22 @@ always @(posedge clk) begin
                             if (valid_arr[cac_way][cac_set] && dirty_arr[cac_way][cac_set]) begin
                                 cwb_tag  <= tag_rd[cac_way];   // cac_set == req_set
                                 cwb_line <= data_out[cac_way];
-                                valid_arr[cac_way][cac_set] <= 1'b0;
-                                dirty_arr[cac_way][cac_set] <= 1'b0;
+                                meta_front_pend     <= 1'b1;
+                                meta_front_way      <= cac_way;
+                                meta_front_set      <= cac_set;
+                                meta_front_valid_we <= 1'b1;
+                                meta_front_valid    <= 1'b0;
+                                meta_front_dirty_we <= 1'b1;
+                                meta_front_dirty    <= 1'b0;
                                 state <= S_CAC_WB0;
                             end else begin
-                                valid_arr[cac_way][cac_set] <= 1'b0;
-                                dirty_arr[cac_way][cac_set] <= 1'b0;
+                                meta_front_pend     <= 1'b1;
+                                meta_front_way      <= cac_way;
+                                meta_front_set      <= cac_set;
+                                meta_front_valid_we <= 1'b1;
+                                meta_front_valid    <= 1'b0;
+                                meta_front_dirty_we <= 1'b1;
+                                meta_front_dirty    <= 1'b0;
                                 state <= S_IDLE;
                             end
                         end
@@ -729,11 +814,21 @@ always @(posedge clk) begin
                                 if (dirty_arr[hit_way][req_set]) begin
                                     cwb_tag  <= tag_rd[hit_way];
                                     cwb_line <= data_out[hit_way];
-                                    valid_arr[hit_way][req_set] <= 1'b0;
-                                    dirty_arr[hit_way][req_set] <= 1'b0;
+                                    meta_front_pend     <= 1'b1;
+                                    meta_front_way      <= hit_way;
+                                    meta_front_set      <= req_set;
+                                    meta_front_valid_we <= 1'b1;
+                                    meta_front_valid    <= 1'b0;
+                                    meta_front_dirty_we <= 1'b1;
+                                    meta_front_dirty    <= 1'b0;
                                     state <= S_CAC_WB0;
                                 end else begin
-                                    valid_arr[hit_way][req_set] <= 1'b0;
+                                    meta_front_pend     <= 1'b1;
+                                    meta_front_way      <= hit_way;
+                                    meta_front_set      <= req_set;
+                                    meta_front_valid_we <= 1'b1;
+                                    meta_front_valid    <= 1'b0;
+                                    meta_front_dirty_we <= 1'b0;
                                     state <= S_CAC_L2;
                                 end
                             end else begin
@@ -749,11 +844,62 @@ always @(posedge clk) begin
                     // 同行 store 合入在飞 MSHR：posted st_done，前端回 IDLE
                     req_ld_killed <= 1'b0;
                     state <= S_IDLE;
+                end else if (hit_any && req_is_ld
+                          && !(req_ld_killed || ld_cancel_i)
+                          && !ld_resp_ready_i) begin
+                    // LSU 暂存槽满：保持当前 tag/data 与 robid，直到握手。
+                    state <= S_LOOKUP;
                 end else if (hit_any) begin
                     // 命中：load 出数 / store 合并写（组合块），本拍完成
-                    if (req_is_st) dirty_arr[hit_way][req_set] <= 1'b1;
-                    req_ld_killed <= 1'b0;
-                    state <= S_IDLE;
+                    if (req_is_st) begin
+                        meta_front_pend     <= 1'b1;
+                        meta_front_way      <= hit_way;
+                        meta_front_set      <= req_set;
+                        meta_front_valid_we <= 1'b0;
+                        meta_front_dirty_we <= 1'b1;
+                        meta_front_dirty    <= 1'b1;
+                    end
+                    // A completing load hit may use the free RAM read port to
+                    // launch one waiting SB/LSU request. Keep that accepted
+                    // request in LOOKUP instead of inserting an IDLE bubble.
+                    if (cacop_take) begin
+                        req_is_cacop  <= 1'b1;
+                        req_is_st     <= 1'b0;
+                        req_is_ld     <= 1'b0;
+                        req_ld_killed <= 1'b0;
+                        req_uncached  <= 1'b0;
+                        req_cacop_op  <= cacop_pend_op;
+                        req_paddr     <= cacop_pend_addr;
+                        req_mshr_line_match_r <= {N_MSHR{1'b0}};
+                        cacop_pend    <= 1'b0;
+                        state         <= S_LOOKUP;
+                    end else if (st_take) begin
+                        req_is_cacop  <= 1'b0;
+                        req_is_st     <= 1'b1;
+                        req_is_ld     <= 1'b0;
+                        req_ld_killed <= 1'b0;
+                        req_paddr     <= st_paddr_i;
+                        req_mshr_line_match_r <= st_take_line_match;
+                        req_wdata     <= st_data_i;
+                        req_wstrb     <= st_strb_i;
+                        req_size      <= st_size_i;
+                        req_uncached  <= st_uncached_i;
+                        state         <= S_LOOKUP;
+                    end else if (ld_take) begin
+                        req_is_cacop  <= 1'b0;
+                        req_is_st     <= 1'b0;
+                        req_is_ld     <= 1'b1;
+                        req_ld_killed <= ld_cancel_i;
+                        req_paddr     <= ld_paddr_i;
+                        req_mshr_line_match_r <= {N_MSHR{1'b0}};
+                        req_robid     <= ld_robid_i;
+                        req_size      <= ld_size_i;
+                        req_uncached  <= ld_uncached_i;
+                        state         <= S_LOOKUP;
+                    end else begin
+                        req_ld_killed <= 1'b0;
+                        state <= S_IDLE;
+                    end
                 end else if (mshr_alloc_ok) begin
                     // miss：分配 MSHR（脏 victim 同拍进写回缓冲，见排空引擎块），
                     // 前端即空闲；ld_miss_o / st_done_o(posted) 在本拍组合给出
@@ -769,6 +915,7 @@ always @(posedge clk) begin
             S_MWAIT: begin
                 // uncached / 双重 pending / cacop：等资源后重查
                 if (!mshr_any_busy && wb_all_idle) begin
+                    req_mshr_line_match_r <= {N_MSHR{1'b0}};
                     state <= S_RELOOK;
                 end
             end
@@ -783,7 +930,7 @@ always @(posedge clk) begin
                     state    <= S_UC_RESP;
                 end
             end
-            S_UC_RESP: begin
+            S_UC_RESP: if ((req_ld_killed || ld_cancel_i) || ld_resp_ready_i) begin
                 req_ld_killed <= 1'b0;
                 state <= S_IDLE;
             end
@@ -833,6 +980,10 @@ always @(posedge clk) begin
         end
 
         for (mi = 0; mi < N_MSHR; mi = mi + 1) begin
+            // 冲刷后旧 load 不再向 LSU 返回。重填/安装继续在后台完成，
+            // 但响应资格在 DCache 内部取消，避免 ROB 标签复用后的 ABA。
+            if (ld_cancel_i)
+                mshr_ld_resp_pend[mi] <= 1'b0;
             case (mshr_state[mi])
                 M_IDLE: begin
                     if (mshr_alloc && (mshr_free_idx == mi[MSHR_W-1:0])) begin
@@ -866,7 +1017,7 @@ always @(posedge clk) begin
                     end
                 end
                 M_RDATA: begin
-                    if (ld_mshr_data_ok_o && (axi_mshr_grant == mi[MSHR_W-1:0]))
+                    if (mshr_resp_fire && (axi_mshr_grant == mi[MSHR_W-1:0]))
                         mshr_ld_resp_pend[mi] <= 1'b0;
                     if (mshr_beat0 && (axi_mshr_grant == mi[MSHR_W-1:0]))
                         mshr_b0[mi] <= axi_ret_data;
@@ -1031,7 +1182,7 @@ always @(posedge clk) begin
                   && (mshr_age[dc_mshr_pc_i] != 16'hffff))
                 mshr_age[dc_mshr_pc_i] <= mshr_age[dc_mshr_pc_i] + 16'd1;
         end
-        if (ld_mshr_data_ok_o) begin
+        if (mshr_resp_fire) begin
             dc_ld_miss_n       <= dc_ld_miss_n + 64'd1;
             dc_ld_miss_lat_sum <= dc_ld_miss_lat_sum + {48'd0, mshr_age[axi_mshr_grant]};
             if (mshr_age[axi_mshr_grant] > dc_ld_miss_lat_max)

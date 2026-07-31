@@ -107,6 +107,7 @@ reg [1:0]  cacop_pend_op;
 reg [31:0] cacop_pend_addr;
 reg        req_is_cacop;
 reg [1:0]  req_cacop_op;
+reg        refill_abort;   // miss 途中被 cacop 打中同 set：丢弃迟到的安装
 
 reg [1:0]        victim_way;
 reg [127:0]      refill_b0;       // 行 beat0（低半行）暂存
@@ -187,7 +188,7 @@ wire [IDXW-1:0] rd_set_idle = cacop_take ? cacop_pend_addr[IDXW+`CACHE_LINE_W-1:
 assign ram_re = cacop_take || req_take;
 
 wire [LINEW-1:0] refill_line = {axi_ret_data, refill_b0};
-wire refill_wr = (state == S_RDATA) && axi_ret_valid && axi_ret_last;
+wire refill_wr = (state == S_RDATA) && axi_ret_valid && axi_ret_last && !refill_abort;
 
 always @(*) begin
     ram_we    = {NWAY{1'b0}};
@@ -219,6 +220,7 @@ always @(posedge clk) begin
     if (!resetn) begin
         state      <= S_IDLE;
         cacop_pend <= 1'b0;
+        refill_abort <= 1'b0;
         for (s = 0; s < NWAY; s = s + 1)
             valid_arr[s] <= {NSET{1'b0}};
     end else begin
@@ -271,18 +273,40 @@ always @(posedge clk) begin
                 end else begin
                     victim_way      <= pick_way;
                     rr_ptr[req_set] <= rr_ptr[req_set] + 2'd1;
+                    refill_abort    <= 1'b0;
                     state           <= S_RREQ;
                 end
             end
 
-            S_RREQ: if (axi_rd_rdy) state <= S_RDATA;
+            S_RREQ: begin
+                // Index/Hit-inv cacop 针对本 miss 的 set：终止重填，避免 cacop
+                // 清 valid 后又被迟到的 refill 写回旧行。
+                if (cacop_en_i && (cacop_op_i != `CACOP_OP_HIT_WB) &&
+                    (cacop_addr_i[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W] == req_set))
+                    refill_abort <= 1'b1;
+                if (cacop_en_i && (cacop_op_i == `CACOP_OP_HIT_WB) &&
+                    (cacop_addr_i[31:`CACHE_LINE_W] == req_paddr[31:`CACHE_LINE_W]))
+                    refill_abort <= 1'b1;
+                if (axi_rd_rdy) state <= S_RDATA;
+            end
             S_RDATA: begin
+                if (cacop_en_i && (cacop_op_i != `CACOP_OP_HIT_WB) &&
+                    (cacop_addr_i[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W] == req_set))
+                    refill_abort <= 1'b1;
+                if (cacop_en_i && (cacop_op_i == `CACOP_OP_HIT_WB) &&
+                    (cacop_addr_i[31:`CACHE_LINE_W] == req_paddr[31:`CACHE_LINE_W]))
+                    refill_abort <= 1'b1;
                 if (axi_ret_valid) begin
                     if (axi_ret_last) begin
-                        // tag 写已移至 gen_tag（refill_wr 同拍同条件）
-                        valid_arr[victim_way][req_set] <= 1'b1;
-                        resp_line <= refill_line;
-                        state     <= S_RESP;
+                        if (refill_abort) begin
+                            refill_abort <= 1'b0;
+                            state        <= S_IDLE;
+                        end else begin
+                            // tag 写已移至 gen_tag（refill_wr 同拍同条件）
+                            valid_arr[victim_way][req_set] <= 1'b1;
+                            resp_line <= refill_line;
+                            state     <= S_RESP;
+                        end
                     end else begin
                         refill_b0 <= axi_ret_data;
                     end

@@ -108,6 +108,12 @@ module rob(
     input  wire [2:0]                 mem_wb_size_i,
     input  wire                       mem_wb_uncached_i,
     input  wire [`EXCP_NUM-1:0]       mem_wb_excp_i,      // 动态异常（与静态按位或）
+    // The raw memory completion above updates ROB state immediately.  ROB
+    // read ports use this registered copy for same-cycle operand forwarding,
+    // because a newly dispatched consumer cannot issue before the next cycle.
+    input  wire                       mem_fwd_valid_i,
+    input  wire [`ROB_W-1:0]          mem_fwd_robid_i,
+    input  wire [31:0]                mem_fwd_data_i,
     // ---- fu_mdu ----
     input  wire                       mdu_wb_valid_i,
     input  wire [`ROB_W-1:0]          mdu_wb_robid_i,
@@ -316,6 +322,36 @@ end
 wire [STA_W-1:0] sta_h0 = sta_even[head];
 wire [STA_W-1:0] sta_h1 = sta_odd[head];
 
+// Static no-execute entries do not need a per-entry completion FF write.
+// Derive their readiness only after the saved ROB static row reaches head:
+//   1) fetch/decode exception;
+//   2) DBAR/IBAR (the commit stage still performs the barrier action);
+//   3) no RF/memory/branch/privileged side effect.
+// This removes the IFU->decode->ROB complete allocation path and also avoids
+// storing is_nop in the static RAM.
+wire cmt0_static_excp = |sta_h0[STA_EXCP_LSB +: `EXCP_NUM];
+wire cmt1_static_excp = |sta_h1[STA_EXCP_LSB +: `EXCP_NUM];
+wire cmt0_barrier =
+    sta_h0[STA_PRIV_LSB + `PRIV_IBAR];
+wire cmt1_barrier =
+    sta_h1[STA_PRIV_LSB + `PRIV_IBAR];
+wire cmt0_no_side_effect =
+    !sta_h0[STA_RFWE_LSB]
+    && !sta_h0[STA_ISLD_LSB]
+    && !sta_h0[STA_ISST_LSB]
+    && !sta_h0[STA_ISBR_LSB]
+    && !(|sta_h0[STA_PRIV_LSB +: `PRIV_NUM]);
+wire cmt1_no_side_effect =
+    !sta_h1[STA_RFWE_LSB]
+    && !sta_h1[STA_ISLD_LSB]
+    && !sta_h1[STA_ISST_LSB]
+    && !sta_h1[STA_ISBR_LSB]
+    && !(|sta_h1[STA_PRIV_LSB +: `PRIV_NUM]);
+wire cmt0_static_done =
+    cmt0_static_excp || cmt0_barrier || cmt0_no_side_effect;
+wire cmt1_static_done =
+    cmt1_static_excp || cmt1_barrier || cmt1_no_side_effect;
+
 assign rob_tail_o = tail;
 // 满判据必须按 ROB_PAIR_W 位宽环形加：`ROB_GUARD` 是无宽度十进制字面量，
 // 若写成 (head == tail+ROB_GUARD)，右边被扩成 32 位（如 11+5=16），与 4 位
@@ -338,11 +374,11 @@ assign head_robid0_o = head0_idx;
 `define ROB_RDPORT(P) \
     wire wbhit``P = (alu0_wb_valid_i && (alu0_wb_robid_i == raddr``P``_i)) || \
                     (alu1_wb_valid_i && (alu1_wb_robid_i == raddr``P``_i)) || \
-                    (mem_wb_valid_i  && (mem_wb_robid_i  == raddr``P``_i)) || \
+                    (mem_fwd_valid_i && (mem_fwd_robid_i == raddr``P``_i)) || \
                     (mdu_wb_valid_i  && (mdu_wb_robid_i  == raddr``P``_i)); \
     wire [31:0] wbdat``P = (alu0_wb_valid_i && (alu0_wb_robid_i == raddr``P``_i)) ? alu0_wb_data_i : \
                            (alu1_wb_valid_i && (alu1_wb_robid_i == raddr``P``_i)) ? alu1_wb_data_i : \
-                           (mem_wb_valid_i  && (mem_wb_robid_i  == raddr``P``_i)) ? mem_wb_data_i  : \
+                           (mem_fwd_valid_i && (mem_fwd_robid_i == raddr``P``_i)) ? mem_fwd_data_i : \
                            (mdu_wb_valid_i  && (mdu_wb_robid_i  == raddr``P``_i)) ? mdu_wb_data_i  : 32'b0; \
     assign rrdy``P``_o  = complete[raddr``P``_i] | wbhit``P; \
     assign rdata``P``_o = wbhit``P ? wbdat``P : result[raddr``P``_i];
@@ -353,7 +389,7 @@ assign head_robid0_o = head0_idx;
 `undef ROB_RDPORT
 
 assign cmt0_valid_o = valid[head0_idx];
-assign cmt0_complete_o = complete[head0_idx];
+assign cmt0_complete_o = complete[head0_idx] || cmt0_static_done;
 assign cmt0_pc_o = sta_h0[STA_PC_LSB +: 32];
 assign cmt0_inst_is_b0_o = sta_h0[STA_B0_LSB];
 assign cmt0_is_direct_b_o = sta_h0[STA_DIRB_LSB];
@@ -382,7 +418,7 @@ assign cmt0_cacop_code_o = sta_h0[STA_CACOP_LSB +: 5];
 assign cmt0_excp_o = sta_h0[STA_EXCP_LSB +: `EXCP_NUM] | excp_dynamic[head0_idx];
 
 assign cmt1_valid_o = valid[head1_idx];
-assign cmt1_complete_o = complete[head1_idx];
+assign cmt1_complete_o = complete[head1_idx] || cmt1_static_done;
 assign cmt1_pc_o = sta_h1[STA_PC_LSB +: 32];
 assign cmt1_inst_is_b0_o = sta_h1[STA_B0_LSB];
 assign cmt1_is_direct_b_o = sta_h1[STA_DIRB_LSB];
@@ -454,10 +490,10 @@ always @(posedge clk) begin
         if (alloc_en_i && !rob_full_o) begin
             // 静态字段写已移至 sta_even/sta_odd LUTRAM（alloc_fire 同拍同条件）
             valid[alloc0_idx] <= a0_valid_i;
-            // NOP 或带静态(取指/译码)异常的指令在分配时即置 complete：二者都不会发射到 FU 写回,
-            // 取指异常(如 jirl 目标非对齐 ADEF)的"指令"是 inst=0 气泡,若不置 complete 会永远卡在
-            // ROB 头(无 FU 写回)→ 死锁。它只需到头抬异常即可。
-            complete[alloc0_idx] <= a0_valid_i && (a0_is_nop_i || (|a0_excp_i));
+            // Static no-execute completion is derived from sta_h* only at
+            // the ROB head.  Allocation therefore has no decode->complete
+            // timing dependency and always clears a reused dynamic bit.
+            complete[alloc0_idx] <= 1'b0;
             result[alloc0_idx] <= 32'b0;
             result2[alloc0_idx] <= 32'b0;
             paddr[alloc0_idx] <= 32'b0;
@@ -470,7 +506,7 @@ always @(posedge clk) begin
             excp_dynamic[alloc0_idx] <= {`EXCP_NUM{1'b0}};
 
             valid[alloc1_idx] <= a1_valid_i;
-            complete[alloc1_idx] <= a1_valid_i && (a1_is_nop_i || (|a1_excp_i));
+            complete[alloc1_idx] <= 1'b0;
             result[alloc1_idx] <= 32'b0;
             result2[alloc1_idx] <= 32'b0;
             paddr[alloc1_idx] <= 32'b0;

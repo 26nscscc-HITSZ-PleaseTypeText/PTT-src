@@ -325,6 +325,9 @@ flush/异常/回压/复位；关键不变量。辅助 RAM 可用简化头，但�
 3. 清理 `pref_70MHZ` 内误放的 65 MHz `timing_summary.rpt`。
 4. 板上 Linux/`/`# 与 DMA（同步当前 `IP/myCPU`，勿混 `chiplab_soc` 旧 L2）。
 5. （非阻塞）仿真 earlycon / bootargs；dual-outstanding、FTB overflow、256 KiB L2 根因。
+6. **WIP 正确性**：修复当前工作树 `func_lab19` `0x700` 后再谈合入；在此之前勿把 WIP IPC
+   当作发版数字。
+7. L2 性能：E 面 32→128 已证明显著；扩 256KB / write-allocate / L2 MSHR 仅在 lab19+Linux 绿后立项。
 
 ---
 
@@ -343,5 +346,76 @@ flush/异常/回压/复位；关键不变量。辅助 RAM 可用简化头，但�
 | 最终短矩阵 | `artifacts/v5.0/final_short_matrix.log` |
 | U-Boot → Linux | `artifacts/v5.0/final_uboot_linux.log` |
 | 256 KiB Linux 失败 | `artifacts/v5.0/candidate_l2_256k_linux_difftest.log` |
+| **2026-07-31 全套 PERF（WIP）** | `artifacts/v5.0/perf_matrix_128k/` |
+| **L2 32KB 对照** | `artifacts/v5.0/perf_matrix_32k/` |
+| 优化-仿真表手册 | `IP/myCPU/doc/优化-仿真表.md` |
 
 `artifacts/`、bitstream、DCP 和软件大镜像不入 Git；发布归档时另存并附 SHA-256。
+
+---
+
+## 11. 优化-仿真表全套 PERF 与 L2 复测（2026-07-31）
+
+> 手册：[优化-仿真表.md](../优化-仿真表.md)。seed=`5570815`。  
+> **被测对象**：chiplab 工作树未提交 RTL（LSU/D$/前端等 WIP），**不是** §0–§4 的发版快照。  
+> 发版 V5.0 数字仍以 §3–§4 / `artifacts/v5.0/final_*` 为准。
+
+### 11.1 L2 是否开启 / 是否吃满
+
+| 问题 | 结论 |
+|------|------|
+| L2 开了吗？ | **是**。`mycpu_top` 无条件例化统一写回 L2：**128KB**（2×2048×32B）；无 bypass。 |
+| 吃满了吗？ | **没有。** 探针 `perf_dcache_miss` L2 hit **94%**，但 Linux 发版日志仅 ~**56%**；无独立 L2 MSHR；行写 miss 不分配；主 FSM 单请求 + I-miss 引擎。 |
+| 「提升很大」归因 | **两层**：历史 V3.4 **32→128KB**（Linux ~+17%）；本 WIP 相对 V5 发版探针的大跳变主要来自 **LSU/前端微架构**，不是又扩了 L2。 |
+
+### 11.2 A–G 全套 PERF（WIP @ 128KB L2）
+
+| 面 | 负载 | IPC | Commit dual | D$ hit | L2 hit | Branch MPKI | MSHR busy | ld miss lat avg |
+|----|------|-----|-------------|--------|--------|-------------|-----------|-----------------|
+| A | `fireye/A0` | **1.325** | 89.1% | 84.5% | 90.0% | 0.183 | 30.7% | 2.55 |
+| A | `inner_product` | **1.101** | 65.6% | 97.1% | 89.8% | 0.073 | 2.1% | 2.94 |
+| B | `perf_front_stream` | 0.566 | 8.3% | 97.0% | 17.4% | 0.094 | 0.1% | 25.1 |
+| C | `perf_branch_mix` | 0.500 | 49.3% | 99.1% | 17.0% | **33.1** | 0.2% | 14.3 |
+| D | CoreMark | 0.217 | 50.5% | 98.8% | 40.4% | 2.74 | 0.1% | 24.9 |
+| E | `perf_dcache_miss` | **0.869** | 67.5% | 68.1% | **94.2%** | 0.179 | 16.5% | **2.03** |
+| E′ | `memcmp`（difftest） | 0.354 | 36.9% | 90.9% | 66.9% | 0.933 | 3.1% | 2.45 |
+| F | `perf_mshr_burst` | 0.476 | 55.2% | 71.3% | 80.8% | 0.297 | 14.5% | 2.58 |
+
+相对 **V5 发版**同探针（§4.1）：A0 `0.957→1.325`（+38%）、`dcache_miss` `0.746→0.869`（+16%）、`front`/`branch` 小幅上升。  
+**D 面**：A0 dual≈89% vs CoreMark dual≈50%（发版 CoreMark 曾仅 ~5%）——后端配对改善，但仍远低于 A0。  
+**G 面**（occupancy）：E/A0 上 MSHR max 仍顶满 cap=2；SB/STQ 未长期顶满；F 面不足以为 dual-OS 开绿灯（且 WIP lab19 红）。
+
+CoreMark UART：`Correct operation validated`（395.5 Iterations/Sec）。memcmp：到达 test end + difftest 无 mismatch 报告。
+
+### 11.3 L2 容量 A/B（同 WIP，临时 `L2_NSET=512` → 32KB，测完已恢复 128KB）
+
+| 负载 | L2 | IPC | L2 hit | MSHR busy | ld miss lat avg |
+|------|----|-----|--------|-----------|-----------------|
+| `perf_dcache_miss` | 128KB | **0.869** | **94.2%** | 16.5% | **2.03** |
+| `perf_dcache_miss` | 32KB | 0.649 | 22.7% | 45.1% | 13.4 |
+| `perf_mshr_burst` | 128KB | **0.476** | **80.8%** | 14.5% | **2.58** |
+| `perf_mshr_burst` | 32KB | 0.385 | 28.5% | 36.9% | 17.2 |
+
+解读：在默认 64KB 工作集探针上，**128KB 相对 32KB 的 IPC 增益约 +34%（E）/ +24%（F）**，与 V3.4「扩 L2 很赚」一致；L2 hit 从 ~23% 拉到 ~94% 是主因。  
+**未吃满证据**：同一微架构下 Linux 发版 L2 hit 仅 ~56% → 工作集/替换/写策略仍有头寸；无「关 L2」旁路对照。
+
+### 11.4 正确性与三仓库适配（本轮）
+
+| 项 | 结果 |
+|----|------|
+| L2 CACOP 专项（WIP `l2cache`） | **PASS**（`scripts/v5/test_l2_cacop.sh`） |
+| `func_lab19` difftest（WIP） | **FAIL** `Both Error(Code:0x700)`；日志见 `artifacts/v5.0/perf_matrix_128k/run_lab19_real.log` |
+| `chiplab_soc` myCPU | 已用 chiplab **`02e8922` HEAD** 覆盖（128KB + `l2_cacop`）；**不含 WIP**。戳记：`chiplab_soc/.../SYNC_FROM_CHIPLAB.txt` |
+| la32r-U-Boot | Kconfig 默认改为 32B/shift=5（无 prompt 符号原先忽略 defconfig）；`make la32rsoc_defconfig` 后 `.config` 为 32 |
+| la32r-Linux | DMA 仍为 Hit-WB+Inv；增补 **scache 信息打印**（128KB/2-way/32B），不改 DMA 算法 |
+| 手册 | `Chiplab_for_vivado启动linux与ucore手册.md` §0：禁止混旧 SoC 核 |
+
+**剩余缺口（文档化，未改 RTL）**：Index/I$ cacop 不清 L2；Linux `flush_icache_range` 仅 `ibar`；无 `Cache_S`。
+
+### 11.5 瓶颈解读（WIP）
+
+1. **E 面已证明 128KB L2 价值很大**；再扩容量前必须先修 lab19。  
+2. **C 面 Branch MPKI≈33** 仍是分支探针主痛（相对 L2）。  
+3. **B 面** I$ hit≈100% 但 IB `push_stall` / FTQ pending 高 → 供指结构，不是 L2。  
+4. **F 面** MSHR 顶满但 dual-OS 历史有 Linux 风险 → 暂不开。  
+5. 发版路径继续用 §0 门控；WIP 大 IPC **不得**覆盖发版结论。

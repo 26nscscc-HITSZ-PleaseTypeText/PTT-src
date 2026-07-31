@@ -46,7 +46,8 @@
 // - 不变量：VB 与 L2 主体不同时持有同一行（安装/重填时清对应 VB 项），
 //   避免 L2 干净换出后读到 VB 陈旧副本；
 // - uncached 写命中 L2 行或 VB 行时失效对应副本，防止 cached/uncached
-//   混用时读到陈旧数据。
+//   混用时读到陈旧数据；若 I-miss 引擎正在填充同一行，标记陈旧并禁止安装，
+//   避免「先失效、后把写前旧行装回」窗口；
 //
 // cacop 写回（dc_wr_cacop=1 的行写）：写穿语义——L2 命中则更新数据并
 // 清脏位，且无论命中与否都直通写到内存（Linux 下 DMA/外设一致性要求
@@ -155,6 +156,7 @@ reg [31:5]      im_line_addr;    // 行地址
 reg             im_way_r;        // NWAY=2，0/1 选择安装路
 reg [127:0]     im_b0;
 reg [LINEW-1:0] im_line;
+reg             im_line_stale;   // UC/维护写覆盖了本填充，禁止安装/回送
 
 wire im_busy = (im_state != IM_IDLE);
 wire [IDXW-1:0] im_set = im_line_addr[IDXW+`CACHE_LINE_W-1:`CACHE_LINE_W];
@@ -306,6 +308,11 @@ assign ic_rd_rdy = (lk_ic_line_rd && (hit_any || vb_hit))   // 主 FSM 2 拍回�
 // ---------------- 上行返回（主 FSM + 引擎归并）----------------
 wire ret_beat  = (state == S_RET0) || (state == S_RET1);
 wire byp_beat  = (state == S_BYP_RET);
+// A demand D-cache line refill already arrives from memory in the exact
+// low-half/high-half order expected by DCache.  Stream those beats upstream
+// instead of first collecting the whole line and replaying it for two more
+// cycles.  The final beat still installs the complete line in L2 below.
+wire dc_refill_stream = (state == S_MRDATA) && !req_is_ic && mem_ret_valid;
 wire [127:0] ret_data_mux = byp_beat ? byp_data
                           : (state == S_RET0) ? ret_line[127:0] : ret_line[255:128];
 
@@ -316,9 +323,10 @@ assign ic_ret_valid = (req_is_ic && (ret_beat || byp_beat)) | im_ret_beat;
 assign ic_ret_last  = (req_is_ic && ((state == S_RET1) || byp_beat)) | (im_state == IM_RET1);
 assign ic_ret_data  = im_ret_beat ? im_ret_data_mux : ret_data_mux;
 
-assign dc_ret_valid = !req_is_ic && (ret_beat || byp_beat);
-assign dc_ret_last  = !req_is_ic && ((state == S_RET1) || byp_beat);
-assign dc_ret_data  = ret_data_mux;
+assign dc_ret_valid = (!req_is_ic && (ret_beat || byp_beat)) || dc_refill_stream;
+assign dc_ret_last  = (!req_is_ic && ((state == S_RET1) || byp_beat))
+                    || (dc_refill_stream && mem_ret_last);
+assign dc_ret_data  = dc_refill_stream ? mem_ret_data : ret_data_mux;
 
 // ---------------- 下游接口 ----------------
 assign mem_rd_req  = (state == S_MRREQ) || (state == S_BYP_RREQ);
@@ -358,8 +366,17 @@ wire whit_wr_en   = (state == S_LOOKUP) && !req_is_rd && req_is_line && hit_any;
 wire ucw_inval_en = (state == S_LOOKUP) && !req_is_maint
                   && !req_is_rd && !req_is_line && hit_any;
 wire maint_inval_en = (state == S_LOOKUP) && req_is_maint && hit_any;
+// UC/DMA 维护写到 I-miss 引擎正在填充的同一行时必须丢弃该填充：
+// 否则 LOOKUP 拍仅挡住一拍 im_install_fire，下一拍会把写前读到的旧行
+// 重新装回 L2（自修改 + icacop 场景下会再次喂给 I$）。
+wire ucw_im_conflict = (state == S_LOOKUP) && !req_is_maint
+                    && !req_is_rd && !req_is_line && im_busy
+                    && (req_addr[31:5] == im_line_addr);
+wire maint_im_conflict = (state == S_LOOKUP) && req_is_maint && im_busy
+                      && (req_addr[31:5] == im_line_addr);
+wire im_fill_abort = ucw_im_conflict || maint_im_conflict;
 // 引擎安装拍：主 FSM 无任何 RAM 活动时插队
-wire im_install_fire = (im_state == IM_INSTALL) && !initing
+wire im_install_fire = (im_state == IM_INSTALL) && !initing && !im_fill_abort
                     && !refill_wr_en && !whit_wr_en && !ucw_inval_en && !maint_inval_en
                     && (state != S_WCAP)
                     && !(grant_wr || grant_dc_rd || grant_ic_rd || grant_pf);
@@ -626,7 +643,9 @@ always @(posedge clk) begin
                 if (mem_ret_valid) begin
                     if (mem_ret_last) begin
                         ret_line <= {mem_ret_data, refill_b0};
-                        state    <= S_RET0;
+                        // D-cache consumed both refill beats directly while
+                        // they arrived, so no S_RET0/S_RET1 replay is needed.
+                        state    <= S_IDLE;
                     end else begin
                         refill_b0 <= mem_ret_data;
                     end
@@ -683,13 +702,20 @@ always @(posedge clk) begin
         im_attach <= 1'b0;
         im_line_addr <= 27'b0;
         im_way_r     <= 1'b0;
+        im_line_stale <= 1'b0;
     end else begin
+        // UC/维护写中同一行：标记在途填充为陈旧。不在 RREQ/RDATA 中途
+        // 拉回 IDLE，以免丢掉已发出的 mem2 应答；到 INSTALL 时丢弃安装。
+        if (im_fill_abort)
+            im_line_stale <= 1'b1;
+
         case (im_state)
             IM_IDLE: begin
                 if (im_alloc) begin
                     im_line_addr <= req_addr[31:5];
                     im_way_r     <= im_alloc_demand_wb ? victim_way_r : pick_way;
                     im_attach <= !im_alloc_pf;   // demand 要回数，纯预取只装表
+                    im_line_stale <= 1'b0;
                     im_state  <= IM_RREQ;
                 end
             end
@@ -705,13 +731,26 @@ always @(posedge clk) begin
                 end
             end
             IM_INSTALL: begin
-                if (im_install_fire) begin
+                if (im_line_stale || im_fill_abort) begin
+                    im_attach <= 1'b0;
+                    im_line_stale <= 1'b0;
+                    im_state  <= IM_IDLE;
+                end else if (im_install_fire) begin
                     im_state <= im_attach ? IM_RET0 : IM_IDLE;
                 end
             end
-            IM_RET0: im_state <= IM_RET1;
+            IM_RET0: begin
+                if (im_line_stale || im_fill_abort) begin
+                    im_attach <= 1'b0;
+                    im_line_stale <= 1'b0;
+                    im_state  <= IM_IDLE;
+                end else begin
+                    im_state <= IM_RET1;
+                end
+            end
             IM_RET1: begin
                 im_attach <= 1'b0;
+                im_line_stale <= 1'b0;
                 im_state  <= IM_IDLE;
             end
             default: im_state <= IM_IDLE;

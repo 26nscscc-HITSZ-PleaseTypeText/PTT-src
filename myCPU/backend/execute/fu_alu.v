@@ -120,7 +120,8 @@ wire [31:0] br_target = ex_br_op[`BR_OP_JIRL]
 assign wb_br_taken_o  = ex_valid & br_taken;
 assign wb_br_target_o = (ex_valid && is_branch) ? br_target : 32'b0;
 
-assign early_wakeup_valid_o = issue_valid_i && !flush_i && !reset;
+assign early_wakeup_valid_o = (`ALU_EARLY_WAKEUP_ENABLE != 0)
+                            && issue_valid_i && !flush_i && !reset;
 assign early_wakeup_robid_o = issue_robid_i;
 
 endmodule

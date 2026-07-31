@@ -2,7 +2,8 @@
 // lsu 模块（访存单元：AGU + DC 两级流水 + miss 槽非阻塞 load）
 // ------------------------------------------------------------
 // 结构：
-// - AGU 级：vaddr=base+imm -> MMU 组合翻译 -> ALE/ADEM/TLB 异常 ->
+// - issue→AGU 边界先计算并锁存 vaddr=base+imm；AGU 级只做 MMU 组合翻译、
+//   ALE/ADEM/TLB 异常与 store 对齐，避免地址加法和 TLB 搜索串在同一拍 ->
 //   store 数据按地址对齐 + wstrb 生成；
 // - DC 级：store/cacop/异常直接写回；load 先查 SB 前递，再访 DCache；
 // - miss 槽（深度 `LSU_MISS_DEPTH`）：cached miss 移入槽，robid 配对返回；
@@ -59,6 +60,8 @@ module lsu(
     input  wire                       dc_addr_ok_i,
     input  wire                       dc_data_ok_i,
     input  wire [31:0]                dc_rdata_i,
+    input  wire [`ROB_W-1:0]          dc_resp_robid_i,
+    output wire                       dc_resp_ready_o,
     output wire                       dc_cancel_o,         // 冲刷：通知 dcache 杀 load MSHR
     // ---- 非阻塞 miss 扩展（配合 dcache MSHR）----
     input  wire                       dc_miss_i,           // 在途 load 移入 MSHR（一拍）
@@ -92,6 +95,16 @@ module lsu(
     output wire                       wb_uncached_o,       // 非缓存访问
     output wire [`EXCP_NUM-1:0]       wb_excp_o,           // 动态异常（ALE/ADEM/TLBR_M/PIL/PIS/PPI_M/PME）
 
+    // Dedicated same-cycle cached load-hit bypass.  Miss/hold/store
+    // completions remain exclusively on the normal writeback path.
+    output wire                       fast_wb_valid_o,
+    output wire [`ROB_W-1:0]          fast_wb_robid_o,
+    output wire [31:0]                fast_wb_data_o,
+    // Registered hold-only subset for timing-sensitive consumers such as MDU.
+    output wire                       hold_wb_valid_o,
+    output wire [`ROB_W-1:0]          hold_wb_robid_o,
+    output wire [31:0]                hold_wb_data_o,
+
     // ---------------- DC 级命中限定早唤醒（顶层可选择打一拍）----------------
     output wire                       early_wakeup_valid_o,
     output wire [`ROB_W-1:0]          early_wakeup_robid_o
@@ -105,9 +118,16 @@ reg [`ROB_W-1:0]       a_robid;
 reg [`MEM_OP_NUM-1:0]  a_mem_op;
 reg                    a_is_cacop;
 reg [4:3]              a_cacop_op;
-reg [31:0]             a_base, a_wdata, a_imm;
+reg [31:0]             a_vaddr, a_wdata;
 
-wire [31:0] a_vaddr = a_base + a_imm;
+// One-entry issue skid. LSU ready depends only on this register, so the
+// store-buffer forwarding cone cannot reach back into rs_mem.
+reg                    q_valid;
+reg [`ROB_W-1:0]       q_robid;
+reg [`MEM_OP_NUM-1:0]  q_mem_op;
+reg                    q_is_cacop;
+reg [4:3]              q_cacop_op;
+reg [31:0]             q_vaddr, q_wdata;
 
 wire a_is_store_op = a_mem_op[`MEM_OP_ST_W] | a_mem_op[`MEM_OP_ST_B]
                    | a_mem_op[`MEM_OP_ST_H] | a_mem_op[`MEM_OP_SC_W];
@@ -185,8 +205,62 @@ reg [3:0]              d_st_strb;
 reg [2:0]              d_size;
 reg                    d_uncached;
 reg [`EXCP_NUM-1:0]    d_excp;
-reg                    d_req_sent;      // DCache 已收下请求，等响应（data_ok 或 miss）
-reg                    d_drop;          // 冲刷后丢弃下一个前端响应
+
+// ---------------- DCache 前端请求标签（最多 4 项）----------------
+// DCache 可以把一个冲突请求挂入 pending，同时继续完成后续 hit，因此命中响应
+// 不能再隐含绑定当前 d 级。每次 addr_ok 时保存完整 load 元数据，命中/miss
+// 返回时由 DCache 给出的 robid 精确匹配。flush 同时清表；DCache 内部取消旧
+// MSHR/LOOKUP 响应，避免 ROB 标签复用后的 ABA。
+localparam TOK_N = 4;
+localparam TOK_W = 2;
+
+function automatic [TOK_W-1:0] lsu_tok_prio_low;
+    input [TOK_N-1:0] mask;
+    integer k;
+    reg found;
+    begin
+        lsu_tok_prio_low = {TOK_W{1'b0}};
+        found = 1'b0;
+        for (k = 0; k < TOK_N; k = k + 1) begin
+            if (mask[k] && !found) begin
+                lsu_tok_prio_low = k[TOK_W-1:0];
+                found = 1'b1;
+            end
+        end
+    end
+endfunction
+
+reg                    t_valid    [0:TOK_N-1];
+reg [`ROB_W-1:0]       t_robid    [0:TOK_N-1];
+reg [`MEM_OP_NUM-1:0]  t_mem_op   [0:TOK_N-1];
+reg [31:0]             t_vaddr    [0:TOK_N-1];
+reg [31:0]             t_paddr    [0:TOK_N-1];
+reg [2:0]              t_size     [0:TOK_N-1];
+reg                    t_uncached [0:TOK_N-1];
+// Timing-only validity mirror indexed directly by ROB id. DCache already
+// returns the request ROB id, so raw dependency wakeup need not traverse the
+// four-entry token CAM and priority encoder.
+reg [`ROB_SIZE-1:0]    fast_tok_valid;
+
+wire [TOK_N-1:0] t_valid_oh;
+wire [TOK_N-1:0] t_free_oh;
+wire [TOK_N-1:0] t_match_oh;
+genvar ti;
+generate
+for (ti = 0; ti < TOK_N; ti = ti + 1) begin : g_tok_status
+    assign t_valid_oh[ti] = t_valid[ti];
+    assign t_free_oh[ti]  = !t_valid[ti];
+    assign t_match_oh[ti] = t_valid[ti] && (t_robid[ti] == dc_resp_robid_i);
+end
+endgenerate
+wire             t_has_free  = |t_free_oh;
+wire [TOK_W-1:0] t_free_idx  = lsu_tok_prio_low(t_free_oh);
+wire             t_match_vld = |t_match_oh;
+wire [TOK_W-1:0] t_match_idx = lsu_tok_prio_low(t_match_oh);
+
+// 保留原调试层次名，但语义改为“至少一个 DCache 前端 token 在途”。
+wire d_req_sent = |t_valid_oh;
+wire d_drop = 1'b0;
 
 // ---------------- miss 槽（MSHR 影子，深度 LSU_MISS_DEPTH）----------------
 localparam MISS_N = `LSU_MISS_DEPTH;
@@ -261,8 +335,13 @@ localparam STQ_W = (STQ_N <= 1) ? 1 : $clog2(STQ_N);
 reg                  stq_v    [0:STQ_N-1];
 reg [`ROB_W-1:0]     stq_id   [0:STQ_N-1];
 reg [31:0]           stq_pa   [0:STQ_N-1];
+reg [31:0]           stq_data [0:STQ_N-1];
 reg [3:0]            stq_strb [0:STQ_N-1];
 reg                  stq_uc   [0:STQ_N-1];
+// Index of the most recently issued store.  Memory stores issue in program
+// order, so this is the only entry that can supersede every older overlapping
+// store without a 16-entry youngest-age priority network.
+reg [STQ_W-1:0]      stq_last_idx;
 
 wire [`ROB_PAIR_W-1:0] head_pair   = rob_head_robid_i[`ROB_PAIR_W-1:0];
 wire                   head_s0_live= rob_head_robid_i[`ROB_W-1];
@@ -298,7 +377,10 @@ wire stq_overlap;
 wire [STQ_N-1:0] stq_hit_one;
 generate
 for (si = 0; si < STQ_N; si = si + 1) begin : g_stq_hz
-    assign stq_hit_one[si] = stq_v[si] && !stq_done[si]
+    // Keep an entry visible through its retirement cycle.  It is safe to wait
+    // or forward from that store for one extra cycle, and this deliberately
+    // removes ROB commit logic from the LSU request critical path.
+    assign stq_hit_one[si] = stq_v[si]
         && mem_st_ld_overlap(stq_pa[si][31:2], stq_strb[si], d_paddr[31:2], d_ld_bytes);
 end
 endgenerate
@@ -309,7 +391,7 @@ always @(*) begin
     stq_any_r = 1'b0;
     stq_any_uc_r = 1'b0;
     for (sj = 0; sj < STQ_N; sj = sj + 1) begin
-        if (stq_v[sj] && !stq_done[sj]) begin
+        if (stq_v[sj]) begin
             stq_any_r = 1'b1;
             if (stq_uc[sj])
                 stq_any_uc_r = 1'b1;
@@ -320,17 +402,30 @@ assign stq_any     = stq_any_r;
 assign stq_any_uc  = stq_any_uc_r;
 assign stq_overlap = |stq_hit_one;
 
+// Timing-safe store-to-load forwarding.  Only the globally newest live store
+// is considered.  When it covers every requested byte it necessarily
+// supersedes all older stores.  Other overlaps retain the conservative wait
+// path.  This trades a few forwarding opportunities for a single indexed
+// read, replacing the former 16-entry serial age/priority cone.
+wire        stq_last_valid = stq_v[stq_last_idx];
+wire [31:0] stq_youngest_data_r = stq_data[stq_last_idx];
+wire [3:0]  stq_youngest_strb_r = stq_strb[stq_last_idx];
+wire stq_fwd_hit = stq_last_valid && !stq_uc[stq_last_idx]
+                 && (stq_pa[stq_last_idx][31:2] == d_paddr[31:2])
+                 && ((stq_youngest_strb_r & d_ld_bytes) == d_ld_bytes);
+
 wire stq_full;
 reg stq_full_r;
 always @(*) begin
     stq_full_r = 1'b1;
     for (sj = 0; sj < STQ_N; sj = sj + 1)
-        if (!stq_v[sj] || stq_done[sj])
+        if (!stq_v[sj])
             stq_full_r = 1'b0;
 end
 assign stq_full = stq_full_r;
 
-wire store_order_block = d_uncached ? stq_any : (stq_overlap || stq_any_uc);
+wire store_order_block = d_uncached ? stq_any
+                                    : ((stq_overlap && !stq_fwd_hit) || stq_any_uc);
 
 // ---------------- DC 级行为 ----------------
 wire d_excp_any = |d_excp;
@@ -351,17 +446,21 @@ assign uncached_ld_inflight_o = d_is_unc_load || u_valid;
 // - 未决 store 先提交（顺序保护）；
 // - hold 槽空（防瞬态完成三方碰撞，见头注仲裁说明）；
 // - uncached load 额外等：到 ROB 头 + SB 无 uncached 残留（query_partial）
-wire d_ld_gate = !store_order_block && !h_valid
+wire d_ld_gate = !store_order_block && !h_valid && t_has_free
               && (!d_uncached || (d_at_head && !sb_query_partial_i));
 
 // load 处理分支
-wire d_sb_hit     = d_valid && d_is_load && !d_excp_any && !d_uncached && sb_query_hit_i;
+wire d_stq_hit    = d_valid && d_is_load && !d_excp_any && !d_uncached && stq_fwd_hit;
+wire d_sb_hit     = d_valid && d_is_load && !d_excp_any && !d_uncached
+                  && !d_stq_hit && sb_query_hit_i;
 wire d_sb_partial = d_valid && d_is_load && !d_excp_any && !d_uncached && sb_query_partial_i;
 
-wire d_need_dc = d_valid && d_is_load && !d_excp_any && !d_sb_hit && !d_sb_partial;
+wire d_need_dc = d_valid && d_is_load && !d_excp_any
+              && !d_stq_hit && !d_sb_hit && !d_sb_partial;
 
-// DCache 请求（保持至 addr_ok）
-assign dc_req_o      = d_need_dc && d_ld_gate && !d_req_sent && !d_drop && !flush_i;
+// DCache 请求（保持至 addr_ok）。addr_ok 后 d 级立即释放；返回元数据由 token
+// 表承担，因此连续 hit 可以利用 DCache LOOKUP 链做到每拍一条。
+assign dc_req_o      = d_need_dc && d_ld_gate && !flush_i;
 assign dc_vindex_o   = d_vaddr[11:5];
 assign dc_paddr_o    = d_paddr;
 assign dc_size_o     = d_size;
@@ -369,23 +468,12 @@ assign dc_uncached_o = d_uncached;
 assign dc_robid_o    = d_robid;
 assign dc_cancel_o   = flush_i;
 
-wire dc_fire   = dc_req_o && dc_addr_ok_i;
-// 前端响应二选一：数据返回（命中/uncached）或 miss 移交
-wire dc_return = d_req_sent && dc_data_ok_i && !d_drop;
-wire dc_return_drop = d_req_sent && dc_data_ok_i && d_drop;
-wire dc_missed = d_req_sent && dc_miss_i;
-
-// D$ miss 通知与 MSHR 分配保持同拍；完成条件寄存一拍，隔离
-// req_paddr→miss→lsu_ready→rs_mem 组合路径。
-reg dc_miss_done_r;
-always @(posedge clk) begin
-    if (reset)
-        dc_miss_done_r <= 1'b0;
-    else if (flush_i)
-        dc_miss_done_r <= 1'b0;
-    else
-        dc_miss_done_r <= dc_missed && (d_drop || m_has_free);
-end
+wire dc_fire = dc_req_o && dc_addr_ok_i;
+// data_ok 是 valid，ready 由 LSU 的单项完成暂存槽反压；miss 通知不需占
+// 写回口，只把 token 元数据移入已有 MSHR 影子槽。
+wire dc_return_valid = dc_data_ok_i && t_match_vld;
+wire dc_return       = dc_return_valid && dc_resp_ready_o;
+wire dc_missed       = dc_miss_i && t_match_vld;
 
 // MSHR 重填返回（按 robid 配对；m_drop 时静默消费）
 wire mshr_return      = m_match_vld && !m_drop[m_match_idx];
@@ -414,43 +502,75 @@ endfunction
 // 1) 异常：直接写回；2) store/cacop：直接写回；3) load：SB 命中或 DCache 返回
 wire wb_mshr_case  = mshr_return;                       // 最老，最高优先
 wire wb_hold_case  = !wb_mshr_case && h_valid;
-wire dcst_ok       = !wb_mshr_case && !h_valid;         // DC 级静态源可用口
+// 旧 hold 被写回的拍可由新 hit 原位补入；MSHR 抢口且 hold 已占用时反压
+// DCache，让 LOOKUP 保持到下一拍，所有 accepted load 都不会丢响应。
+assign dc_resp_ready_o = !h_valid || wb_hold_case;
+wire wb_ld_dc_case = !wb_mshr_case && !h_valid && dc_return;
+wire dcst_ok       = !wb_mshr_case && !h_valid && !dc_return;
 wire wb_excp_case  = dcst_ok && d_valid && d_excp_any;
 wire wb_st_case    = dcst_ok && d_valid && !d_excp_any && (d_is_store || d_is_cacop)
                   && !(d_is_store && stq_full);
 // SB 命中结果经 hold 暂存一拍，隔离逐字节前递合并到写回旁路的长组合路径。
 // flush 会丢弃尚未提交的 hold 内容；store_order_block 保证 store→load 顺序。
+wire stq_ready     = d_stq_hit && d_ld_gate && !store_order_block;
 wire sb_ready      = d_sb_hit && d_ld_gate && !store_order_block; // d_ld_gate 已含 !h_valid
 wire wb_ld_sb_case = 1'b0;                               // SB 命中仍走 hold，切断 SB→RS 组合路径
-// 启用 `LSU_DC_HIT_BYPASS` 时 D$ 命中同拍写回；MSHR 抢口时仍进入 hold。
-wire wb_ld_dc_case = (`LSU_DC_HIT_BYPASS != 0) && dcst_ok && dc_return;
-wire hold_cap_dc   = dc_return && ((`LSU_DC_HIT_BYPASS != 0) ? wb_mshr_case : 1'b1);
+// D$ 返回由 robid token 解包；被 MSHR/旧 hold 抢口时进入 hold。
+wire hold_cap_dc   = dc_return && !wb_ld_dc_case;
 // 所有就绪 SB 命中都进 hold(与 hold_cap_dc 互斥:同一 d 级 load 不会既 SB 命中又 DC 返回)
-wire hold_cap_sb   = sb_ready && !hold_cap_dc;
+wire hold_cap_stq  = stq_ready && !hold_cap_dc;
+wire hold_cap_sb   = sb_ready && !hold_cap_dc && !hold_cap_stq;
 
 assign wb_valid_o = (wb_mshr_case || wb_hold_case
                   || wb_excp_case || wb_st_case || wb_ld_sb_case || wb_ld_dc_case)
                   && !flush_i;
 assign wb_robid_o = wb_mshr_case ? m_robid[m_match_idx]
                   : wb_hold_case ? h_robid
+                  : wb_ld_dc_case ? t_robid[t_match_idx]
                   : d_robid;
 assign wb_data_o  = wb_mshr_case  ? shape_load(dc_mshr_rdata_i, m_mem_op[m_match_idx][7:4], m_vaddr[m_match_idx][1:0])
                   : wb_hold_case  ? h_data
                   : wb_ld_sb_case ? shape_load(sb_query_data_i, d_mem_op[7:4], d_vaddr[1:0])
-                  : wb_ld_dc_case ? shape_load(dc_rdata_i,      d_mem_op[7:4], d_vaddr[1:0])
+                  : wb_ld_dc_case ? shape_load(dc_rdata_i, t_mem_op[t_match_idx][7:4],
+                                               t_vaddr[t_match_idx][1:0])
                   : d_st_data;
-assign wb_paddr_o = wb_mshr_case ? m_paddr[m_match_idx] : wb_hold_case ? h_paddr : d_paddr;
-assign wb_vaddr_o = wb_mshr_case ? m_vaddr[m_match_idx] : wb_hold_case ? h_vaddr : d_vaddr;
-assign wb_wstrb_o = (!wb_mshr_case && !wb_hold_case && d_is_store && !d_excp_any) ? d_st_strb : 4'b0;
-assign wb_size_o  = wb_mshr_case ? m_size[m_match_idx] : wb_hold_case ? h_size : d_size;
-assign wb_uncached_o = (!wb_mshr_case && !wb_hold_case) && d_uncached;
-assign wb_excp_o  = (!wb_mshr_case && !wb_hold_case) ? d_excp : {`EXCP_NUM{1'b0}};
+assign wb_paddr_o = wb_mshr_case ? m_paddr[m_match_idx]
+                  : wb_hold_case ? h_paddr
+                  : wb_ld_dc_case ? t_paddr[t_match_idx] : d_paddr;
+assign wb_vaddr_o = wb_mshr_case ? m_vaddr[m_match_idx]
+                  : wb_hold_case ? h_vaddr
+                  : wb_ld_dc_case ? t_vaddr[t_match_idx] : d_vaddr;
+assign wb_wstrb_o = (!wb_mshr_case && !wb_hold_case && !wb_ld_dc_case
+                  && d_is_store && !d_excp_any) ? d_st_strb : 4'b0;
+assign wb_size_o  = wb_mshr_case ? m_size[m_match_idx]
+                  : wb_hold_case ? h_size
+                  : wb_ld_dc_case ? t_size[t_match_idx] : d_size;
+assign wb_uncached_o = wb_ld_dc_case ? t_uncached[t_match_idx]
+                     : (!wb_mshr_case && !wb_hold_case) && d_uncached;
+assign wb_excp_o  = (!wb_mshr_case && !wb_hold_case && !wb_ld_dc_case)
+                  ? d_excp : {`EXCP_NUM{1'b0}};
+// The dependency wakeup bus describes data readiness, not ownership of the
+// single architectural writeback port.  In particular, an older MSHR return
+// may win that port while the hold/DC-hit value below is already usable by a
+// dependent instruction.  Keeping this bus independent of wb_mshr_case both
+// preserves the useful early wakeup and removes the DCache-MSHR -> ALU cone.
+wire fast_hold_ready = h_valid;
+wire fast_dc_ready = (`LSU_DC_HIT_BYPASS != 0) && dc_data_ok_i
+                   && fast_tok_valid[dc_resp_robid_i];
+assign fast_wb_valid_o = (fast_hold_ready || fast_dc_ready) && !flush_i;
+assign fast_wb_robid_o = fast_hold_ready ? h_robid : dc_resp_robid_i;
+assign fast_wb_data_o  = fast_hold_ready
+                       ? h_data
+                       : shape_load(dc_rdata_i, t_mem_op[t_match_idx][7:4],
+                                    t_vaddr[t_match_idx][1:0]);
+assign hold_wb_valid_o = h_valid && !flush_i;
+assign hold_wb_robid_o = h_robid;
+assign hold_wb_data_o  = h_data;
 
 // ---------------- 流水推进 ----------------
 // DC 级本拍腾空：写回成功、miss 完成条件到达，或已捕获进 hold。
-wire d_done  = wb_excp_case || wb_st_case || wb_ld_sb_case || wb_ld_dc_case
-             || dc_miss_done_r || dc_return_drop
-             || hold_cap_dc || hold_cap_sb;
+wire d_done  = wb_excp_case || wb_st_case || wb_ld_sb_case
+             || dc_fire || hold_cap_stq || hold_cap_sb;
 
 // 年轻 UC park（宽版）：仅对【比 DC 中 UC 更老】的 AGU 让位。
 // 勿对更年轻 AGU 让位（会覆盖 u / 堵 RS）；u_valid 期间禁更年轻进 DC。
@@ -478,43 +598,60 @@ wire d_free   = !d_valid || d_done
 wire a_go     = a_valid && d_free && !u_reload && a_older_than_u;
 wire d_park   = (d_uc_yield && a_go && !u_valid) || (d_uc_yield && u_reload);
 
-assign lsu_ready_o = (!a_valid || a_go) && !flush_i;
+// Do not use a_go here: a_go contains the SB lookup result and formed the
+// synthesized store_buffer -> rs_mem critical path.
+assign lsu_ready_o = !q_valid && !flush_i;
+wire issue_accept = issue_valid_i && lsu_ready_o;
 
 always @(posedge clk) begin
     if (reset) begin
         a_valid    <= 1'b0;
+        q_valid    <= 1'b0;
         d_valid    <= 1'b0;
-        d_drop     <= 1'b0;
-        d_req_sent <= 1'b0;
         h_valid    <= 1'b0;
         u_valid    <= 1'b0;
+        fast_tok_valid <= {`ROB_SIZE{1'b0}};
+        for (sj = 0; sj < TOK_N; sj = sj + 1)
+            t_valid[sj] <= 1'b0;
         for (sj = 0; sj < MISS_N; sj = sj + 1) begin
             m_valid[sj] <= 1'b0;
             m_drop[sj]  <= 1'b0;
         end
         for (sj = 0; sj < STQ_N; sj = sj + 1)
             stq_v[sj] <= 1'b0;
+        stq_last_idx <= {STQ_W{1'b0}};
     end else if (flush_i) begin
         a_valid    <= 1'b0;
+        q_valid    <= 1'b0;
         d_valid    <= 1'b0;
         h_valid    <= 1'b0;
         u_valid    <= 1'b0;
+        fast_tok_valid <= {`ROB_SIZE{1'b0}};
+        for (sj = 0; sj < TOK_N; sj = sj + 1)
+            t_valid[sj] <= 1'b0;
         for (sj = 0; sj < STQ_N; sj = sj + 1)
             stq_v[sj] <= 1'b0;
-        d_drop     <= d_req_sent && !(dc_data_ok_i || dc_miss_i);
-        d_req_sent <= 1'b0;
         for (sj = 0; sj < MISS_N; sj = sj + 1) begin
-            if (m_match_vld && (sj[MISS_W-1:0] == m_match_idx)) begin
-                m_valid[sj] <= 1'b0;
-                m_drop[sj]  <= 1'b0;
-            end else if (m_valid[sj]) begin
-                m_drop[sj]  <= 1'b1;
-            end
+            m_valid[sj] <= 1'b0;
+            m_drop[sj]  <= 1'b0;
         end
     end else begin
-        // ---- 前端 drop 配对（冲刷遗留的在途响应）----
-        if (d_drop && (dc_data_ok_i || dc_miss_i)) begin
-            d_drop <= 1'b0;
+        if ((dc_data_ok_i || dc_miss_i) && fast_tok_valid[dc_resp_robid_i])
+            fast_tok_valid[dc_resp_robid_i] <= 1'b0;
+        if (dc_fire)
+            fast_tok_valid[d_robid] <= 1'b1;
+
+        // ---- DCache 前端 token：返回/移交 miss 清项，新请求 addr_ok 分配 ----
+        if (dc_return || dc_missed)
+            t_valid[t_match_idx] <= 1'b0;
+        if (dc_fire) begin
+            t_valid[t_free_idx]    <= 1'b1;
+            t_robid[t_free_idx]    <= d_robid;
+            t_mem_op[t_free_idx]   <= d_mem_op;
+            t_vaddr[t_free_idx]    <= d_vaddr;
+            t_paddr[t_free_idx]    <= d_paddr;
+            t_size[t_free_idx]     <= d_size;
+            t_uncached[t_free_idx] <= d_uncached;
         end
 
         // ---- miss 槽：返回清槽 / miss 分配 ----
@@ -522,28 +659,31 @@ always @(posedge clk) begin
             m_valid[m_match_idx] <= 1'b0;
             m_drop [m_match_idx] <= 1'b0;
         end
-        if (dc_missed && !d_drop && m_has_free) begin
+        if (dc_missed && m_has_free) begin
             m_valid[m_free_idx]  <= 1'b1;
             m_drop [m_free_idx]  <= 1'b0;
-            m_robid[m_free_idx]  <= d_robid;
-            m_mem_op[m_free_idx] <= d_mem_op;
-            m_vaddr[m_free_idx]  <= d_vaddr;
-            m_paddr[m_free_idx]  <= d_paddr;
-            m_size [m_free_idx]  <= d_size;
+            m_robid[m_free_idx]  <= t_robid[t_match_idx];
+            m_mem_op[m_free_idx] <= t_mem_op[t_match_idx];
+            m_vaddr[m_free_idx]  <= t_vaddr[t_match_idx];
+            m_paddr[m_free_idx]  <= t_paddr[t_match_idx];
+            m_size [m_free_idx]  <= t_size[t_match_idx];
         end
 
         // ---- hold 暂存槽 ----
         if (wb_hold_case) begin
             h_valid <= 1'b0;
         end
-        if (hold_cap_dc || hold_cap_sb) begin
+        if (hold_cap_dc || hold_cap_stq || hold_cap_sb) begin
             h_valid <= 1'b1;
-            h_robid <= d_robid;
-            h_data  <= hold_cap_dc ? shape_load(dc_rdata_i,      d_mem_op[7:4], d_vaddr[1:0])
+            h_robid <= hold_cap_dc ? t_robid[t_match_idx] : d_robid;
+            h_data  <= hold_cap_dc ? shape_load(dc_rdata_i, t_mem_op[t_match_idx][7:4],
+                                                t_vaddr[t_match_idx][1:0])
+                     : hold_cap_stq ? shape_load(stq_youngest_data_r, d_mem_op[7:4],
+                                                d_vaddr[1:0])
                                    : shape_load(sb_query_data_i, d_mem_op[7:4], d_vaddr[1:0]);
-            h_vaddr <= d_vaddr;
-            h_paddr <= d_paddr;
-            h_size  <= d_size;
+            h_vaddr <= hold_cap_dc ? t_vaddr[t_match_idx] : d_vaddr;
+            h_paddr <= hold_cap_dc ? t_paddr[t_match_idx] : d_paddr;
+            h_size  <= hold_cap_dc ? t_size[t_match_idx] : d_size;
         end
 
         // ---- 顺序保护：STQ 入/出 ----
@@ -556,12 +696,14 @@ always @(posedge clk) begin
             reg pushed;
             pushed = 1'b0;
             for (sk = 0; sk < STQ_N; sk = sk + 1) begin
-                if (!pushed && (!stq_v[sk] || stq_done[sk])) begin
+                if (!pushed && !stq_v[sk]) begin
                     stq_v[sk]    <= 1'b1;
                     stq_id[sk]   <= d_robid;
                     stq_pa[sk]   <= d_paddr;
+                    stq_data[sk] <= d_st_data;
                     stq_strb[sk] <= d_st_strb;
                     stq_uc[sk]   <= d_uncached;
+                    stq_last_idx <= sk[STQ_W-1:0];
                     pushed = 1'b1;
                 end
             end
@@ -569,8 +711,6 @@ always @(posedge clk) begin
 
         // ---- DC 级 / UC park / reload ----
         if (d_done && !u_reload && !a_go) d_valid <= 1'b0;
-        if (dc_fire) d_req_sent <= 1'b1;
-        if (dc_return || dc_return_drop || dc_missed) d_req_sent <= 1'b0;
 
         // park：把年轻 UC 挪到 u（可与 u_reload 交换）
         if (d_park) begin
@@ -597,7 +737,6 @@ always @(posedge clk) begin
             d_size     <= u_size;
             d_uncached <= 1'b1;
             d_excp     <= {`EXCP_NUM{1'b0}};
-            d_req_sent <= 1'b0;
         end else if (a_go) begin
             d_valid    <= 1'b1;
             d_robid    <= a_robid;
@@ -612,20 +751,39 @@ always @(posedge clk) begin
             d_size     <= a_size;
             d_uncached <= a_uncached;
             d_excp     <= a_excp;
-            d_req_sent <= 1'b0;
         end
-        if (a_go && !issue_valid_i) a_valid <= 1'b0;
-
-        // ---- 发射 -> AGU ----
-        if (issue_valid_i && lsu_ready_o) begin
-            a_valid    <= 1'b1;
-            a_robid    <= issue_robid_i;
-            a_mem_op   <= issue_mem_op_i;
-            a_is_cacop    <= issue_is_cacop_i;
-            a_cacop_op    <= issue_cacop_op_i;
-            a_base        <= issue_base_i;
-            a_wdata    <= issue_wdata_i;
-            a_imm      <= issue_imm_i;
+        // ---- rs_mem -> issue skid -> AGU ----
+        // Oldest data in q wins when A advances. A new issue enters A
+        // directly in the common no-stall case, or parks in q while A stalls.
+        if (a_go || !a_valid) begin
+            if (q_valid) begin
+                a_valid    <= 1'b1;
+                a_robid    <= q_robid;
+                a_mem_op   <= q_mem_op;
+                a_is_cacop <= q_is_cacop;
+                a_cacop_op <= q_cacop_op;
+                a_vaddr    <= q_vaddr;
+                a_wdata    <= q_wdata;
+                q_valid    <= 1'b0;
+            end else if (issue_accept) begin
+                a_valid    <= 1'b1;
+                a_robid    <= issue_robid_i;
+                a_mem_op   <= issue_mem_op_i;
+                a_is_cacop <= issue_is_cacop_i;
+                a_cacop_op <= issue_cacop_op_i;
+                a_vaddr    <= issue_base_i + issue_imm_i;
+                a_wdata    <= issue_wdata_i;
+            end else begin
+                a_valid    <= 1'b0;
+            end
+        end else if (issue_accept) begin
+            q_valid    <= 1'b1;
+            q_robid    <= issue_robid_i;
+            q_mem_op   <= issue_mem_op_i;
+            q_is_cacop <= issue_is_cacop_i;
+            q_cacop_op <= issue_cacop_op_i;
+            q_vaddr    <= issue_base_i + issue_imm_i;
+            q_wdata    <= issue_wdata_i;
         end
     end
 end
@@ -633,11 +791,11 @@ end
 // DC 级 early2：仅在 `LSU_EARLY2_ENABLE` 且「写回有保证」时唤醒。
 // bypass=0 时必须关 early2（否则依赖可能在 hold 写回前被唤醒，Linux hang）。
 wire d_early_ok = (`LSU_EARLY2_ENABLE != 0)
-                && d_valid && d_is_load && !d_excp_any && !d_is_cacop
+                && (dc_return || (d_valid && d_is_load && !d_excp_any && !d_is_cacop))
                 && !wb_mshr_case
                 && (dc_return || (sb_ready && !hold_cap_dc));
 assign early_wakeup_valid_o = d_early_ok && !flush_i && !reset;
-assign early_wakeup_robid_o = d_robid;
+assign early_wakeup_robid_o = dc_return ? t_robid[t_match_idx] : d_robid;
 
 `ifdef SYNTHESIS
 // synthesis translate_off

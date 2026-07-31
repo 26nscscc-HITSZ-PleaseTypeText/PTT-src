@@ -165,7 +165,7 @@ function [`TAGE_TAG_W-1:0] ttag_h;
     end
 endfunction
 
-// ---------------- 训练流水线寄存器（T0 读表 / T1 / T2 写回）----------------
+// ---------------- 训练流水线寄存器（T0 读表 / T1 / T2 计算 / T3 写回）----------------
 reg        t0_valid;
 reg [21:2] t0_pc;
 reg        t0_taken, t0_mispred;
@@ -230,14 +230,17 @@ end
 // ---------------- 基础表（bimodal，2R+1W）----------------
 wire [BASE_IDXW-1:0] q_base_idx = query_pc_i[2 +: BASE_IDXW];
 wire [1:0] base_q_rdata;
-reg        base_we;
-reg [BASE_IDXW-1:0] base_waddr;
-reg [1:0]  base_wdata;
+reg        base_we_calc;
+reg [BASE_IDXW-1:0] base_waddr_calc;
+reg [1:0]  base_wdata_calc;
+reg        t3_base_we;
+reg [BASE_IDXW-1:0] t3_base_waddr;
+reg [1:0]  t3_base_wdata;
 
 tage_base_ram u_base(
     .clk(clk),
     .q_raddr(q_base_idx), .q_rdata(base_q_rdata),
-    .we(base_we), .waddr(base_waddr), .wdata(base_wdata)
+    .we(t3_base_we), .waddr(t3_base_waddr), .wdata(t3_base_wdata)
 );
 
 // ---------------- 4 个标记表（2R+1W）----------------
@@ -245,9 +248,22 @@ wire [TIDXW-1:0] q_idx [0:3];
 wire [`TAGE_TAG_W-1:0] q_tag [0:3];
 wire [TENTRY_W-1:0] t_q_rdata [0:3];
 wire [TENTRY_W-1:0] t_train_rdata [0:3];
-reg  [3:0] t_we;
-reg  [TIDXW-1:0] t_waddr [0:3];
-reg  [TENTRY_W-1:0] t_wdata [0:3];
+reg  [3:0] t_we_calc;
+reg  [TIDXW-1:0] t_waddr_calc [0:3];
+reg  [TENTRY_W-1:0] t_wdata_calc [0:3];
+// The RAM write port is driven only by these registers.  This prevents the
+// T2 allocation/provider network from directly reaching the RAM bypass
+// registers and BRAM write controls in the same cycle.
+reg  [3:0] t3_t_we;
+reg  [TIDXW-1:0] t3_t_waddr [0:3];
+reg  [TENTRY_W-1:0] t3_t_wdata [0:3];
+// A just-committed command is retained for one more cycle.  A training read
+// may have been issued before that write reached the duplicated RAMs, so T2
+// needs both the pending and the just-committed commands for correct RAW
+// forwarding.
+reg  [3:0] t3_last_t_we;
+reg  [TIDXW-1:0] t3_last_t_waddr [0:3];
+reg  [TENTRY_W-1:0] t3_last_t_wdata [0:3];
 
 genvar g;
 generate
@@ -263,9 +279,9 @@ for (g = 0; g < 4; g = g + 1) begin : gen_ttab
         .q_rdata(t_q_rdata[g]),
         .t_raddr(train_raddr),
         .t_rdata(t_train_rdata[g]),
-        .we(t_we[g]),
-        .waddr(t_waddr[g]),
-        .wdata(t_wdata[g])
+        .we(t3_t_we[g]),
+        .waddr(t3_t_waddr[g]),
+        .wdata(t3_t_wdata[g])
     );
 end
 endgenerate
@@ -275,22 +291,49 @@ reg        q_valid_r;
 reg [`TAGE_TAG_W-1:0] q_tag_r [0:3];
 reg [TIDXW-1:0]       q_idx_r [0:3];
 reg [BASE_IDXW-1:0]   q_bidx_r;
+reg [3:0]             q_write_fwd_valid_r;
+reg [TENTRY_W-1:0]    q_write_fwd_data_r [0:3];
+reg                   q_base_fwd_valid_r;
+reg [1:0]             q_base_fwd_data_r;
 integer qk;
 always @(posedge clk) begin
-    q_valid_r <= query_valid_i;
-    for (qk = 0; qk < 4; qk = qk + 1) begin
-        q_tag_r[qk] <= q_tag[qk];
-        q_idx_r[qk] <= q_idx[qk];
+    if (reset) begin
+        q_valid_r             <= 1'b0;
+        q_write_fwd_valid_r   <= 4'b0;
+        q_base_fwd_valid_r    <= 1'b0;
+    end else begin
+        q_valid_r <= query_valid_i;
+        for (qk = 0; qk < 4; qk = qk + 1) begin
+            q_tag_r[qk] <= q_tag[qk];
+            q_idx_r[qk] <= q_idx[qk];
+            // Precompute write/query collisions in the query-issue cycle.
+            // The response therefore depends only on these registers, not
+            // on a training write address through the next-PC feedback path.
+            q_write_fwd_valid_r[qk] <=
+                (t_we_calc[qk] && (t_waddr_calc[qk] == q_idx[qk])) ||
+                (t3_t_we[qk] && (t3_t_waddr[qk] == q_idx[qk]));
+            q_write_fwd_data_r[qk] <=
+                (t_we_calc[qk] && (t_waddr_calc[qk] == q_idx[qk]))
+                ? t_wdata_calc[qk] : t3_t_wdata[qk];
+        end
+        q_bidx_r <= q_base_idx;
+        q_base_fwd_valid_r <=
+            (base_we_calc && (base_waddr_calc == q_base_idx)) ||
+            (t3_base_we && (t3_base_waddr == q_base_idx));
+        q_base_fwd_data_r <=
+            (base_we_calc && (base_waddr_calc == q_base_idx))
+            ? base_wdata_calc : t3_base_wdata;
     end
-    q_bidx_r <= q_base_idx;
 end
 
-// 查询侧组合写旁路：T2 写回与查询响应同拍命中同一索引时，用新值
+// Query response uses only registered RAM data or a collision recorded in
+// the query-issue cycle.  Training addresses cannot feed next-PC logic here.
 wire [3:0] thit;
 wire [TENTRY_W-1:0] t_q_entry_eff [0:3];
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_thit
-    assign t_q_entry_eff[g] = (t_we[g] && (t_waddr[g] == q_idx_r[g])) ? t_wdata[g] : t_q_rdata[g];
+    assign t_q_entry_eff[g] =
+        q_write_fwd_valid_r[g] ? q_write_fwd_data_r[g] : t_q_rdata[g];
     assign thit[g] = q_valid_r
                     && t_q_entry_eff[g][TENTRY_W-1]
                     && (t_q_entry_eff[g][TENTRY_W-2 -: `TAGE_TAG_W] == q_tag_r[g]);
@@ -303,21 +346,77 @@ wire [1:0] prov_id    = thit[3] ? 2'd3 : thit[2] ? 2'd2 : thit[1] ? 2'd1 : 2'd0;
 wire [2:0] prov_ctr   = t_q_entry_eff[prov_id][4:2];
 wire [1:0] prov_u     = t_q_entry_eff[prov_id][1:0];
 wire [`TAGE_TAG_W-1:0] prov_tag = t_q_entry_eff[prov_id][TENTRY_W-2 -: `TAGE_TAG_W];
-wire [1:0] base_q_eff = (base_we && (base_waddr == q_bidx_r)) ? base_wdata : base_q_rdata;
+wire [1:0] base_q_eff =
+    q_base_fwd_valid_r ? q_base_fwd_data_r : base_q_rdata;
 wire       base_taken = base_q_eff[1];
 
+// The alternate provider is the second-longest matching tagged table, not
+// unconditionally the bimodal base table.
+reg        alt_valid;
+reg [1:0]  alt_id;
+reg        alt_taken;
+always @(*) begin
+    alt_valid = 1'b0;
+    alt_id    = 2'd0;
+    alt_taken = base_taken;
+    case (prov_id)
+        2'd3: begin
+            if (thit[2]) begin
+                alt_valid = 1'b1; alt_id = 2'd2;
+                alt_taken = t_q_entry_eff[2][4];
+            end else if (thit[1]) begin
+                alt_valid = 1'b1; alt_id = 2'd1;
+                alt_taken = t_q_entry_eff[1][4];
+            end else if (thit[0]) begin
+                alt_valid = 1'b1; alt_id = 2'd0;
+                alt_taken = t_q_entry_eff[0][4];
+            end
+        end
+        2'd2: begin
+            if (thit[1]) begin
+                alt_valid = 1'b1; alt_id = 2'd1;
+                alt_taken = t_q_entry_eff[1][4];
+            end else if (thit[0]) begin
+                alt_valid = 1'b1; alt_id = 2'd0;
+                alt_taken = t_q_entry_eff[0][4];
+            end
+        end
+        2'd1: begin
+            if (thit[0]) begin
+                alt_valid = 1'b1; alt_id = 2'd0;
+                alt_taken = t_q_entry_eff[0][4];
+            end
+        end
+        default: begin
+            alt_valid = 1'b0;
+            alt_id    = 2'd0;
+            alt_taken = base_taken;
+        end
+    endcase
+end
+
+// Weak, newly allocated providers may defer to the alternate.  The global
+// counter changes only when the two predictions disagree.
+reg [3:0] use_alt_on_na;
+wire prov_weak = (prov_ctr == 3'd3) || (prov_ctr == 3'd4);
+wire use_alt_prediction = prov_valid && prov_weak && (prov_u == 2'b00) &&
+                          (use_alt_on_na >= 4'd2);
+wire tage_selected_taken = use_alt_prediction ? alt_taken : prov_ctr[2];
+wire tage_final_taken = prov_valid ? tage_selected_taken : base_taken;
+
 assign resp_valid_o = q_valid_r;
-assign taken_o = q_valid_r && (prov_valid ? prov_ctr[2] : base_taken);
+assign taken_o = q_valid_r && tage_final_taken;
 
 // meta 打包：{prov_useful(2), prov_ctr(3), prov_idx(10), prov_id(2), prov_valid(1),
 //             alt_taken(1), base_ctr(2), base_idx(13), hits(4)} 共 38 位，
 wire [`BPU_META_W-1:0] meta_raw =
     { {(`BPU_META_W-META_RAW_W){1'b0}},
       prov_u, prov_ctr, q_idx_r[prov_id], prov_id, prov_valid,
-      base_taken, base_q_eff, q_bidx_r, thit };
+      alt_taken, base_q_eff, q_bidx_r, thit };
 wire [`BPU_META_W-1:0] meta_provider_tag =
     { {(`BPU_META_W-META_PROVIDER_TAG_W){1'b0}}, prov_tag } << META_PROVIDER_TAG_LSB;
-assign meta_o = q_valid_r ? (meta_raw | meta_provider_tag) : {`BPU_META_W{1'b0}};
+assign meta_o = q_valid_r ? (meta_raw | meta_provider_tag)
+                          : {`BPU_META_W{1'b0}};
 
 // meta 解包（训练 T2 拍使用）
 wire [BASE_IDXW-1:0]  m_base_idx = t2_meta[META_BASE_IDX_LSB +: BASE_IDXW];
@@ -331,6 +430,24 @@ wire [1:0]            m_pu       = t2_meta[META_PROVIDER_U_LSB +: 2];
 wire [`TAGE_TAG_W-1:0] m_ptag    = t2_meta[META_PROVIDER_TAG_LSB +: META_PROVIDER_TAG_W];
 
 // ---------------- 训练写回 ----------------
+// T2 table data can predate one or two registered write commands.  Select
+// the newest matching command before provider validation and allocation.
+wire [TIDXW-1:0] t2_read_idx [0:3];
+wire [TENTRY_W-1:0] t2_rd_entry_eff [0:3];
+generate
+for (g = 0; g < 4; g = g + 1) begin : gen_t2_raw_forward
+    localparam [1:0] TABLE_ID = g[1:0];
+    assign t2_read_idx[g] =
+        (m_pvalid && (m_pid == TABLE_ID)) ? m_pidx : t2_alloc_idx[g];
+    assign t2_rd_entry_eff[g] =
+        (t3_t_we[g] && (t3_t_waddr[g] == t2_read_idx[g]))
+        ? t3_t_wdata[g]
+        : (t3_last_t_we[g] && (t3_last_t_waddr[g] == t2_read_idx[g]))
+          ? t3_last_t_wdata[g]
+          : t2_rd_entry[g];
+end
+endgenerate
+
 // 饱和计数器
 function [1:0] sat2;
     input [1:0] c;
@@ -354,12 +471,12 @@ wire [3:0] alloc_cand;
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_alloc
     if (g == 0) begin : gen_first
-        assign alloc_cand[g] = (!t2_rd_entry[g][TENTRY_W-1]
-                             || (t2_rd_entry[g][1:0] == 2'b00))
+        assign alloc_cand[g] = (!t2_rd_entry_eff[g][TENTRY_W-1]
+                             || (t2_rd_entry_eff[g][1:0] == 2'b00))
                             && !m_pvalid;
     end else begin : gen_longer
-        assign alloc_cand[g] = (!t2_rd_entry[g][TENTRY_W-1]
-                             || (t2_rd_entry[g][1:0] == 2'b00))
+        assign alloc_cand[g] = (!t2_rd_entry_eff[g][TENTRY_W-1]
+                             || (t2_rd_entry_eff[g][1:0] == 2'b00))
                             && (!m_pvalid || (m_pid < g[1:0]));
     end
 end
@@ -373,45 +490,52 @@ wire t1_prov_pred  = m_pctr[2];
 wire t1_prov_corr  = (t1_prov_pred == t2_taken);
 wire t1_useful_chg = m_pvalid && (t1_prov_pred != m_alt);
 wire [1:0] t1_u_new = !t1_useful_chg ? m_pu : sat2(m_pu, t1_prov_corr);
-wire provider_entry_valid = t2_rd_entry[m_pid][TENTRY_W-1];
+wire train_prov_weak = (m_pctr == 3'd3) || (m_pctr == 3'd4);
+wire train_alt_better = m_pvalid && train_prov_weak &&
+                        (t1_prov_pred != m_alt) &&
+                        (m_alt == t2_taken);
+wire train_prov_better = m_pvalid && train_prov_weak &&
+                         (t1_prov_pred != m_alt) &&
+                         (t1_prov_pred == t2_taken);
+wire provider_entry_valid = t2_rd_entry_eff[m_pid][TENTRY_W-1];
 wire provider_tag_match = provider_entry_valid &&
-                          (t2_rd_entry[m_pid][TENTRY_W-2 -: `TAGE_TAG_W] == m_ptag);
+                          (t2_rd_entry_eff[m_pid][TENTRY_W-2 -: `TAGE_TAG_W] == m_ptag);
 
 integer tk;
 always @(*) begin
-    base_we    = 1'b0;
-    base_waddr = m_base_idx;
-    base_wdata = sat2(m_base_ctr, t2_taken);
-    t_we       = 4'b0;
+    base_we_calc    = 1'b0;
+    base_waddr_calc = m_base_idx;
+    base_wdata_calc = sat2(m_base_ctr, t2_taken);
+    t_we_calc       = 4'b0;
     for (tk = 0; tk < 4; tk = tk + 1) begin
-        t_waddr[tk] = t2_alloc_idx[tk];
-        t_wdata[tk] = {1'b1, t2_alloc_tag[tk],
-                       t2_taken ? 3'd4 : 3'd3, 2'b00};
+        t_waddr_calc[tk] = t2_alloc_idx[tk];
+        t_wdata_calc[tk] = {1'b1, t2_alloc_tag[tk],
+                            t2_taken ? 3'd4 : 3'd3, 2'b00};
     end
-        if (t2_valid) begin
+    if (t2_valid) begin
         // 基础表恒训练
-        base_we = 1'b1;
+        base_we_calc = 1'b1;
         if (m_pvalid && provider_tag_match) begin
             // provider 原地更新（ctr + useful；tag 比对通过才写，防队列期间被换项）
-            t_we[m_pid]    = 1'b1;
-            t_waddr[m_pid] = m_pidx;
-            t_wdata[m_pid] = {1'b1,
-                              m_ptag,
-                              sat3(m_pctr, t2_taken), t1_u_new};
+            t_we_calc[m_pid]    = 1'b1;
+            t_waddr_calc[m_pid] = m_pidx;
+            t_wdata_calc[m_pid] = {1'b1,
+                                   m_ptag,
+                                   sat3(m_pctr, t2_taken), t1_u_new};
         end
         // 误预测且有分配候选（且候选不是 provider 自身）：分配新项
         if (t2_mispred && alloc_any && !(m_pvalid && (alloc_sel == m_pid))) begin
-            t_we[alloc_sel] = 1'b1;
+            t_we_calc[alloc_sel] = 1'b1;
         end else if (t2_mispred && !alloc_any) begin
             // 无可分配项：把比 provider 更长历史表的 useful 清 0（腾位）
             for (tk = 0; tk < 4; tk = tk + 1) begin
                 if (!m_pvalid || (tk[1:0] > m_pid)) begin
-                    if (t2_rd_entry[tk][1:0] != 2'b00) begin
-                        t_we[tk]    = 1'b1;
-                        t_waddr[tk] = t2_alloc_idx[tk];
-                        t_wdata[tk] = {t2_rd_entry[tk][TENTRY_W-1],
-                                       t2_rd_entry[tk][TENTRY_W-2 -: `TAGE_TAG_W],
-                                       t2_rd_entry[tk][4:2], 2'b00};
+                    if (t2_rd_entry_eff[tk][1:0] != 2'b00) begin
+                        t_we_calc[tk]    = 1'b1;
+                        t_waddr_calc[tk] = t2_alloc_idx[tk];
+                        t_wdata_calc[tk] = {t2_rd_entry_eff[tk][TENTRY_W-1],
+                                            t2_rd_entry_eff[tk][TENTRY_W-2 -: `TAGE_TAG_W],
+                                            t2_rd_entry_eff[tk][4:2], 2'b00};
                     end
                 end
             end
@@ -425,12 +549,44 @@ always @(posedge clk) begin
         t0_valid     <= 1'b0;
         t1_valid     <= 1'b0;
         t2_valid     <= 1'b0;
+        t3_base_we   <= 1'b0;
+        t3_t_we      <= 4'b0;
+        t3_last_t_we <= 4'b0;
+        t3_base_waddr <= {BASE_IDXW{1'b0}};
+        t3_base_wdata <= 2'b0;
+        for (pk = 0; pk < 4; pk = pk + 1) begin
+            t3_t_waddr[pk]      <= {TIDXW{1'b0}};
+            t3_t_wdata[pk]      <= {TENTRY_W{1'b0}};
+            t3_last_t_waddr[pk] <= {TIDXW{1'b0}};
+            t3_last_t_wdata[pk] <= {TENTRY_W{1'b0}};
+        end
+        use_alt_on_na <= 4'd0;
         spec_ghr     <= {`GHR_LEN{1'b0}};
         commit_ghr   <= {`GHR_LEN{1'b0}};
         uq_rptr      <= {TAGE_UPDATE_Q_PTR_W{1'b0}};
         uq_wptr      <= {TAGE_UPDATE_Q_PTR_W{1'b0}};
         uq_count     <= {TAGE_UPDATE_Q_CNT_W{1'b0}};
     end else begin
+        // T3 write command.  The RAM modules see only registered controls;
+        // throughput remains one completed training command per cycle.
+        t3_base_we    <= base_we_calc;
+        t3_base_waddr <= base_waddr_calc;
+        t3_base_wdata <= base_wdata_calc;
+        t3_last_t_we  <= t3_t_we;
+        t3_t_we       <= t_we_calc;
+        for (pk = 0; pk < 4; pk = pk + 1) begin
+            t3_last_t_waddr[pk] <= t3_t_waddr[pk];
+            t3_last_t_wdata[pk] <= t3_t_wdata[pk];
+            t3_t_waddr[pk]      <= t_waddr_calc[pk];
+            t3_t_wdata[pk]      <= t_wdata_calc[pk];
+        end
+
+        if (t2_valid && train_alt_better && (use_alt_on_na != 4'hf))
+            use_alt_on_na <= use_alt_on_na + 4'd1;
+        else if (t2_valid && train_prov_better &&
+                 (use_alt_on_na != 4'h0))
+            use_alt_on_na <= use_alt_on_na - 4'd1;
+
         if (cmt_hist_valid_i)
             commit_ghr <= hist_shift(commit_ghr, cmt_hist_taken_i);
 
@@ -503,26 +659,148 @@ end
 
 `ifdef SYNTHESIS
 // synthesis translate_off
-wire [1:0] tage_update_pipeline_pending_w = {1'b0, t0_valid}
-                                          + {1'b0, t1_valid}
-                                          + {1'b0, t2_valid};
+wire [2:0] tage_update_pipeline_pending_w = {2'b0, t0_valid}
+                                          + {2'b0, t1_valid}
+                                          + {2'b0, t2_valid}
+                                          + {2'b0, t3_base_we};
 
 reg [63:0] tage_update_overflow_count;
 reg [63:0] tage_update_queue_max_occupancy;
 reg [63:0] tage_update_pipeline_max_pending_count;
+reg [63:0] tage_train_count;
+reg [63:0] tage_provider_base_count;
+reg [63:0] tage_provider_base_correct_count;
+reg [63:0] tage_provider_t0_count;
+reg [63:0] tage_provider_t0_correct_count;
+reg [63:0] tage_provider_t1_count;
+reg [63:0] tage_provider_t1_correct_count;
+reg [63:0] tage_provider_t2_count;
+reg [63:0] tage_provider_t2_correct_count;
+reg [63:0] tage_provider_t3_count;
+reg [63:0] tage_provider_t3_correct_count;
+reg [63:0] tage_weak_provider_count;
+reg [63:0] tage_weak_provider_correct_count;
+reg [63:0] tage_weak_disagree_count;
+reg [63:0] tage_weak_provider_better_count;
+reg [63:0] tage_weak_alt_better_count;
+reg [63:0] tage_provider_alt_disagree_count;
+reg [63:0] tage_provider_better_count;
+reg [63:0] tage_alt_better_count;
+reg [63:0] tage_allocation_success_count;
+reg [63:0] tage_allocation_failure_count;
+reg [63:0] tage_provider_update_lost_count;
+
+wire stat_provider_correct = (m_pctr[2] == t2_taken);
+wire stat_base_correct = (m_base_ctr[1] == t2_taken);
+wire stat_allocation_success =
+    t2_mispred && alloc_any &&
+    !(m_pvalid && (alloc_sel == m_pid));
 
 always @(posedge clk) begin
     if (reset) begin
         tage_update_overflow_count     <= 64'd0;
         tage_update_queue_max_occupancy <= 64'd0;
         tage_update_pipeline_max_pending_count <= 64'd0;
+        tage_train_count <= 64'd0;
+        tage_provider_base_count <= 64'd0;
+        tage_provider_base_correct_count <= 64'd0;
+        tage_provider_t0_count <= 64'd0;
+        tage_provider_t0_correct_count <= 64'd0;
+        tage_provider_t1_count <= 64'd0;
+        tage_provider_t1_correct_count <= 64'd0;
+        tage_provider_t2_count <= 64'd0;
+        tage_provider_t2_correct_count <= 64'd0;
+        tage_provider_t3_count <= 64'd0;
+        tage_provider_t3_correct_count <= 64'd0;
+        tage_weak_provider_count <= 64'd0;
+        tage_weak_provider_correct_count <= 64'd0;
+        tage_weak_disagree_count <= 64'd0;
+        tage_weak_provider_better_count <= 64'd0;
+        tage_weak_alt_better_count <= 64'd0;
+        tage_provider_alt_disagree_count <= 64'd0;
+        tage_provider_better_count <= 64'd0;
+        tage_alt_better_count <= 64'd0;
+        tage_allocation_success_count <= 64'd0;
+        tage_allocation_failure_count <= 64'd0;
+        tage_provider_update_lost_count <= 64'd0;
     end else begin
         if (tage_update_overflow)
             tage_update_overflow_count <= tage_update_overflow_count + 64'd1;
         if (uq_count_next_64 > tage_update_queue_max_occupancy)
             tage_update_queue_max_occupancy <= uq_count_next_64;
-        if ({62'd0, tage_update_pipeline_pending_w} > tage_update_pipeline_max_pending_count)
-            tage_update_pipeline_max_pending_count <= {62'd0, tage_update_pipeline_pending_w};
+        if ({61'd0, tage_update_pipeline_pending_w} > tage_update_pipeline_max_pending_count)
+            tage_update_pipeline_max_pending_count <= {61'd0, tage_update_pipeline_pending_w};
+        if (t2_valid) begin
+            tage_train_count <= tage_train_count + 64'd1;
+            if (!m_pvalid) begin
+                tage_provider_base_count <= tage_provider_base_count + 64'd1;
+                if (stat_base_correct)
+                    tage_provider_base_correct_count <=
+                        tage_provider_base_correct_count + 64'd1;
+            end else begin
+                case (m_pid)
+                    2'd0: begin
+                        tage_provider_t0_count <= tage_provider_t0_count + 64'd1;
+                        if (stat_provider_correct)
+                            tage_provider_t0_correct_count <=
+                                tage_provider_t0_correct_count + 64'd1;
+                    end
+                    2'd1: begin
+                        tage_provider_t1_count <= tage_provider_t1_count + 64'd1;
+                        if (stat_provider_correct)
+                            tage_provider_t1_correct_count <=
+                                tage_provider_t1_correct_count + 64'd1;
+                    end
+                    2'd2: begin
+                        tage_provider_t2_count <= tage_provider_t2_count + 64'd1;
+                        if (stat_provider_correct)
+                            tage_provider_t2_correct_count <=
+                                tage_provider_t2_correct_count + 64'd1;
+                    end
+                    default: begin
+                        tage_provider_t3_count <= tage_provider_t3_count + 64'd1;
+                        if (stat_provider_correct)
+                            tage_provider_t3_correct_count <=
+                                tage_provider_t3_correct_count + 64'd1;
+                    end
+                endcase
+                if (train_prov_weak) begin
+                    tage_weak_provider_count <=
+                        tage_weak_provider_count + 64'd1;
+                    if (stat_provider_correct)
+                        tage_weak_provider_correct_count <=
+                            tage_weak_provider_correct_count + 64'd1;
+                    if (m_pctr[2] != m_alt) begin
+                        tage_weak_disagree_count <=
+                            tage_weak_disagree_count + 64'd1;
+                        if (stat_provider_correct)
+                            tage_weak_provider_better_count <=
+                                tage_weak_provider_better_count + 64'd1;
+                        else
+                            tage_weak_alt_better_count <=
+                                tage_weak_alt_better_count + 64'd1;
+                    end
+                end
+                if (m_pctr[2] != m_alt) begin
+                    tage_provider_alt_disagree_count <=
+                        tage_provider_alt_disagree_count + 64'd1;
+                    if (stat_provider_correct)
+                        tage_provider_better_count <=
+                            tage_provider_better_count + 64'd1;
+                    else
+                        tage_alt_better_count <= tage_alt_better_count + 64'd1;
+                end
+                if (!provider_tag_match)
+                    tage_provider_update_lost_count <=
+                        tage_provider_update_lost_count + 64'd1;
+            end
+            if (stat_allocation_success)
+                tage_allocation_success_count <=
+                    tage_allocation_success_count + 64'd1;
+            if (t2_mispred && !alloc_any)
+                tage_allocation_failure_count <=
+                    tage_allocation_failure_count + 64'd1;
+        end
     end
 end
 // synthesis translate_on
@@ -543,10 +821,12 @@ module tage_base_ram(
     input  wire [1:0]  wdata
 );
 // 两份保持一致的 BRAM 副本实现双读口，写入同时广播到两份副本。
+// Read-during-write forwarding is implemented explicitly in the parent TAGE
+// pipeline using the pending and last-committed T3 commands.  Keeping it out
+// of these RAM wrappers prevents Vivado from folding the T2 command network
+// back into an internal bypass-valid register.
 (* ram_style = "block" *) reg [1:0] q_mem [0:`TAGE_BASE_DEPTH-1];
 reg [1:0] q_rdata_ram;
-reg [1:0] q_bypass_data;
-reg       q_bypass_valid;
 integer i;
 initial begin
     for (i = 0; i < `TAGE_BASE_DEPTH; i = i + 1) begin
@@ -555,12 +835,10 @@ initial begin
 end
 always @(posedge clk) begin
     q_rdata_ram <= q_mem[q_raddr];
-    q_bypass_valid <= we && (waddr == q_raddr);
-    q_bypass_data <= wdata;
     if (we)
         q_mem[waddr] <= wdata;
 end
-assign q_rdata = q_bypass_valid ? q_bypass_data : q_rdata_ram;
+assign q_rdata = q_rdata_ram;
 endmodule
 
 module tage_tag_ram #(
@@ -578,8 +856,6 @@ module tage_tag_ram #(
 (* ram_style = "block" *) reg [ENTRY_W-1:0] q_mem [0:`TAGE_TAG_DEPTH-1];
 (* ram_style = "block" *) reg [ENTRY_W-1:0] t_mem [0:`TAGE_TAG_DEPTH-1];
 reg [ENTRY_W-1:0] q_rdata_ram, t_rdata_ram;
-reg [ENTRY_W-1:0] q_bypass_data, t_bypass_data;
-reg               q_bypass_valid, t_bypass_valid;
 integer i;
 initial begin
     for (i = 0; i < `TAGE_TAG_DEPTH; i = i + 1) begin
@@ -590,15 +866,11 @@ end
 always @(posedge clk) begin
     q_rdata_ram <= q_mem[q_raddr];
     t_rdata_ram <= t_mem[t_raddr];
-    q_bypass_valid <= we && (waddr == q_raddr);
-    t_bypass_valid <= we && (waddr == t_raddr);
-    q_bypass_data <= wdata;
-    t_bypass_data <= wdata;
     if (we) begin
         q_mem[waddr] <= wdata;
         t_mem[waddr] <= wdata;
     end
 end
-assign q_rdata = q_bypass_valid ? q_bypass_data : q_rdata_ram;
-assign t_rdata = t_bypass_valid ? t_bypass_data : t_rdata_ram;
+assign q_rdata = q_rdata_ram;
+assign t_rdata = t_rdata_ram;
 endmodule

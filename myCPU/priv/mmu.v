@@ -35,6 +35,8 @@ module mmu (
     output wire        i_excp_adef_o,
     output wire [`TLB_EX_NUM-1:0] i_tlb_ex_o,
     output wire        i_direct_ok_o,
+    output wire [31:0] i_direct_paddr_o,
+    output wire [1:0]  i_direct_mat_o,
     // 直发专用异常：本地非对齐 ADEF | tlb_manager.inst_direct_excp（CAM 口径）
     output wire        i_direct_excp_o,
 
@@ -65,6 +67,8 @@ module mmu (
     input  wire        tlbm_inst_ex_pif_i,
     input  wire        tlbm_inst_ex_ppi_i,
     input  wire        tlbm_inst_direct_ok_i,
+    input  wire [31:0] tlbm_inst_direct_paddr_i,
+    input  wire [1:0]  tlbm_inst_direct_mat_i,
     input  wire        tlbm_inst_direct_excp_i, // <- tlb_manager.inst_direct_excp（直发专用）
     input  wire [31:0] tlbm_data_paddr_i,
     input  wire [1:0]  tlbm_data_mat_i,
@@ -89,6 +93,8 @@ assign tlbm_data_vaddr_o    = d_vaddr_i;
 assign i_paddr_o     = tlbm_inst_paddr_i;
 assign i_mat_o       = tlbm_inst_mat_i;
 assign i_direct_ok_o = tlbm_inst_direct_ok_i;
+assign i_direct_paddr_o = tlbm_inst_direct_paddr_i;
+assign i_direct_mat_o   = tlbm_inst_direct_mat_i;
 // ADEF = 取指非对齐（本地）| PLV3 越界（tlb_manager 检测）
 assign i_excp_adef_o = ((i_req_i === 1'b1) && (i_vaddr_i[1:0] != 2'b00))
                      || ((i_req_i === 1'b1) && (tlbm_inst_ex_adef_i === 1'b1));

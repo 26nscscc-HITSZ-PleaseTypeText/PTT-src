@@ -47,6 +47,9 @@ module rs_mem(
     input  wire                       wb2_valid_i,
     input  wire [`ROB_W-1:0]          wb2_robid_i,
     input  wire [31:0]                wb2_data_i,
+    input  wire                       fast2_valid_i,
+    input  wire [`ROB_W-1:0]          fast2_robid_i,
+    input  wire [31:0]                fast2_data_i,
     input  wire                       wb3_valid_i,
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
@@ -116,8 +119,15 @@ integer a;
 wire issue_fire;
 reg  [`RS_MEM_IDX_W-1:0] issue_idx;
 reg                      issue_sel_valid;
-reg                      scan_stop;
+reg                      base_scan_stop;
+reg                      fast_scan_stop;
 reg  [`RS_MEM_IDX_W-1:0] scan_idx;
+reg  [`RS_MEM_IDX_W-1:0] base_issue_idx;
+reg  [`RS_MEM_IDX_W-1:0] fast_issue_idx;
+reg  [`RS_MEM_OCC_W-1:0] base_issue_age;
+reg  [`RS_MEM_OCC_W-1:0] fast_issue_age;
+reg                      base_issue_valid;
+reg                      fast_issue_valid;
 wire                     issue_need_swap;
 
 wire            s0_wb_match [0:`RS_MEM_SIZE-1];
@@ -126,9 +136,12 @@ wire            s0_wbhit [0:`RS_MEM_SIZE-1];
 wire            s1_wbhit [0:`RS_MEM_SIZE-1];
 wire            s0_earlyhit [0:`RS_MEM_SIZE-1];
 wire            s1_earlyhit [0:`RS_MEM_SIZE-1];
+wire            s0_fasttag [0:`RS_MEM_SIZE-1];
+wire            s1_fasttag [0:`RS_MEM_SIZE-1];
 wire [31:0]     s0_wbdat [0:`RS_MEM_SIZE-1];
 wire [31:0]     s1_wbdat [0:`RS_MEM_SIZE-1];
 wire            entry_ready [0:`RS_MEM_SIZE-1];
+wire            entry_fast_ready [0:`RS_MEM_SIZE-1];
 wire            is_ord_barrier [0:`RS_MEM_SIZE-1]; // store/ll/sc/cacop：不可被越过
 genvar gw;
 generate
@@ -152,6 +165,8 @@ for (gw = 0; gw < `RS_MEM_SIZE; gw = gw + 1) begin : g_wake
                              ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
                               (early1_valid_i && (early1_robid_i == s1_robid[gw])) ||
                               (early2_valid_i && (early2_robid_i == s1_robid[gw])));
+    assign s0_fasttag[gw] = !s0_val_valid[gw] && (fast2_robid_i == s0_robid[gw]);
+    assign s1_fasttag[gw] = !s1_val_valid[gw] && (fast2_robid_i == s1_robid[gw]);
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :
@@ -164,6 +179,12 @@ for (gw = 0; gw < `RS_MEM_SIZE; gw = gw + 1) begin : g_wake
     assign entry_ready[gw] = valid[gw] &&
                              ((s0_ready[gw] && s0_val_valid[gw]) || s0_wbhit[gw]) &&
                              ((s1_ready[gw] && s1_val_valid[gw]) || s1_wbhit[gw]);
+    assign entry_fast_ready[gw] = valid[gw] &&
+                             (((s0_ready[gw] && s0_val_valid[gw]) || s0_wbhit[gw])
+                               || s0_fasttag[gw]) &&
+                             (((s1_ready[gw] && s1_val_valid[gw]) || s1_wbhit[gw])
+                               || s1_fasttag[gw]) &&
+                             (s0_fasttag[gw] || s1_fasttag[gw]);
     assign is_ord_barrier[gw] = is_cacop[gw]
                              || mem_op[gw][`MEM_OP_ST_W] || mem_op[gw][`MEM_OP_ST_B]
                              || mem_op[gw][`MEM_OP_ST_H] || mem_op[gw][`MEM_OP_SC_W]
@@ -178,23 +199,51 @@ endgenerate
 always @(*) begin
     issue_idx = head;
     issue_sel_valid = 1'b0;
-    scan_stop = 1'b0;
+    base_issue_idx = head;
+    fast_issue_idx = head;
+    base_issue_age = {`RS_MEM_OCC_W{1'b0}};
+    fast_issue_age = {`RS_MEM_OCC_W{1'b0}};
+    base_issue_valid = 1'b0;
+    fast_issue_valid = 1'b0;
+    base_scan_stop = 1'b0;
+    fast_scan_stop = 1'b0;
     for (a = 0; a < `RS_MEM_SIZE; a = a + 1) begin
         scan_idx = head + a[`RS_MEM_IDX_W-1:0];
-        if (!issue_sel_valid && !scan_stop && (a[`RS_MEM_OCC_W-1:0] < count) && valid[scan_idx]) begin
+        if (!base_issue_valid && !base_scan_stop
+            && (a[`RS_MEM_OCC_W-1:0] < count) && valid[scan_idx]) begin
             if (entry_ready[scan_idx]) begin
                 if (!is_ord_barrier[scan_idx] || (a == 0)) begin
-                    issue_idx = scan_idx;
-                    issue_sel_valid = 1'b1;
+                    base_issue_idx = scan_idx;
+                    base_issue_age = a[`RS_MEM_OCC_W-1:0];
+                    base_issue_valid = 1'b1;
                 end else begin
-                    // 更年轻的就绪屏障：不能越过前方未发 load，停扫
-                    scan_stop = 1'b1;
+                    base_scan_stop = 1'b1;
                 end
             end else if (is_ord_barrier[scan_idx]) begin
-                scan_stop = 1'b1;
+                base_scan_stop = 1'b1;
+            end
+        end
+        if (!fast_issue_valid && !fast_scan_stop
+            && (a[`RS_MEM_OCC_W-1:0] < count) && valid[scan_idx]) begin
+            if (entry_fast_ready[scan_idx]) begin
+                if (!is_ord_barrier[scan_idx] || (a == 0)) begin
+                    fast_issue_idx = scan_idx;
+                    fast_issue_age = a[`RS_MEM_OCC_W-1:0];
+                    fast_issue_valid = 1'b1;
+                end else begin
+                    fast_scan_stop = 1'b1;
+                end
+            end else if (is_ord_barrier[scan_idx]) begin
+                fast_scan_stop = 1'b1;
             end
         end
     end
+    if (fast2_valid_i && fast_issue_valid
+        && (!base_issue_valid || (fast_issue_age < base_issue_age)))
+        issue_idx = fast_issue_idx;
+    else
+        issue_idx = base_issue_idx;
+    issue_sel_valid = base_issue_valid || (fast2_valid_i && fast_issue_valid);
 end
 
 assign issue_need_swap = issue_fire && (issue_idx != head);
@@ -236,8 +285,14 @@ assign issue_robid_o = robid[issue_idx];
 assign issue_mem_op_o = mem_op[issue_idx];
 assign issue_is_cacop_o = is_cacop[issue_idx];
 assign issue_cacop_op_o = cacop_op[issue_idx];
-assign issue_base_o = s0_wbhit[issue_idx] ? s0_wbdat[issue_idx] : s0_val[issue_idx];
-assign issue_wdata_o = s1_wbhit[issue_idx] ? s1_wbdat[issue_idx] : s1_val[issue_idx];
+wire issue_uses_fast = fast2_valid_i && fast_issue_valid
+                    && (!base_issue_valid || (fast_issue_age < base_issue_age));
+wire issue_s0_fast = issue_uses_fast && s0_fasttag[issue_idx] && !s0_wbhit[issue_idx];
+wire issue_s1_fast = issue_uses_fast && s1_fasttag[issue_idx] && !s1_wbhit[issue_idx];
+assign issue_base_o = issue_s0_fast ? fast2_data_i
+                    : s0_wbhit[issue_idx] ? s0_wbdat[issue_idx] : s0_val[issue_idx];
+assign issue_wdata_o = issue_s1_fast ? fast2_data_i
+                     : s1_wbhit[issue_idx] ? s1_wbdat[issue_idx] : s1_val[issue_idx];
 assign issue_imm_o = imm[issue_idx];
 
 always @(posedge clk) begin

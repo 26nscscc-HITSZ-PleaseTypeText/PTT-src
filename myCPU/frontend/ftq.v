@@ -28,6 +28,8 @@ module ftq(
 
     input  wire                       p1_valid_i,          // 覆盖 bpu_ptr-1 处的块（主预测修正）
     input  wire                       p1_meta_valid_i,
+    input  wire                       p1_desc_valid_i,     // P1 安定描述符有效；不依赖方向是否修正
+    input  wire                       p0_retry_pending_i,  // 已寄存：上一拍修正取消了同拍 P0
     input  wire [`BLK_LEN_W-1:0]      p1_length_i,
     input  wire                       p1_taken_i,
     input  wire [31:0]                p1_target_i,
@@ -61,8 +63,6 @@ module ftq(
     input  wire                       cmt_mispred_i,        // 是否误预测
     input  wire [31:0]                cmt_target_i,         // 实际跳转目标
     input  wire [`BR_TYPE_W-1:0]      cmt_br_type_i,
-    // 区分直接跳转 B 与普通 JIRL，避免 JTC 训练直接跳转目标
-    input  wire                       cmt_is_direct_b_i,
     input  wire [`BLK_LEN_W+1:2]      cmt_pc_word_i,        // 分支 PC 的块内字偏移
 
     // ---------------- commit 误预测比对查询口（组合）----------------
@@ -77,7 +77,6 @@ module ftq(
     output wire                       train_mispred_o,
     output wire [31:0]                train_target_o,
     output wire [`BR_TYPE_W-1:0]      train_br_type_o,
-    output wire                       train_is_direct_b_o,
     output wire [`BLK_LEN_W+1:2]      train_fall_through_o, // 顺序出口的块内字偏移
     output wire [`BPU_META_W-1:0]     train_meta_o          // 暂存的 meta 原样回送
 );
@@ -123,13 +122,33 @@ assign ftq_full_o = ((bpu_ptr + {{(`FTQ_W-1){1'b0}}, 1'b1}) == cmt_ptr)
                  || ((bpu_ptr + {{(`FTQ_W-2){1'b0}}, 2'd2}) == cmt_ptr);
 
 // ---------------- IFU 取块口 ----------------
-// 上一拍刚写入的块要等 P1 覆盖安定后才发出
-wire head_blk_settling = (ifu_ptr == bpu_prev) && p0_wrote_r;
-assign ifu_valid_o  = (ifu_ptr != bpu_ptr) && !head_blk_settling;
+// The P1 response for the newest P0 arrives in this cycle.  Release the head
+// immediately when that response is valid; corrected fields bypass the array.
+//
+// Deliberately do not gate this control with predec_redirect_i.  IFU already
+// rejects a new block while predecode redirects, and keeping redirect out of
+// this expression cuts the IFU-predecode -> FTQ-valid -> MMU/TLB feedback cone.
+wire head_is_newest = (ifu_ptr == bpu_prev);
+wire head_retry_blocked = head_is_newest && p0_retry_pending_i;
+wire head_blk_settling_raw = head_is_newest && p0_wrote_r &&
+                             !p0_retry_pending_i;
+// p0_wrote_r is the local, registered P1 schedule marker.  Do not use
+// p1_meta_valid_i to control ifu_valid_o: that signal is suppressed by an IFU
+// predecode redirect and would recreate the same cross-module feedback path.
+// Redirect/flush already blocks acceptance.  The complete settled descriptor
+// is selected below from the fixed P1 schedule, not from p1_valid_i.
+wire head_p1_bypass = head_blk_settling_raw;
+wire head_p1_correction_bypass = head_p1_bypass && p1_valid_i;
+wire head_blk_settling = head_blk_settling_raw && !head_p1_bypass;
+assign ifu_valid_o  = (ifu_ptr != bpu_ptr) && !head_blk_settling &&
+                      !head_retry_blocked;
 assign ifu_pc_o     = blk_pc[ifu_ptr];
-assign ifu_length_o = blk_len[ifu_ptr];
-assign ifu_taken_o  = blk_taken[ifu_ptr];
-assign ifu_target_o = blk_target[ifu_ptr];
+// The newest block is released on its fixed P1 settle cycle.  BPU supplies a
+// complete settled descriptor on both FTB hit and miss, so this bypass is no
+// longer limited to corrections.
+assign ifu_length_o = head_p1_bypass ? p1_length_i : blk_len[ifu_ptr];
+assign ifu_taken_o  = head_p1_bypass ? p1_taken_i  : blk_taken[ifu_ptr];
+assign ifu_target_o = head_p1_bypass ? p1_target_i : blk_target[ifu_ptr];
 assign ifu_ftq_id_o = ifu_ptr;
 
 // ---------------- commit 查询口 ----------------
@@ -145,14 +164,35 @@ wire [`FTQ_W-1:0] cmt_adv = (|cmt_release_i)
 wire ftq_run      = !reset && !flush_i;
 wire blk_pc_wr    = ftq_run && !predec_redirect_i && p0_valid_i;   // 块 PC 只随 P0 写入
 wire blk_meta_wr  = ftq_run && p1_meta_valid_i;
+wire [`FTQ_W-1:0] blk_pc_waddr =
+    p0_retry_pending_i ? bpu_prev : bpu_ptr;
+// Descriptor storage has one normal write point: the fixed P1 settle cycle.
+// p1_desc_valid_i depends only on the registered response schedule, not on the
+// TAGE direction decision.  Predecode redirects are mutually exclusive.
+wire blk_p1_desc_wr = ftq_run && !predec_redirect_i && p1_desc_valid_i;
+wire blk_predec_desc_wr = ftq_run && predec_redirect_i;
 
 always @(posedge clk) begin
     if (blk_pc_wr)
-        blk_pc[bpu_ptr] <= p0_pc_i;
+        blk_pc[blk_pc_waddr] <= p0_pc_i;
 end
 always @(posedge clk) begin
     if (blk_meta_wr)
         blk_meta[bpu_prev] <= p1_meta_i;
+end
+
+// Prediction descriptor storage no longer has a P0/P1 dual-write mux.  In
+// particular, p1_valid_i cannot select the D input of all 32 target bits.
+always @(posedge clk) begin
+    if (blk_predec_desc_wr) begin
+        blk_len[predec_redirect_id_i]    <= predec_length_i;
+        blk_taken[predec_redirect_id_i]  <= predec_taken_i;
+        blk_target[predec_redirect_id_i] <= predec_target_i;
+    end else if (blk_p1_desc_wr) begin
+        blk_len[bpu_prev]    <= p1_length_i;
+        blk_taken[bpu_prev]  <= p1_taken_i;
+        blk_target[bpu_prev] <= p1_target_i;
+    end
 end
 
 // meta 有效位图：P0 清（对应原"写 0 清空"），P1 写置位
@@ -160,7 +200,7 @@ always @(posedge clk) begin
     if (reset)
         blk_meta_set <= {`FTQ_SIZE{1'b0}};
     else begin
-        if (blk_pc_wr)   blk_meta_set[bpu_ptr]  <= 1'b0;
+        if (blk_pc_wr)   blk_meta_set[blk_pc_waddr] <= 1'b0;
         if (blk_meta_wr) blk_meta_set[bpu_prev] <= 1'b1;
     end
 end
@@ -184,9 +224,6 @@ always @(posedge clk) begin
     end else begin
         // predec 优先于 P0：同拍禁止写入 fall-through 块污染 ifu_ptr 指向的槽
         if (predec_redirect_i) begin
-            blk_len[predec_redirect_id_i]    <= predec_length_i;
-            blk_taken[predec_redirect_id_i]  <= predec_taken_i;
-            blk_target[predec_redirect_id_i] <= predec_target_i;
             if (!predec_fixup_only_i) begin
                 bpu_ptr    <= predec_redirect_id_i + 1'b1;
                 // 丢弃 redirect 之后的推测块。IFU 两级流水最多领先 redirect 块
@@ -196,27 +233,18 @@ always @(posedge clk) begin
             end
             p0_wrote_r <= 1'b0;
         end else begin
-            // P1 同拍纠正时丢弃本拍 P0，不推进 bpu_ptr，也不置 p0_wrote_r。
-            // blk_pc LUTRAM 写使能仍可跟 p0_valid（见上方 blk_pc_wr），
-            // 刻意不含 p1，以切断 TAGE→p1_diff→p0_valid→blk_pc WE 长链。
-            if (p0_valid_i && !p1_valid_i) begin
-                blk_len[bpu_ptr]    <= p0_length_i;
-                blk_taken[bpu_ptr]  <= p0_taken_i;
-                blk_target[bpu_ptr] <= p0_target_i;
-                bpu_ptr             <= bpu_ptr + 1'b1;
-                p0_wrote_r          <= 1'b1;
+            // Pointer allocation never depends on combinational p1_valid_i.
+            // A correction-cycle P0 reserves the tail normally; on the next
+            // accepted P0, registered retry state overwrites that slot and
+            // suppresses a second increment.
+            if (p0_valid_i) begin
+                if (!p0_retry_pending_i)
+                    bpu_ptr <= bpu_ptr + 1'b1;
+                p0_wrote_r <= 1'b1;
             end else begin
                 p0_wrote_r <= 1'b0;
             end
         end
-
-        // P1 覆盖（bpu_ptr-1；与 P0 同拍时只修正旧槽，新槽不提交）
-        if (p1_valid_i) begin
-            blk_len[bpu_prev]    <= p1_length_i;
-            blk_taken[bpu_prev]  <= p1_taken_i;
-            blk_target[bpu_prev] <= p1_target_i;
-        end
-
         // IFU 取走
         if (ifu_accept_i && ifu_valid_o)
             ifu_ptr <= ifu_ptr + 1'b1;
@@ -233,7 +261,6 @@ reg [31:0]            train_pc_r;
 reg                   train_is_branch_r, train_taken_r, train_mispred_r;
 reg [31:0]            train_target_r;
 reg [`BR_TYPE_W-1:0]  train_btype_r;
-reg                   train_is_direct_b_r;
 reg [`BLK_LEN_W+1:2]  train_ft_r;
 reg [`BPU_META_W-1:0] train_meta_r;
 
@@ -248,7 +275,6 @@ always @(posedge clk) begin
         train_mispred_r   <= cmt_mispred_i;
         train_target_r    <= cmt_target_i;
         train_btype_r     <= cmt_br_type_i;
-        train_is_direct_b_r <= cmt_is_direct_b_i;
         train_ft_r        <= cmt_pc_word_i + 1'b1;
         train_meta_r      <= blk_meta_cmt_rd;
     end
@@ -261,7 +287,6 @@ assign train_taken_o        = train_taken_r;
 assign train_mispred_o      = train_mispred_r;
 assign train_target_o       = train_target_r;
 assign train_br_type_o      = train_btype_r;
-assign train_is_direct_b_o  = train_is_direct_b_r;
 assign train_fall_through_o = train_ft_r;
 assign train_meta_o         = train_meta_r;
 
@@ -273,6 +298,9 @@ reg [63:0] commit_cond_branch_count;
 reg [63:0] commit_cond_mispred_count;
 reg [63:0] commit_cond_meta_valid_count;
 reg [63:0] commit_cond_meta_invalid_count;
+reg [63:0] p1_head_bypass_offer_count;
+reg [63:0] p1_head_bypass_accept_count;
+reg [63:0] p1_head_correction_bypass_count;
 
 localparam META_TAGE_VALID_BIT = 38;
 
@@ -284,6 +312,9 @@ always @(posedge clk) begin
         commit_cond_mispred_count <= 64'd0;
         commit_cond_meta_valid_count <= 64'd0;
         commit_cond_meta_invalid_count <= 64'd0;
+        p1_head_bypass_offer_count <= 64'd0;
+        p1_head_bypass_accept_count <= 64'd0;
+        p1_head_correction_bypass_count <= 64'd0;
     end else begin
         if (p1_meta_valid_i)
             p1_meta_saved_count <= p1_meta_saved_count + 64'd1;
@@ -298,6 +329,13 @@ always @(posedge clk) begin
         end
         if (cmt_valid_i && cmt_is_branch_i && (cmt_br_type_i == `BR_TYPE_COND) && cmt_mispred_i)
             commit_cond_mispred_count <= commit_cond_mispred_count + 64'd1;
+        if (head_p1_bypass)
+            p1_head_bypass_offer_count <= p1_head_bypass_offer_count + 64'd1;
+        if (head_p1_bypass && ifu_accept_i && ifu_valid_o)
+            p1_head_bypass_accept_count <= p1_head_bypass_accept_count + 64'd1;
+        if (head_p1_correction_bypass && ifu_accept_i && ifu_valid_o)
+            p1_head_correction_bypass_count <=
+                p1_head_correction_bypass_count + 64'd1;
     end
 end
 // synthesis translate_on

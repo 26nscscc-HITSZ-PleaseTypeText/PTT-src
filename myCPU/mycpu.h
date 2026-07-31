@@ -41,6 +41,11 @@
                             // 结果时，已提交但未被覆盖的数据仍可读，必须保留！）
 // 未决 store 提交判定：对指针距离 d=(R-head) 环形；存活项 d ∈ [0, N-GUARD)，
 // wrap 后 d ∈ [N-GUARD, N)。阈值须随 ROB_PAIR_W 伸缩（原写死 12 只适配 16 对）。
+// Candidate: retain only the architecturally required empty pair.  Dispatch
+// reads a just-committed value before its tag can be reused and subsequently
+// falls back to ARF once RAT.busy clears.
+`undef ROB_GUARD
+`define ROB_GUARD       1
 `define ROB_WRAP_THR    ((1<<`ROB_PAIR_W)-`ROB_GUARD)
 
 `define RS_ALU_SIZE     4   // 每个 ALU 保留站项数（乱序发射）
@@ -61,7 +66,7 @@
 `define IB_SIZE         16  // 指令缓冲项数（入口<=4条/拍，出口 2条/拍）
 `define IB_W            4   // $clog2(IB_SIZE)
 // 默认启用空 IB 组合旁路；定义该宏可关闭旁路，用于隔离冷启动行为。
-// `define IB_DISABLE_EMPTY_FALLTHROUGH
+`define IB_DISABLE_EMPTY_FALLTHROUGH
 
 
 /* =====================================================
@@ -83,10 +88,27 @@
 // 保留 hit-bypass，在顶层对 mem_wb 整总线打一拍切断 D$→RS；early2 关闭，
 // 避免消费者在写回数据可用前提前唤醒。
 `define LSU_DC_HIT_BYPASS 1           // 保持命中当拍算出 WB 数据
-`define LSU_WB_PIPE       1           // 顶层 mem_wb→RS/ROB 打一拍，切断命中组合路径
+`define LSU_WB_PIPE       1           // 常规 LSU 写回打一拍；ALU 另用不写 RS 状态的专用快速旁路
+// The routed 70 MHz reports show that sending the unregistered DCache hit or
+// MSHR completion directly to ROB result RAM still creates two setup
+// violations (DCache req/tag/MSHR state -> ROB result D).  ROB completion is
+// therefore taken from the existing registered mem_wb bus as well.  The
+// dedicated fast_wb path below remains available to reservation stations, so
+// dependent cached loads keep their same-cycle operand bypass without making
+// the architectural ROB write cross the chip combinationally.
+`define LSU_ROB_EARLY_COMPLETE 0
 `define LSU_EARLY2_ENABLE 0           // 与 WB_PIPE 配对关闭（否则 T 醒、T+1 数据）
 `define LSU_EARLY2_PIPE   0
+`define ALU_EARLY_WAKEUP_ENABLE 0     // 禁止 D$→ALU issue→early→第二级 RS 的超长组合链
 `define IFU_FTQ_DIRECT    1           // 1: 允许同拍 FTQ→I$；仅在 mmu_i_direct_ok（无主 TLB）时开火
+// NSCSCC on-chip RAM is at PA 0x1c000000~0x1c0fffff.  Do NOT silently
+// promote software MAT=0 (UC) to cached here: lab19 self-modifying tests
+// (n73 icacop) rely on DMW MAT=0 stores reaching memory before Index inv.
+// A previous COMPETITION_BOOT_RAM_CACHE promote broke that contract.
+// FPGA BRAM contents are initialized by the bitstream.  Let FTB entries power
+// up invalid instead of spending the first 2048 clocks clearing every set and
+// discarding all cold-start queries/training.
+`define FTB_POWERUP_INIT 1
 `define STQ_DEPTH         16          // 未提交 store 队列深度；提交后按 ROB id 释放
 `define L1_NSET           128         // L1 每路组数（16KB/4路/32B）
 `define L1_INDEX_W        7           // $clog2(L1_NSET)
@@ -102,8 +124,6 @@
  * ===================================================== */
 `define UBTB_SIZE         16          // uBTB 项数（全相联，当拍返回，回填小循环）
 // 普通 JIRL 使用小型目标缓存；CALL/RET 由 RAS 处理。
-`define JIRL_TC_SIZE      32          // 普通 JIRL 小型目标缓存项数（直接映射）
-`define JIRL_TC_INDEX_W   5           // $clog2(JIRL_TC_SIZE)
 `define FTB_NWAY          4           // FTB 路数
 `define FTB_NSET          2048        // FTB 每路组数（共 8192 项，BRAM 实现）
 `define FTB_INDEX_W       11          // $clog2(FTB_NSET)

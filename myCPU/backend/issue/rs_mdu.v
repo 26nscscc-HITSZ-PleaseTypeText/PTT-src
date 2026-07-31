@@ -47,6 +47,11 @@ module rs_mdu(
     input  wire                       wb2_valid_i,
     input  wire [`ROB_W-1:0]          wb2_robid_i,
     input  wire [31:0]                wb2_data_i,
+    // Unregistered LSU completion is used only as a same-cycle operand
+    // bypass for the FIFO head.  Normal wb2 still captures RS state.
+    input  wire                       fast2_valid_i,
+    input  wire [`ROB_W-1:0]          fast2_robid_i,
+    input  wire [31:0]                fast2_data_i,
     input  wire                       wb3_valid_i,
     input  wire [`ROB_W-1:0]          wb3_robid_i,
     input  wire [31:0]                wb3_data_i,
@@ -102,6 +107,10 @@ reg [1:0]               count;
 
 integer i;
 wire head_ready;
+wire head_s0_fast;
+wire head_s1_fast;
+wire head_fast_ready;
+wire head_uses_fast;
 wire issue_fire;
 
 wire            s0_wb_match [0:`RS_MDU_SIZE-1];
@@ -171,10 +180,21 @@ wire [31:0] push_s1_wbdat = (wb0_valid_i && (wb0_robid_i == push_src1_robid_i)) 
 
 assign occupancy_o = count;
 assign can_accept_o = (count != `RS_MDU_SIZE);
+assign head_s0_fast = !s0_val_valid[head] &&
+                      (fast2_robid_i == s0_robid[head]);
+assign head_s1_fast = !s1_val_valid[head] &&
+                      (fast2_robid_i == s1_robid[head]);
 assign head_ready = (count != 2'b0) && valid[head] &&
                     ((s0_ready[head] && s0_val_valid[head]) || s0_wbhit[head]) &&
                     ((s1_ready[head] && s1_val_valid[head]) || s1_wbhit[head]);
-assign issue_valid_o = head_ready && mdu_ready_i;
+assign head_fast_ready = (count != 2'b0) && valid[head] &&
+                         (((s0_ready[head] && s0_val_valid[head]) ||
+                           s0_wbhit[head]) || head_s0_fast) &&
+                         (((s1_ready[head] && s1_val_valid[head]) ||
+                           s1_wbhit[head]) || head_s1_fast) &&
+                         (head_s0_fast || head_s1_fast);
+assign head_uses_fast = !head_ready && fast2_valid_i && head_fast_ready;
+assign issue_valid_o = (head_ready || head_uses_fast) && mdu_ready_i;
 assign issue_fire = issue_valid_o;
 
 assign issue_robid_o = robid[head];
@@ -183,8 +203,12 @@ assign issue_csr_op_o = csr_op[head];
 assign issue_csr_num_o = csr_num[head];
 assign issue_tlb_op_o = tlb_op[head];
 assign issue_wb_src_op_o = wb_src_op[head];
-assign issue_src0_o = s0_wbhit[head] ? s0_wbdat[head] : s0_val[head];
-assign issue_src1_o = s1_wbhit[head] ? s1_wbdat[head] : s1_val[head];
+assign issue_src0_o = (head_uses_fast && head_s0_fast && !s0_wbhit[head])
+                    ? fast2_data_i
+                    : (s0_wbhit[head] ? s0_wbdat[head] : s0_val[head]);
+assign issue_src1_o = (head_uses_fast && head_s1_fast && !s1_wbhit[head])
+                    ? fast2_data_i
+                    : (s1_wbhit[head] ? s1_wbdat[head] : s1_val[head]);
 
 always @(posedge clk) begin
     if (reset || flush_i) begin

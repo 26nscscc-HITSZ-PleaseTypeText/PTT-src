@@ -303,8 +303,26 @@ assign dis1_src1_addr_o = dis1_src1_addr_r;
 //      ready 在“槽空”或“本拍 valid 槽均 fire”时为 1，允许同拍 vacated+装入。
 //      分发级每拍最多 1 条 MEM/MDU，双发两条同类会卡住直到能 vacated。
 //
-wire ib0_eff_v = ib0_valid_i && !ib0_is_nop_i;
-wire ib1_eff_v = ib1_valid_i && !ib1_is_nop_i;
+// Keep static exceptions/barriers/no-effect operations in the ROB so commit
+// observes their architectural ordering, but do not send them to an
+// execution unit.  ROB completion is reconstructed from the same saved
+// static fields at the head, so a late FU write cannot corrupt a reused tag.
+wire ib0_static_excp = |ib0_excp_i;
+wire ib1_static_excp = |ib1_excp_i;
+wire ib0_barrier = ib0_priv_vec_i[`PRIV_IBAR];
+wire ib1_barrier = ib1_priv_vec_i[`PRIV_IBAR];
+wire ib0_no_side_effect =
+    !ib0_rf_we_i && !ib0_is_load_i && !ib0_is_store_i
+    && !ib0_is_branch_i && !(|ib0_priv_vec_i);
+wire ib1_no_side_effect =
+    !ib1_rf_we_i && !ib1_is_load_i && !ib1_is_store_i
+    && !ib1_is_branch_i && !(|ib1_priv_vec_i);
+wire ib0_no_exec =
+    ib0_static_excp || ib0_barrier || ib0_no_side_effect;
+wire ib1_no_exec =
+    ib1_static_excp || ib1_barrier || ib1_no_side_effect;
+wire ib0_eff_v = ib0_valid_i && !ib0_no_exec;
+wire ib1_eff_v = ib1_valid_i && !ib1_no_exec;
 // L0 CSR 写：单独成对进入 ROB，并闸住后续 rename，直至提交（免 flush 时防在途 csrrd）
 wire ib0_l0_csr_wr = ib0_eff_v && ib0_priv_vec_i[`PRIV_CSR_WR]
                   && `CSR_NUM_IS_L0_NOFLUSH(ib0_csr_num_i);
@@ -464,7 +482,7 @@ always @(posedge clk) begin
         dis0_valid_o <= 1'b0;
         dis1_valid_o <= 1'b0;
     end else if (can_go) begin
-        dis0_valid_o <= ib0_valid_i && !ib0_is_nop_i;
+        dis0_valid_o <= ib0_valid_i && !ib0_no_exec;
         dis0_robid_o <= robid0;
         dis0_pc_o <= ib0_pc_i;
         dis0_futype_o <= ib0_futype_i;
@@ -491,7 +509,7 @@ always @(posedge clk) begin
         dis0_src0_addr_r <= ib0_src0_addr_i;
         dis0_src1_addr_r <= ib0_src1_addr_i;
 
-        dis1_valid_o <= ib1_valid_i && !ib1_is_nop_i && dual_issue_ok;
+        dis1_valid_o <= ib1_valid_i && !ib1_no_exec && dual_issue_ok;
         dis1_robid_o <= robid1;
         dis1_pc_o <= ib1_pc_i;
         dis1_futype_o <= ib1_futype_i;

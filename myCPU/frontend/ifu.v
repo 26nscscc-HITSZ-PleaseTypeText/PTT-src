@@ -38,6 +38,8 @@ module ifu(
     input  wire                       mmu_i_excp_adef_i,
     input  wire [`TLB_EX_NUM-1:0]     mmu_i_tlb_ex_i,
     input  wire                       mmu_i_direct_ok_i, // 1: 翻译不依赖主 TLB（DA/DMW/L1 CAM）
+    input  wire [31:0]                mmu_i_direct_paddr_i,
+    input  wire [1:0]                 mmu_i_direct_mat_i,
     // 仅包含可直发路径上的异常；PRE 仍锁存完整 adef/tlb_ex 结果。
     input  wire                       mmu_i_direct_excp_i,
 
@@ -48,6 +50,7 @@ module ifu(
     input  wire                       ic_addr_ok_i,
     input  wire                       ic_data_ok_i,
     input  wire [`CACHE_LINE_BITS-1:0] ic_rline_i,
+    input  wire                       ic_invalidate_i,
 
     output wire                       predec_redirect_o,
     output wire                       predec_fixup_only_o,
@@ -157,10 +160,29 @@ end
 
 reg ic_outstanding;
 reg [31:5] ic_rsp_line;
+reg [31:5] ic_rsp_pline;
+reg [2:0]  ic_rsp_word;
+reg        ic_rsp_uncached;
+reg        ic_rsp_killed;
+
+// One-entry physical response reuse buffer.  Reuse is checked only after the
+// FTQ block has entered PRE, so the tag comparison is kept out of the P0/FTQ
+// request path.  Both cached and uncached responses are retained: the latter
+// is especially important during the reset-time data-copy loop, where one
+// 32-byte fetch response would otherwise be refetched several times.
+reg        linebuf_valid;
+reg [31:5] linebuf_pline;
+reg [7:0]  linebuf_word_valid;
+reg [`CACHE_LINE_BITS-1:0] linebuf_data;
 
 initial begin
     ic_outstanding = 1'b0;
     ic_rsp_line    = 27'b0;
+    ic_rsp_pline   = 27'b0;
+    ic_rsp_word    = 3'b0;
+    ic_rsp_uncached = 1'b0;
+    ic_rsp_killed  = 1'b0;
+    linebuf_valid  = 1'b0;
 end
 
 // I$ 单逻辑请求在途：addr_ok 置位、data_ok 清零；若旧响应和新接受同拍，
@@ -172,6 +194,10 @@ always @(posedge clk) begin
     if (reset) begin
         ic_outstanding <= 1'b0;
         ic_rsp_line    <= 27'b0;
+        ic_rsp_pline   <= 27'b0;
+        ic_rsp_word    <= 3'b0;
+        ic_rsp_uncached <= 1'b0;
+        ic_rsp_killed  <= 1'b0;
     end else begin
         case ({(ic_req_o && (ic_addr_ok_i === 1'b1)), (ic_data_ok_i === 1'b1)})
             2'b10: ic_outstanding <= 1'b1;
@@ -181,8 +207,39 @@ always @(posedge clk) begin
         endcase
         // 同拍 data_ok + addr_ok 时，data_ok 属于旧 ic_rsp_line；时钟沿后
         // tracker 被新请求替换，供下一拍响应配对。
-        if (ic_req_o && (ic_addr_ok_i === 1'b1))
+        // A flush/cache-maintenance operation invalidates the response that
+        // was already in flight.  It may return later, but must not refill
+        // the reuse buffer after the invalidation point.
+        if ((flush_i === 1'b1) || (ic_invalidate_i === 1'b1))
+            ic_rsp_killed <= ic_outstanding
+                          || (ic_req_o && (ic_addr_ok_i === 1'b1));
+        else if (ic_req_o && (ic_addr_ok_i === 1'b1))
+            ic_rsp_killed <= 1'b0;
+
+        if (ic_req_o && (ic_addr_ok_i === 1'b1)) begin
             ic_rsp_line <= ic_vline;
+            ic_rsp_pline <= ic_paddr_o[31:5];
+            ic_rsp_word <= ic_paddr_o[4:2];
+            ic_rsp_uncached <= ic_uncached_o;
+        end
+    end
+end
+
+always @(posedge clk) begin
+    if (reset || (flush_i === 1'b1)
+              || (ic_invalidate_i === 1'b1)) begin
+        linebuf_valid <= 1'b0;
+    end else if ((ic_data_ok_i === 1'b1)
+              && (ic_rsp_killed !== 1'b1)) begin
+        linebuf_valid <= 1'b1;
+        linebuf_pline <= ic_rsp_pline;
+        // An uncached I$ response contains only the requested word through
+        // word 7; the lower words are zero-filled by icache.v.  Track that
+        // coverage explicitly so a later backward branch can never consume
+        // those zeros as instructions.
+        linebuf_word_valid <= ic_rsp_uncached
+                            ? (8'hff << ic_rsp_word) : 8'hff;
+        linebuf_data  <= ic_rline_i;
     end
 end
 
@@ -204,23 +261,38 @@ wire [`BLK_LEN_W-1:0] if_len_eff  = safe_blk_len(if_len);
 wire ib_can_push = (ib_can_push_i === 1'b1);
 wire if_rsp_match  = (ic_rsp_line == if_pc[31:5]);
 wire pre_rsp_match = (ic_rsp_line == pre_pc[31:5]);
+wire pre_rsp_reuse = (pre_v === 1'b1) && !pre_excp
+                  && (pre_ic_sent !== 1'b1)
+                  && (ic_data_ok_i === 1'b1)
+                  && (ic_rsp_killed !== 1'b1)
+                  && (pre_paddr[31:5] == ic_rsp_pline)
+                  && (!ic_rsp_uncached
+                      || (pre_paddr[4:2] >= ic_rsp_word))
+                  && (ic_invalidate_i !== 1'b1);
+wire pre_linebuf_hit = (pre_v === 1'b1) && !pre_excp
+                    && (pre_ic_sent !== 1'b1)
+                    && linebuf_valid
+                    && (pre_paddr[31:5] == linebuf_pline)
+                    && linebuf_word_valid[pre_paddr[4:2]]
+                    && (ic_invalidate_i !== 1'b1);
 // data_ok 拍只锁存 if_rline，下一拍 !wait && |if_rline 才允许 IF 前进。
 wire if_line_ready = (if_excp === 1'b1)
                   || ((if_wait_data !== 1'b1) && (if_v === 1'b1) && (|if_rline));
-wire if_ready_go = (if_v === 1'b1) && ib_can_push && if_line_ready;
-
-// PRE/IF 两级流水：最多 2 块在途。
-// 仅当 PRE 占用且本拍无法前进（IF 占用未走 / PRE 请求未发出）时反压 FTQ；
-// predec 全量重定向当拍不接新块（FTQ 正回滚 ifu_ptr/bpu_ptr），
-// 且 PRE 中的错误路径块被丢弃（见 predec_kill）。
-wire pre_done     = (pre_v === 1'b1) && (pre_excp || (pre_ic_sent === 1'b1));
+// Invalidate must combinationally stop IB push: register clear is next edge.
+wire if_ready_go = (if_v === 1'b1) && ib_can_push && if_line_ready
+                && (ic_invalidate_i !== 1'b1);
+wire pre_done     = (pre_v === 1'b1)
+                 && (pre_excp || (pre_ic_sent === 1'b1)
+                     || pre_rsp_reuse || pre_linebuf_hit);
 wire if_allow_in  = (if_v !== 1'b1) || if_ready_go;
-wire pre_ready_go = pre_done && if_allow_in;
+wire pre_ready_go = pre_done && if_allow_in
+                 && (ic_invalidate_i !== 1'b1);
 wire predec_kill  = predec_redirect_o && (predec_fixup_only_o !== 1'b1);
 wire pre_to_if    = pre_ready_go && !predec_kill;
 assign ftq_accept_o = (ftq_valid_i === 1'b1)
                    && ((pre_v !== 1'b1) || pre_ready_go)
-                   && !predec_kill && (flush_i !== 1'b1);
+                   && !predec_kill && (flush_i !== 1'b1)
+                   && (ic_invalidate_i !== 1'b1);
 
 // MMU 请求由 FTQ valid 驱动，避免 ftq_accept_o 上的 I$ 返回链进入地址翻译。
 // 翻译结果只会在 ftq_accept_o 成立时锁存；停顿期间提前查询真实 FTQ PC
@@ -238,6 +310,7 @@ wire ic_slot_free = (ic_outstanding !== 1'b1) || (ic_data_ok_i === 1'b1);
 // PRE 发请求的前提：I$ 有空槽、IF 不在重放、本块非错误路径
 wire pre_ic_req = (pre_v === 1'b1) && !pre_excp && (pre_ic_sent !== 1'b1)
                && ic_slot_free && !if_replay_req
+               && !pre_rsp_reuse && !pre_linebuf_hit
                && !predec_kill && (flush_i !== 1'b1);
 
 // PRE 正在前进（或为空）时，ftq_accept_o 接收的新块可直接发 I$，避免
@@ -248,6 +321,11 @@ wire pre_ic_req = (pre_v === 1'b1) && !pre_excp && (pre_ic_sent !== 1'b1)
 wire ftq_direct_req = (`IFU_FTQ_DIRECT != 0)
                    && (ftq_accept_o === 1'b1) && (mmu_i_direct_excp_i !== 1'b1)
                    && (mmu_i_direct_ok_i === 1'b1)
+                   // Uncached responses are partial lines and much slower
+                   // than one PRE cycle.  Let PRE consult the physical
+                   // response buffer before issuing them; keep same-cycle
+                   // FTQ direct issue only for ordinary cacheable fetches.
+                   && (mmu_i_direct_mat_i == 2'd1)
                    && ic_slot_free && !if_replay_req
                    && (flush_i !== 1'b1);
 wire ftq_direct_fire = ftq_direct_req && (ic_addr_ok_i === 1'b1);
@@ -257,12 +335,14 @@ wire [31:5] ic_vline = if_replay_req ? if_pc[31:5]
                       : pre_ic_req   ? pre_pc[31:5] : ftq_pc_i[31:5];
 assign ic_vindex_o   = ic_vline[11:5];
 assign ic_paddr_o    = if_replay_req ? if_paddr
-                     : pre_ic_req    ? pre_paddr : mmu_i_paddr_i;
+                     : pre_ic_req    ? pre_paddr : mmu_i_direct_paddr_i;
 assign ic_uncached_o = if_replay_req ? if_uncached
-                     : pre_ic_req    ? pre_uncached : (mmu_i_mat_i != 2'd1);
+                     : pre_ic_req    ? pre_uncached : (mmu_i_direct_mat_i != 2'd1);
 
 always @(posedge clk) begin
-    if (reset || flush_i) begin
+    // I$ cacop 与流水线 flush 可能差一拍：invalidate 当拍必须丢掉 PRE/IF
+    // 已锁存的行数据，否则自修改代码仍可能从 if_rline/linebuf 吃到旧指令。
+    if (reset || flush_i || (ic_invalidate_i === 1'b1)) begin
         pre_v        <= 1'b0;
         pre_ic_sent  <= 1'b0;
         pre_line_valid <= 1'b0;
@@ -292,10 +372,20 @@ always @(posedge clk) begin
             pre_ic_sent <= 1'b0;
             pre_line_valid <= 1'b0;
         end else begin
-            if (pre_ic_req && (ic_addr_ok_i === 1'b1))
+            if (pre_rsp_reuse) begin
+                pre_ic_sent    <= 1'b1;
+                pre_line_valid <= 1'b1;
+                pre_rline      <= ic_rline_i;
+            end else if (pre_linebuf_hit) begin
+                pre_ic_sent    <= 1'b1;
+                pre_line_valid <= 1'b1;
+                pre_rline      <= linebuf_data;
+            end else if (pre_ic_req && (ic_addr_ok_i === 1'b1)) begin
                 pre_ic_sent <= 1'b1;
+            end
             // IF/IB 反压可能在 PRE 被占用时遇到 I$ 返回；保留该行，避免丢弃后重放。
-            if (pre_v && pre_ic_sent && (ic_data_ok_i === 1'b1) && pre_rsp_match) begin
+            if (pre_v && pre_ic_sent && (ic_data_ok_i === 1'b1) && pre_rsp_match
+                && (ic_rsp_killed !== 1'b1)) begin
                 pre_rline      <= ic_rline_i;
                 pre_line_valid <= 1'b1;
             end
@@ -318,7 +408,14 @@ always @(posedge clk) begin
             end else if (pre_line_valid) begin
                 if_rline     <= pre_rline;
                 if_wait_data <= 1'b0;
-            end else if ((ic_data_ok_i === 1'b1) && pre_rsp_match) begin
+            end else if (pre_rsp_reuse) begin
+                if_rline     <= ic_rline_i;
+                if_wait_data <= 1'b0;
+            end else if (pre_linebuf_hit) begin
+                if_rline     <= linebuf_data;
+                if_wait_data <= 1'b0;
+            end else if ((ic_data_ok_i === 1'b1) && pre_rsp_match
+                         && (ic_rsp_killed !== 1'b1)) begin
                 // 只消费与 PRE 同一 cache line 的响应；旧路径应答即使与
                 // 新请求同拍返回，也不会被错误配给新块。
                 if_rline     <= ic_rline_i;
@@ -330,7 +427,7 @@ always @(posedge clk) begin
             if_v         <= 1'b0;
             if_wait_data <= 1'b0;
         end else if (if_v && if_wait_data && (ic_data_ok_i === 1'b1)
-                     && if_rsp_match) begin
+                     && if_rsp_match && (ic_rsp_killed !== 1'b1)) begin
             if_rline     <= ic_rline_i;
             if_wait_data <= 1'b0;
         end
@@ -449,20 +546,26 @@ always @(*) begin
     block_has_br     = 1'b0;
     for (pi = 0; pi < 4; pi = pi + 1) begin
         if (pi < if_len_u) begin
-            if (imm_br[pi] || cond_br[pi])
+            // A JIRL is also a real control-flow boundary.  In particular, a
+            // correctly predicted RET must not be mistaken for a dirty taken
+            // FTB entry merely because no predecode redirect is required.
+            if (imm_br[pi] || cond_br[pi] || jirl_br[pi])
                 block_has_br = 1'b1;
             if (!predec_found) begin
-                if (imm_br[pi] && ((pi < if_len_u - 32'd1) || !if_taken)) begin
+                // Find the first architectural control-flow instruction
+                // independently of whether its predicted target is correct.
+                // out_len and all IB push controls are derived from this
+                // structural boundary and therefore do not depend on the
+                // asynchronous RAS checkpoint read.
+                if (imm_br[pi]) begin
                     predec_found     = 1'b1;
                     predec_idx       = pi[1:0];
                     predec_is_direct = 1'b1;
-                end else if (ret_br[pi] && ras_checkpoint_nonempty_i &&
-                             ((pi < if_len_u - 32'd1) || !if_taken ||
-                              (if_target != ras_checkpoint_top_i))) begin
+                end else if (ret_br[pi]) begin
                     predec_found     = 1'b1;
                     predec_idx       = pi[1:0];
                     predec_is_ret    = 1'b1;
-                end else if (cond_br[pi] && (pi < if_len_u - 32'd1)) begin
+                end else if (cond_br[pi] || jirl_br[pi]) begin
                     predec_found     = 1'b1;
                     predec_idx       = pi[1:0];
                 end
@@ -470,6 +573,21 @@ always @(*) begin
         end
     end
 end
+
+wire predec_before_end = predec_found &&
+                         ({30'b0, predec_idx} < (if_len_u - 32'd1));
+// Target validation is intentionally kept on the redirect-only side of the
+// predecoder.  It may update BPU/FTQ state, but it cannot change the number of
+// instructions presented to the four-bank FWFT instruction buffer.
+wire predec_needs_redirect =
+    predec_found &&
+    (predec_is_direct
+        ? (predec_before_end || !if_taken)
+        : predec_is_ret
+            ? (ras_checkpoint_nonempty_i &&
+               (predec_before_end || !if_taken ||
+                (if_target != ras_checkpoint_top_i)))
+            : (cond_br[predec_idx] && predec_before_end));
 
 wire [`BLK_LEN_W-1:0] out_len = predec_found ? (predec_idx + 1'b1) : if_len_eff;
 wire push_en = if_ready_go;
@@ -492,9 +610,15 @@ function slot_pred_taken;
         if ((idx + 1'b1) == olen[`BLK_LEN_W-1:0]) begin
             if (imm_br[idx])
                 slot_pred_taken = 1'b1;
-            else if (predec_found && predec_is_ret)
+            // RET is architecturally taken even when the speculative RAS is
+            // empty.  The backend may still repair its target, but the IB
+            // metadata must not depend on the RAS checkpoint lookup.
+            else if (predec_found && predec_is_ret &&
+                     (idx == predec_idx))
                 slot_pred_taken = 1'b1;
-            else if (predec_found && !predec_is_direct)
+            else if (predec_found && !predec_is_direct &&
+                     !predec_is_ret && cond_br[idx] &&
+                     (idx == predec_idx) && predec_before_end)
                 slot_pred_taken = 1'b0;
             else if (if_taken && (cond_br[idx] || jirl_br[idx]))
                 slot_pred_taken = 1'b1;
@@ -502,7 +626,8 @@ function slot_pred_taken;
     end
 endfunction
 
-assign predec_redirect_o    = push_en && !if_excp && (predec_found || false_taken);
+assign predec_redirect_o    = push_en && !if_excp &&
+                              (predec_needs_redirect || false_taken);
 assign predec_fixup_only_o  = 1'b0;   // 两类截断均全量重定向（回滚指针 + 改 PC）
 assign predec_update_pc_o   = 1'b1;
 // 直接跳转：去立即数目标；cond/ret 截断 / 假 taken：去截断块 fall-through
@@ -513,7 +638,7 @@ assign predec_redirect_id_o = if_id;
 assign predec_length_o      = out_len;
 // cond/ret 截断 / 假 taken 按"不跳"出口，taken=0；
 // target 与 redirect_pc 一致（pred_taken=0 时提交级不比对 target，仅记录）
-assign predec_taken_o       = predec_found && predec_is_direct;
+assign predec_taken_o       = predec_needs_redirect && predec_is_direct;
 assign predec_target_o      = predec_redirect_pc_o;
 assign predec_block_pc_o    = if_pc;
 assign predec_branch_target_o =
@@ -561,5 +686,113 @@ assign ib_push3_is_last_o   = (out_len >= 3'd4);
 assign ib_push3_ftq_id_o    = if_id;
 assign ib_push3_excp_o      = if_excp_vec;
 
+`ifdef SYNTHESIS
+// synthesis translate_off
+reg [63:0] diag_cycle;
+reg [63:0] diag_ftq_valid;
+reg [63:0] diag_ftq_accept;
+reg [63:0] diag_ftq_pre_stall;
+reg [63:0] diag_pre_wait_req;
+reg [63:0] diag_pre_wait_if;
+reg [63:0] diag_if_wait_data;
+reg [63:0] diag_if_wait_ib;
+reg [63:0] diag_ic_outstanding;
+reg [63:0] diag_ic_req;
+reg [63:0] diag_ic_addr_ok;
+reg [63:0] diag_ic_data_ok;
+reg [63:0] diag_ic_uncached;
+reg [63:0] diag_ic_uncached_direct;
+reg [63:0] diag_ic_uncached_pre;
+reg [63:0] diag_ic_uncached_replay;
+reg [63:0] diag_pre_rsp_mismatch;
+reg [63:0] diag_if_rsp_mismatch;
+reg [31:0] diag_first_uncached_pc;
+reg [31:0] diag_last_uncached_pc;
+
+always @(posedge clk) begin
+    if (reset) begin
+        diag_cycle            <= 64'd0;
+        diag_ftq_valid        <= 64'd0;
+        diag_ftq_accept       <= 64'd0;
+        diag_ftq_pre_stall    <= 64'd0;
+        diag_pre_wait_req     <= 64'd0;
+        diag_pre_wait_if      <= 64'd0;
+        diag_if_wait_data     <= 64'd0;
+        diag_if_wait_ib       <= 64'd0;
+        diag_ic_outstanding   <= 64'd0;
+        diag_ic_req           <= 64'd0;
+        diag_ic_addr_ok       <= 64'd0;
+        diag_ic_data_ok       <= 64'd0;
+        diag_ic_uncached      <= 64'd0;
+        diag_ic_uncached_direct <= 64'd0;
+        diag_ic_uncached_pre  <= 64'd0;
+        diag_ic_uncached_replay <= 64'd0;
+        diag_pre_rsp_mismatch <= 64'd0;
+        diag_if_rsp_mismatch  <= 64'd0;
+        diag_first_uncached_pc <= 32'd0;
+        diag_last_uncached_pc <= 32'd0;
+    end else begin
+        diag_cycle          <= diag_cycle + 64'd1;
+        diag_ftq_valid      <= diag_ftq_valid + {63'd0, ftq_valid_i};
+        diag_ftq_accept     <= diag_ftq_accept + {63'd0, ftq_accept_o};
+        diag_ftq_pre_stall  <= diag_ftq_pre_stall
+                             + {63'd0, (ftq_valid_i && !ftq_accept_o)};
+        diag_pre_wait_req   <= diag_pre_wait_req
+                             + {63'd0, (pre_v && !pre_excp && !pre_ic_sent)};
+        diag_pre_wait_if    <= diag_pre_wait_if
+                             + {63'd0, (pre_done && !if_allow_in)};
+        diag_if_wait_data   <= diag_if_wait_data
+                             + {63'd0, (if_v && if_wait_data)};
+        diag_if_wait_ib     <= diag_if_wait_ib
+                             + {63'd0, (if_v && !ib_can_push)};
+        diag_ic_outstanding <= diag_ic_outstanding + {63'd0, ic_outstanding};
+        diag_ic_req         <= diag_ic_req + {63'd0, ic_req_o};
+        diag_ic_addr_ok     <= diag_ic_addr_ok
+                             + {63'd0, (ic_req_o && ic_addr_ok_i)};
+        diag_ic_data_ok     <= diag_ic_data_ok + {63'd0, ic_data_ok_i};
+        diag_ic_uncached    <= diag_ic_uncached
+                             + {63'd0, (ic_req_o && ic_addr_ok_i
+                                      && ic_uncached_o)};
+        diag_ic_uncached_direct <= diag_ic_uncached_direct
+                             + {63'd0, (ftq_direct_req && ic_addr_ok_i
+                                      && (mmu_i_direct_mat_i != 2'd1))};
+        diag_ic_uncached_pre <= diag_ic_uncached_pre
+                             + {63'd0, (pre_ic_req && ic_addr_ok_i
+                                      && pre_uncached)};
+        diag_ic_uncached_replay <= diag_ic_uncached_replay
+                             + {63'd0, (if_replay_req && ic_addr_ok_i
+                                      && if_uncached)};
+        if (ic_req_o && ic_addr_ok_i && ic_uncached_o) begin
+            if (diag_ic_uncached == 64'd0)
+                diag_first_uncached_pc <= {ic_vline, 5'd0};
+            diag_last_uncached_pc <= {ic_vline, 5'd0};
+        end
+        diag_pre_rsp_mismatch <= diag_pre_rsp_mismatch
+                             + {63'd0, (ic_data_ok_i && pre_v
+                                      && pre_ic_sent && !pre_rsp_match)};
+        diag_if_rsp_mismatch <= diag_if_rsp_mismatch
+                             + {63'd0, (ic_data_ok_i && if_v
+                                      && if_wait_data && !if_rsp_match)};
+    end
+end
+
+final begin
+    $display("IFU diag: cycle=%0d ftq_valid=%0d accept=%0d pre_stall=%0d",
+             diag_cycle, diag_ftq_valid, diag_ftq_accept, diag_ftq_pre_stall);
+    $display("  pre_wait_req=%0d pre_wait_if=%0d if_wait_data=%0d if_wait_ib=%0d",
+             diag_pre_wait_req, diag_pre_wait_if, diag_if_wait_data,
+             diag_if_wait_ib);
+    $display("  ic_outstanding=%0d req=%0d addr_ok=%0d data_ok=%0d",
+             diag_ic_outstanding, diag_ic_req, diag_ic_addr_ok,
+             diag_ic_data_ok);
+    $display("  ic_uncached=%0d direct/pre/replay=%0d/%0d/%0d first/last=%08x/%08x",
+             diag_ic_uncached, diag_ic_uncached_direct,
+             diag_ic_uncached_pre, diag_ic_uncached_replay,
+             diag_first_uncached_pc, diag_last_uncached_pc);
+    $display("  rsp_mismatch: pre=%0d if=%0d",
+             diag_pre_rsp_mismatch, diag_if_rsp_mismatch);
+end
+// synthesis translate_on
+`endif
 
 endmodule

@@ -91,9 +91,13 @@ wire ib_empty_fwft_en = 1'b1;
 wire stored_pop0_valid_c = (count != {(`IB_W+1){1'b0}});
 wire stored_pop1_valid_c = (count >= {{(`IB_W-1){1'b0}}, 2'd2});
 wire ft_active = ib_empty_fwft_en && (count == {(`IB_W+1){1'b0}})
-              && (push_n != 3'd0) && can_push_o && !flush_i;
+              && push0_valid_i && can_push_o && !flush_i;
 wire pop0_valid_c = ft_active ? (push_n >= 3'd1) : stored_pop0_valid_c;
+`ifdef IB_SINGLE_EMPTY_FALLTHROUGH
+wire pop1_valid_c = ft_active ? 1'b0 : stored_pop1_valid_c;
+`else
 wire pop1_valid_c = ft_active ? (push_n >= 3'd2) : stored_pop1_valid_c;
+`endif
 wire pop0_fire = (pop0_ready_i === 1'b1) && pop0_valid_c;
 wire pop1_fire = pop0_fire && (pop1_ready_i === 1'b1) && pop1_valid_c;
 wire [1:0] pop_n = {1'b0, pop0_fire} + {1'b0, pop1_fire};
@@ -111,7 +115,6 @@ wire [`IB_W:0] push_cnt_n = can_push_o ? residual_push_count_ext : {(`IB_W+1){1'
 wire [`IB_W:0] count_next = ft_active
                           ? residual_push_count_ext
                           : (count + push_cnt_n - stored_pop_count_ext);
-wire           ib_empty_next = (count_next == {(`IB_W+1){1'b0}});
 
 // can_push_o 只能依赖寄存器 count，不能依赖 IFU 的 push valid，否则会与
 // ib_can_push_i 构成组合环。预留每拍最大 4 条的空间；count 为 13..16 时会
@@ -224,10 +227,11 @@ always @(posedge clk) begin
             endcase
         end
 
-        if (ib_empty_next) begin
-            head <= {`IB_W{1'b0}};
-            tail <= {`IB_W{1'b0}};
-        end else if (ft_active) begin
+        // Do not reset head/tail when the queue naturally becomes empty.
+        // Ring-buffer invariants already guarantee head_next == tail_next in
+        // that case.  Resetting both to zero made the FWFT push-valid path run
+        // through decode/rename ready and back into every pointer reset pin.
+        if (ft_active) begin
             head <= head + ft_consume_inc;
             tail <= tail + push_inc;
         end else begin
