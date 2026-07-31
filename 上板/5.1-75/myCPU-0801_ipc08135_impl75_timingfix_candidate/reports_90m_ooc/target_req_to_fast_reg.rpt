@@ -1,0 +1,1577 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2023 Advanced Micro Devices, Inc. All Rights Reserved.
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2023.2 (win64) Build 4029153 Fri Oct 13 20:14:34 MDT 2023
+| Date         : Fri Jul 31 22:04:11 2026
+| Host         : LAPTOP-B16PUBOD running 64-bit major release  (build 9200)
+| Command      : report_timing -from [get_cells -quiet -hier -filter {NAME =~ *req_paddr_reg*}] -to [get_cells -quiet -hier -filter {NAME =~ *mem_dc_fast*}] -delay_type max -max_paths 20 -nworst 1 -file D:/frontend/myCPU-0801_impl75_alltimingfix_exp/reports_90m_ooc/target_req_to_fast_reg.rpt
+| Design       : core_top
+| Device       : 7a200t-fbg676
+| Speed File   : -2  PRODUCTION 1.23 2018-06-13
+| Design State : Synthesized
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Timing Report
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[10]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[10]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[10]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[10]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[10]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[10]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[10]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[10]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[11]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[11]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[11]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[11]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[11]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[11]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[11]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[11]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[12]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[12]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[12]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[12]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[12]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[12]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[12]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[12]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[13]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[13]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[13]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[13]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[13]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[13]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[13]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[13]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[14]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[14]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[14]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[14]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[14]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[14]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[14]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[14]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[15]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[15]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[15]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[15]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[15]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[15]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[15]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[15]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[16]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[16]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[16]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[16]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[16]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[16]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[16]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[16]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[17]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[17]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[17]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[17]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[17]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[17]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[17]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[17]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[18]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[18]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[18]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[18]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[18]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[18]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[18]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[18]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[19]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[19]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[19]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[19]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[19]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[19]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[19]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[19]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[20]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[20]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[20]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[20]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[20]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[20]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[20]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[20]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[21]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[21]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[21]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[21]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[21]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[21]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[21]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[21]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[22]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[22]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[22]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[22]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[22]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[22]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[22]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[22]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[23]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[23]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[23]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[23]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[23]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[23]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[23]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[23]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[24]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[24]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[24]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[24]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[24]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[24]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[24]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[24]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[25]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[25]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[25]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[25]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[25]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[25]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[25]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[25]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[26]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[26]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[26]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[26]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[26]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[26]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[26]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[26]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[27]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[27]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[27]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[27]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[27]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[27]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[27]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[27]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[28]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[28]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[28]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[28]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[28]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[28]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[28]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[28]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+Slack (MET) :             2.104ns  (required time - arrival time)
+  Source:                 u_dcache/req_paddr_reg[5]_rep__0/C
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Destination:            mem_dc_fast_data_r_reg[29]/D
+                            (rising edge-triggered cell FDRE clocked by cpu_clk  {rise@0.000ns fall@5.556ns period=11.111ns})
+  Path Group:             cpu_clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            11.111ns  (cpu_clk rise@11.111ns - cpu_clk rise@0.000ns)
+  Data Path Delay:        8.961ns  (logic 2.706ns (30.198%)  route 6.255ns (69.803%))
+  Logic Levels:           15  (CARRY4=2 LUT2=1 LUT3=4 LUT4=1 LUT5=1 LUT6=5 RAMD64E=1)
+  Clock Path Skew:        -0.039ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.748ns = ( 11.859 - 11.111 ) 
+    Source Clock Delay      (SCD):    0.787ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock cpu_clk rise edge)    0.000     0.000 r  
+                                                      0.000     0.000 r  aclk (IN)
+                         net (fo=34009, unset)        0.787     0.787    u_dcache/aclk
+                         FDRE                                         r  u_dcache/req_paddr_reg[5]_rep__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_fdre_C_Q)         0.379     1.166 r  u_dcache/req_paddr_reg[5]_rep__0/Q
+                         net (fo=124, unplaced)       0.884     2.050    u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/ADDRC0
+                         RAMD64E (Prop_ramd64e_RADR0_O)
+                                                      0.232     2.282 r  u_dcache/gen_tag[3].tag_ram_reg_64_127_3_5/RAMC/O
+                         net (fo=2, unplaced)         0.593     2.875    u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_2
+                         LUT3 (Prop_lut3_I0_O)        0.124     2.999 r  u_dcache/gen_dram[3].u_way_ram/wb_addr[17]_i_4/O
+                         net (fo=3, unplaced)         0.600     3.599    u_dcache/gen_dram[3].u_way_ram/tag_rd[3]_9[5]
+                         LUT6 (Prop_lut6_I0_O)        0.105     3.704 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16/O
+                         net (fo=1, unplaced)         0.000     3.704    u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_16_n_0
+                         CARRY4 (Prop_carry4_S[1]_CO[3])
+                                                      0.457     4.161 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6/CO[3]
+                         net (fo=1, unplaced)         0.008     4.169    u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_6_n_0
+                         CARRY4 (Prop_carry4_CI_CO[2])
+                                                      0.209     4.378 r  u_dcache/gen_dram[3].u_way_ram/meta_front_way_reg[0]_i_4/CO[2]
+                         net (fo=1, unplaced)         0.330     4.708    u_dcache/gen_dram[3].u_way_ram/way_hit_30
+                         LUT2 (Prop_lut2_I0_O)        0.252     4.960 f  u_dcache/gen_dram[3].u_way_ram/meta_front_way[0]_i_2/O
+                         net (fo=11, unplaced)        0.628     5.588    u_dcache/gen_dram[3].u_way_ram/req_paddr_reg[11]_4
+                         LUT3 (Prop_lut3_I0_O)        0.105     5.693 f  u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_4__5/O
+                         net (fo=86, unplaced)        0.424     6.117    u_dcache/gen_dram[3].u_way_ram/mem_reg_0_i_254_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     6.222 r  u_dcache/gen_dram[3].u_way_ram/mem_reg_1_i_244/O
+                         net (fo=1, unplaced)         0.347     6.569    u_dcache/gen_dram[0].u_way_ram/cwb_line_reg[79]_0
+                         LUT4 (Prop_lut4_I3_O)        0.105     6.674 r  u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123/O
+                         net (fo=3, unplaced)         0.600     7.274    u_dcache/gen_dram[0].u_way_ram/mem_reg_1_i_123_n_0
+                         LUT6 (Prop_lut6_I1_O)        0.105     7.379 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12/O
+                         net (fo=1, unplaced)         0.347     7.726    u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_12_n_0
+                         LUT5 (Prop_lut5_I4_O)        0.105     7.831 r  u_dcache/gen_dram[0].u_way_ram/h_data[15]_i_7/O
+                         net (fo=4, unplaced)         0.371     8.202    u_dcache/gen_dram[0].u_way_ram/uc_rdata_reg[31][5]
+                         LUT3 (Prop_lut3_I2_O)        0.105     8.307 r  u_dcache/gen_dram[0].u_way_ram/h_data[31]_i_24/O
+                         net (fo=1, unplaced)         0.347     8.654    u_lsu/h_data[31]_i_6_0
+                         LUT6 (Prop_lut6_I5_O)        0.105     8.759 r  u_lsu/h_data[31]_i_14/O
+                         net (fo=24, unplaced)        0.411     9.170    u_lsu/h_data[31]_i_14_n_0
+                         LUT6 (Prop_lut6_I0_O)        0.105     9.275 r  u_lsu/h_data[29]_i_4/O
+                         net (fo=3, unplaced)         0.365     9.640    u_lsu/h_data[29]_i_4_n_0
+                         LUT3 (Prop_lut3_I2_O)        0.108     9.748 r  u_lsu/mem_dc_fast_data_r[29]_i_1/O
+                         net (fo=1, unplaced)         0.000     9.748    mem_fast_wb_data[29]
+                         FDRE                                         r  mem_dc_fast_data_r_reg[29]/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock cpu_clk rise edge)   11.111    11.111 r  
+                                                      0.000    11.111 r  aclk (IN)
+                         net (fo=34009, unset)        0.748    11.859    aclk
+                         FDRE                                         r  mem_dc_fast_data_r_reg[29]/C
+                         clock pessimism              0.000    11.859    
+                         clock uncertainty           -0.035    11.823    
+                         FDRE (Setup_fdre_C_D)        0.029    11.852    mem_dc_fast_data_r_reg[29]
+  -------------------------------------------------------------------
+                         required time                         11.852    
+                         arrival time                          -9.748    
+  -------------------------------------------------------------------
+                         slack                                  2.104    
+
+
+
+

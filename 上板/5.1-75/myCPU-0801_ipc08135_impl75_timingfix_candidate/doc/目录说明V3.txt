@@ -1,0 +1,63 @@
+================================================================
+myCPU 目录说明 V3（乱序双发射）
+================================================================
+
+myCPU/
+├── mycpu_top.v                      顶层：模块例化与连线（已完成，无 TODO）
+├── mycpu.h                          全局宏：宽度/深度/BPU/FU/冲刷/异常/CSR
+│
+├── frontend/  ——前端（取指 4 宽）
+│   ├── bpu.v                        分支预测顶层（P0 当拍 / P1 覆盖）
+│   │   ├── ubtb.v                     内含：16 项当拍小 BTB
+│   │   ├── ftb.v                      内含：取指目标缓冲 4路×1K
+│   │   ├── tage.v                     内含：TAGE 方向预测 8K+4×1K
+│   │   └── ras.v                      内含：返回地址栈 32 项双栈
+│   ├── ftq.v                        取指目标队列（8 基本块，三指针）
+│   ├── ifu.v                        取指流水 F0~F2（含预译码自重定向）
+│   ├── inst_buffer.v                指令缓冲（16 项，4 进 2 出）
+│   └── icache.v                     L1 I$（端口已改整行取指，内部待改造）
+│
+├── backend/   ——后端（2 宽乱序）
+│   ├── decode/
+│   │   ├── decoder.v                单条译码器（顶层例化 ×2）
+│   │   ├── inst_dec.v                 内含：按字段比较生成指令识别标志
+│   │   ├── op_dec.v                   内含：操作码生成
+│   │   ├── imm_generator.v            内含：立即数/分支偏移
+│   │   └── get_reg_read_addr.v        内含：源寄存器地址
+│   ├── rename/
+│   │   ├── rename.v                  重命名级（ROB 编号=标签，恒成对分配）
+│   │   └── rat.v                     寄存器别名表 32×{busy,robid}
+│   ├── issue/
+│   │   ├── dispatch.v                分发（读 ROB 补操作数 + 路由 4 RS）
+│   │   ├── rs_alu.v                  ALU 保留站 4 项·乱序发射（顶层例化 ×2）
+│   │   ├── rs_mem.v                  访存保留站 4 项·FIFO 顺序发射
+│   │   └── rs_mdu.v                  乘除杂项保留站 2 项·FIFO 顺序发射
+│   ├── execute/
+│   │   ├── fu_alu.v                  单周期 ALU+分支判断（顶层例化 ×2）
+│   │   │   └── alu.v                   内含：组合运算核（乘除待迁出）
+│   │   ├── fu_mdu.v                  多周期杂项单元（乘除/CSR读/rdcnt/invtlb打包）
+│   │   │   ├── mul.v                   内含：DSP 流水乘法器
+│   │   │   └── div.v                   内含：CLZ 快速除法器
+│   │   └── lsu.v                     访存单元（AGU+DC 两级流水）
+│   └── commit/
+│       ├── rob.v                     ROB 32 项奇偶双体环形队列（架构核心）
+│       ├── commit.v                  提交级（双提交仲裁/异常/特权/误预测）
+│       ├── ctrl.v                    全局冲刷/重定向仲裁 + idle 睡眠
+│       └── regfile.v                 ARF 4 读 2 写（第二写口 TODO）
+│
+├── memory/    ——存储与总线
+│   ├── store_buffer.v                提交后写缓冲 8 项（冲刷不清空）
+│   ├── dcache.v                      L1 D$（端口已改 load/store 双口，内部待改造）
+│   ├── l2cache.v                     L2 统一缓存（victim cache 为可选 TODO）
+│   └── axi_line_bridge.v             cache 行 <-> 32bit AXI burst 桥
+│
+├── priv/      ——特权与地址翻译
+    ├── csr_exception_commit_handler.v  CSR 寄存器组+异常提交（整体复用）
+    │   └── exception_Decoder.v         内含：异常优先级编码（已重建）
+    ├── tlb_manager.v                 翻译/维护封装
+    │   ├── tlb.v                       内含：主 TLB 32 项双查询口
+    │   └── l1_tlb.v                    内含（二期插入）：L1 微 TLB 加速
+    └── mmu.v                         I/D 双通道翻译门面（端口已改）
+ 
+
+

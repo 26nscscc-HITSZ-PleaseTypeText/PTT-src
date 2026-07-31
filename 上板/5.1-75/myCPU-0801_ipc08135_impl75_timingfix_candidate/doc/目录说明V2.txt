@@ -1,0 +1,77 @@
+目录说明（V2）
+
+修订1 V1时间：2026.4.2 9：15
+本次修订者：dogandlamb
+本次修订：初始化、整体初步分类
+问题与想法：流水级最好只有组合，把时序分出去
+
+修订2 V1.1时间：2026.4.6 0：39 凌晨
+本次修订者：dogandlamb
+本次修订：npc扩展
+问题与想法：下一步top的逻辑分离、模块规划由yuu12070302负责^-^
+
+修订3 V2时间：2026.5.5 19：05 阴雨绵绵
+本次修订者：dogandlamb
+本次修订：加入了AXI、cache、tlb、异常后的文件目录统整
+问题与想法：要加bpu，有空再细看AXI、cache、tlb
+
+/*--------------------------------------------------------------------*/
+myCPU/                                  # myCPU 总目录
+  top/                                  # 顶层
+    mycpu_top.v                         # CPU 顶层集成（五级流水 + cache/mmu/tlb + AXI + CSR/异常）
+    cpu_defs.vh                         # 全局宏定义（操作码位宽、控制位定义等）
+
+  frontend/                             # 前端相关
+    IFport.v                            # IF 流水级
+    IF_ID_reg.v                         # IF->ID 级间寄存器
+    IDport.v                            # ID 流水级
+    ID_EXE_reg.v                        # ID->EXE 级间寄存器
+    fetch/                              # 取指与 PC 更新
+      pc.v                              # PC 寄存器
+      npc.v                             # nextpc 组合仲裁（CSR/分支/阻塞）
+    decode/                             # 译码子模块（供 IDport 例化）
+      inst_dec.v                        # 指令识别
+      op_dec.v                          # ALU/BR/MEM/CSR/TLB/WB 控制解码
+      imm_generator.v                   # 立即数生成
+      get_reg_read_addr.v               # regfile 读地址生成
+      ALU_srcGenerator.v                # ALU 源操作数生成
+      decode_tools.v                    # 译码辅助工具
+
+  backend/                              # 后端相关
+    EXEport.v                           # EXE 流水级
+    EXE_MEM_reg.v                       # EXE->MEM 级间寄存器
+    MEMport.v                           # MEM 流水级
+    MEM_WB_reg.v                        # MEM->WB 级间寄存器
+    WBport.v                            # WB 流水级
+    execute/                            # EXE 子模块
+      alu.v                             # ALU（含乘除法时序路径）
+      clk_count64bit.v                  # 计数器辅助模块
+    memory/
+      暂时还没有在MEM例化的子模块.txt
+    writeback/
+      暂时还没有在WB例化的子模块.txt
+
+  common/                               # 跨级公共模块
+    control/                            # 流水控制
+      pipeline_controller.v             # 各级 valid/allowIn 控制
+      forward_deliver.v                 # 前递数据选择
+    hazard/                             # 冒险检测与处理
+      conflict_detector.v               # RAW 命中检测 + refetch 请求检测
+      conflict_handle.v                 # 阻塞/冲刷/前递控制归并
+    exception/                          # CSR 与异常提交
+      csr_exception_commit_handler.v    # CSR 读写、异常提交、重定向
+      exception_Decoder.v               # 异常译码辅助
+    mmu/                                # 存储系统相关
+      mmu.v                             # MMU 汇聚与通路控制
+      mem_req_tracker.v                 # MEM 侧 dcache 请求/接收状态跟踪（addr_ok/complete 配对）
+      tlb_manager.v                     # TLB 管理与翻译结果输出
+      tlb.v                             # TLB 表项存储与查询
+      icache.v                          # ICache
+      dcache.v                          # DCache
+      cache_control_unit.v              # WB 提交后的 cache 维护控制
+      axi_line_bridge.v                 # I/D cache 到 AXI 单主口桥接
+      regfile.v                         # 局部寄存器模块
+
+  ip_core/                              # Vivado IP 核（cache RAM、乘除法 IP）
+    ...                                 # *.xci（icache/dcache 各路 RAM、mult_gen、div_gen）
+/*--------------------------------------------------------------------*/
