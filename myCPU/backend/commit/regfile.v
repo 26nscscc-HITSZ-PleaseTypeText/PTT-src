@@ -112,48 +112,27 @@ always @(posedge clk) begin
     end
 end
 
-// 读口写穿透（已实现）：同拍写的值直接出现在读口（双写口都透，槽 1 优先），
-//      与 RAT 的提交释放/重命名读时序约定对齐，避免"提交拍读到旧值"的窗口。
-// 用 === 与 we===1'b1：地址或写使能含 X 时勿用 `==`/`&&` 产生 X 污染读口（进而污染 CSR 写回链）。
-assign rdata0 = (raddr0 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr0) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr0) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr0]);
+// Functional ports read the committed array without same-cycle forwarding.
+// A committing destination is still busy in the RAT before this edge.  Its
+// consumer therefore retains the ROB tag for this cycle and reads the newly
+// written ARF value on the following cycle.  Functional write-through was
+// redundant and formed ROB-head -> commit -> ARF -> RS routed critical paths.
+// The edge-aligned difftest snapshot keeps its separate forwarding below.
+assign rdata0 = (raddr0 === 5'b0) ? 32'b0 : rf[raddr0];
 
-assign rdata1 = (raddr1 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr1) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr1) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr1]);
+assign rdata1 = (raddr1 === 5'b0) ? 32'b0 : rf[raddr1];
 
-assign rdata2 = (raddr2 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr2) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr2) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr2]);
+assign rdata2 = (raddr2 === 5'b0) ? 32'b0 : rf[raddr2];
 
-assign rdata3 = (raddr3 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr3) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr3) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr3]);
+assign rdata3 = (raddr3 === 5'b0) ? 32'b0 : rf[raddr3];
 
-assign rdata4 = (raddr4 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr4) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr4) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr4]);
+assign rdata4 = (raddr4 === 5'b0) ? 32'b0 : rf[raddr4];
 
-assign rdata5 = (raddr5 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr5) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr5) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr5]);
+assign rdata5 = (raddr5 === 5'b0) ? 32'b0 : rf[raddr5];
 
-assign rdata6 = (raddr6 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr6) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr6) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr6]);
+assign rdata6 = (raddr6 === 5'b0) ? 32'b0 : rf[raddr6];
 
-assign rdata7 = (raddr7 === 5'b0) ? 32'b0 :
-                (((we1 === 1'b1) && (waddr1 === raddr7) && (waddr1 !== 5'b0)) ? wdata1 :
-                 ((we0 === 1'b1) && (waddr0 === raddr7) && (waddr0 !== 5'b0)) ? wdata0 :
-                 rf[raddr7]);
+assign rdata7 = (raddr7 === 5'b0) ? 32'b0 : rf[raddr7];
 
 // 调试端口：直接读寄存器内容（不含写穿透），r0 恒 0
 assign dbg_rdata = (dbg_raddr === 5'b0) ? 32'b0 : rf[dbg_raddr];

@@ -39,6 +39,10 @@ module ubtb(
 
 localparam BANK_DEPTH = 16;
 localparam ENTRY_IDX_W = 4;
+// A micro-BTB may use a partial tag: aliases are performance misses/mispredicts
+// and are repaired by P1/commit.  PC[21:2] uniquely covers a 1 MiB code
+// window while removing twelve bits from every P0 CAM comparator.
+localparam TAG_W = 20;
 
 // Mix low and high word-address bits so adjacent functions and loop bodies
 // are distributed across the two banks.
@@ -54,8 +58,8 @@ reg [BANK_DEPTH-1:0] bank0_valid;
 reg [BANK_DEPTH-1:0] bank1_valid;
 reg [1:0] bank0_ctr [0:BANK_DEPTH-1];
 reg [1:0] bank1_ctr [0:BANK_DEPTH-1];
-reg [31:0] bank0_tag [0:BANK_DEPTH-1];
-reg [31:0] bank1_tag [0:BANK_DEPTH-1];
+reg [TAG_W-1:0] bank0_tag [0:BANK_DEPTH-1];
+reg [TAG_W-1:0] bank1_tag [0:BANK_DEPTH-1];
 reg [31:0] bank0_target [0:BANK_DEPTH-1];
 reg [31:0] bank1_target [0:BANK_DEPTH-1];
 reg [`BLK_LEN_W-1:0] bank0_length [0:BANK_DEPTH-1];
@@ -67,14 +71,16 @@ reg [ENTRY_IDX_W-1:0] repl_ptr1;
 
 // ---------------- Query: select bank, then compare 16 tags ----------------
 wire q_bank = ubtb_bank(query_pc_i);
+wire [TAG_W-1:0] q_tag = query_pc_i[21:2];
 wire [BANK_DEPTH-1:0] q_hit;
 
 genvar g;
 generate
 for (g = 0; g < BANK_DEPTH; g = g + 1) begin : gen_qhit
     wire selected_valid = q_bank ? bank1_valid[g] : bank0_valid[g];
-    wire [31:0] selected_tag = q_bank ? bank1_tag[g] : bank0_tag[g];
-    assign q_hit[g] = selected_valid && (selected_tag == query_pc_i);
+    wire [TAG_W-1:0] selected_tag =
+        q_bank ? bank1_tag[g] : bank0_tag[g];
+    assign q_hit[g] = selected_valid && (selected_tag == q_tag);
 end
 endgenerate
 
@@ -108,15 +114,17 @@ wire do_fill = update_valid_i &&
                   (update_br_type_i == `BR_TYPE_RET))));
 
 wire u_bank = ubtb_bank(update_block_pc_i);
+wire [TAG_W-1:0] u_tag = update_block_pc_i[21:2];
 wire [BANK_DEPTH-1:0] u_hit;
 wire [BANK_DEPTH-1:0] u_invalid;
 
 generate
 for (g = 0; g < BANK_DEPTH; g = g + 1) begin : gen_uhit
     wire selected_valid = u_bank ? bank1_valid[g] : bank0_valid[g];
-    wire [31:0] selected_tag = u_bank ? bank1_tag[g] : bank0_tag[g];
+    wire [TAG_W-1:0] selected_tag =
+        u_bank ? bank1_tag[g] : bank0_tag[g];
     assign u_hit[g] = selected_valid &&
-                      (selected_tag == update_block_pc_i);
+                      (selected_tag == u_tag);
     assign u_invalid[g] = !selected_valid;
 end
 endgenerate
@@ -161,7 +169,7 @@ always @(posedge clk) begin
     end else if (do_update) begin
         if (u_bank == 1'b0) begin
             bank0_valid[fill_idx]  <= 1'b1;
-            bank0_tag[fill_idx]    <= update_block_pc_i;
+            bank0_tag[fill_idx]    <= u_tag;
             bank0_target[fill_idx] <= update_target_i;
             bank0_length[fill_idx] <= update_length_i;
             bank0_btype[fill_idx]  <= update_br_type_i;
@@ -179,7 +187,7 @@ always @(posedge clk) begin
                 repl_ptr0 <= repl_ptr0 + {{(ENTRY_IDX_W-1){1'b0}}, 1'b1};
         end else begin
             bank1_valid[fill_idx]  <= 1'b1;
-            bank1_tag[fill_idx]    <= update_block_pc_i;
+            bank1_tag[fill_idx]    <= u_tag;
             bank1_target[fill_idx] <= update_target_i;
             bank1_length[fill_idx] <= update_length_i;
             bank1_btype[fill_idx]  <= update_br_type_i;

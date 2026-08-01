@@ -144,6 +144,7 @@ module dispatch(
 
     // =============== rs_mem 入站口 ===============
     input  wire                       rs_mem_can_accept_i,
+    input  wire                       rs_mem_can_accept_two_i,
     output wire                       rs_mem_push_valid_o,
     output wire [`ROB_W-1:0]          rs_mem_push_robid_o,
     output wire [`MEM_OP_NUM-1:0]     rs_mem_push_mem_op_o,
@@ -156,6 +157,18 @@ module dispatch(
     output wire [31:0]                rs_mem_push_src1_val_o,
     output wire [`ROB_W-1:0]          rs_mem_push_src1_robid_o,
     output wire [31:0]                rs_mem_push_imm_o,
+    output wire                       rs_mem_push1_valid_o,
+    output wire [`ROB_W-1:0]          rs_mem_push1_robid_o,
+    output wire [`MEM_OP_NUM-1:0]     rs_mem_push1_mem_op_o,
+    output wire                       rs_mem_push1_is_cacop_o,
+    output wire [4:3]                 rs_mem_push1_cacop_op_o,
+    output wire                       rs_mem_push1_src0_ready_o,
+    output wire [31:0]                rs_mem_push1_src0_val_o,
+    output wire [`ROB_W-1:0]          rs_mem_push1_src0_robid_o,
+    output wire                       rs_mem_push1_src1_ready_o,
+    output wire [31:0]                rs_mem_push1_src1_val_o,
+    output wire [`ROB_W-1:0]          rs_mem_push1_src1_robid_o,
+    output wire [31:0]                rs_mem_push1_imm_o,
 
     // =============== rs_mdu 入站口 ===============
     input  wire                       rs_mdu_can_accept_i,
@@ -305,7 +318,8 @@ assign dis0_rs_ok = dis0_is_alu ? (slot0_to_alu0 ? rs_alu0_can_accept_i : rs_alu
                     1'b0;
 assign dis1_rs_ok = dis1_is_alu ? (slot1_to_alu0 ? (rs_alu0_can_accept_i && !dis0_will_take_alu0)
                                                    : (rs_alu1_can_accept_i && !dis0_will_take_alu1)) :
-                    dis1_is_mem ? (rs_mem_can_accept_i && !dis0_will_take_mem) :
+                    dis1_is_mem ? (dis0_will_take_mem ? rs_mem_can_accept_two_i
+                                                       : rs_mem_can_accept_i) :
                     dis1_is_mdu ? (rs_mdu_can_accept_i && !dis0_will_take_mdu) :
                     1'b0;
 
@@ -361,18 +375,36 @@ assign rs_alu1_push_imm_o = rs_alu1_from_slot1 ? dis1_imm_i : dis0_imm_i;
 assign rs_alu1_push_use_imm_o = rs_alu1_from_slot1 ? dis1_use_imm_i : dis0_use_imm_i;
 assign rs_alu1_push_br_offs_o = rs_alu1_from_slot1 ? dis1_br_offs_i : dis0_br_offs_i;
 
-assign rs_mem_push_valid_o = (slot0_to_mem && dis0_fire_o) || (slot1_to_mem && dis1_fire_o);
-assign rs_mem_push_robid_o = rs_mem_from_slot1 ? dis1_robid_i : dis0_robid_i;
-assign rs_mem_push_mem_op_o = rs_mem_from_slot1 ? dis1_mem_op_i : dis0_mem_op_i;
-assign rs_mem_push_is_cacop_o = rs_mem_from_slot1 ? dis1_is_cacop_i : dis0_is_cacop_i;
-assign rs_mem_push_cacop_op_o = rs_mem_from_slot1 ? dis1_cacop_op_i : dis0_cacop_op_i;
-assign rs_mem_push_src0_ready_o = rs_mem_from_slot1 ? dis1_src0_ready : dis0_src0_ready;
-assign rs_mem_push_src0_val_o = rs_mem_from_slot1 ? dis1_src0_val : dis0_src0_val;
-assign rs_mem_push_src0_robid_o = rs_mem_from_slot1 ? dis1_src0_robid_i : dis0_src0_robid_i;
-assign rs_mem_push_src1_ready_o = rs_mem_from_slot1 ? dis1_src1_ready : dis0_src1_ready;
-assign rs_mem_push_src1_val_o = rs_mem_from_slot1 ? dis1_src1_val : dis0_src1_val;
-assign rs_mem_push_src1_robid_o = rs_mem_from_slot1 ? dis1_src1_robid_i : dis0_src1_robid_i;
-assign rs_mem_push_imm_o = rs_mem_from_slot1 ? dis1_imm_i : dis0_imm_i;
+// Port 0 always carries the oldest MEM instruction.  Port 1 is active only
+// for a MEM/MEM pair, so FIFO insertion order is unambiguous.
+wire rs_mem_single_from_slot1 = rs_mem_from_slot1 && !dis0_will_take_mem;
+assign rs_mem_push_valid_o = (slot0_to_mem && dis0_fire_o)
+                          || (slot1_to_mem && dis1_fire_o && !dis0_will_take_mem);
+assign rs_mem_push_robid_o = rs_mem_single_from_slot1 ? dis1_robid_i : dis0_robid_i;
+assign rs_mem_push_mem_op_o = rs_mem_single_from_slot1 ? dis1_mem_op_i : dis0_mem_op_i;
+assign rs_mem_push_is_cacop_o = rs_mem_single_from_slot1 ? dis1_is_cacop_i : dis0_is_cacop_i;
+assign rs_mem_push_cacop_op_o = rs_mem_single_from_slot1 ? dis1_cacop_op_i : dis0_cacop_op_i;
+assign rs_mem_push_src0_ready_o = rs_mem_single_from_slot1 ? dis1_src0_ready : dis0_src0_ready;
+assign rs_mem_push_src0_val_o = rs_mem_single_from_slot1 ? dis1_src0_val : dis0_src0_val;
+assign rs_mem_push_src0_robid_o = rs_mem_single_from_slot1 ? dis1_src0_robid_i : dis0_src0_robid_i;
+assign rs_mem_push_src1_ready_o = rs_mem_single_from_slot1 ? dis1_src1_ready : dis0_src1_ready;
+assign rs_mem_push_src1_val_o = rs_mem_single_from_slot1 ? dis1_src1_val : dis0_src1_val;
+assign rs_mem_push_src1_robid_o = rs_mem_single_from_slot1 ? dis1_src1_robid_i : dis0_src1_robid_i;
+assign rs_mem_push_imm_o = rs_mem_single_from_slot1 ? dis1_imm_i : dis0_imm_i;
+
+assign rs_mem_push1_valid_o = slot0_to_mem && dis0_fire_o
+                            && slot1_to_mem && dis1_fire_o;
+assign rs_mem_push1_robid_o = dis1_robid_i;
+assign rs_mem_push1_mem_op_o = dis1_mem_op_i;
+assign rs_mem_push1_is_cacop_o = dis1_is_cacop_i;
+assign rs_mem_push1_cacop_op_o = dis1_cacop_op_i;
+assign rs_mem_push1_src0_ready_o = dis1_src0_ready;
+assign rs_mem_push1_src0_val_o = dis1_src0_val;
+assign rs_mem_push1_src0_robid_o = dis1_src0_robid_i;
+assign rs_mem_push1_src1_ready_o = dis1_src1_ready;
+assign rs_mem_push1_src1_val_o = dis1_src1_val;
+assign rs_mem_push1_src1_robid_o = dis1_src1_robid_i;
+assign rs_mem_push1_imm_o = dis1_imm_i;
 
 assign rs_mdu_push_valid_o = (slot0_to_mdu && dis0_fire_o) || (slot1_to_mdu && dis1_fire_o);
 assign rs_mdu_push_robid_o = rs_mdu_from_slot1 ? dis1_robid_i : dis0_robid_i;

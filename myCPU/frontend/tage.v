@@ -291,49 +291,34 @@ reg        q_valid_r;
 reg [`TAGE_TAG_W-1:0] q_tag_r [0:3];
 reg [TIDXW-1:0]       q_idx_r [0:3];
 reg [BASE_IDXW-1:0]   q_bidx_r;
-reg [3:0]             q_write_fwd_valid_r;
-reg [TENTRY_W-1:0]    q_write_fwd_data_r [0:3];
 reg                   q_base_fwd_valid_r;
 reg [1:0]             q_base_fwd_data_r;
 integer qk;
 always @(posedge clk) begin
     if (reset) begin
         q_valid_r             <= 1'b0;
-        q_write_fwd_valid_r   <= 4'b0;
         q_base_fwd_valid_r    <= 1'b0;
     end else begin
         q_valid_r <= query_valid_i;
         for (qk = 0; qk < 4; qk = qk + 1) begin
             q_tag_r[qk] <= q_tag[qk];
             q_idx_r[qk] <= q_idx[qk];
-            // Precompute write/query collisions in the query-issue cycle.
-            // The response therefore depends only on these registers, not
-            // on a training write address through the next-PC feedback path.
-            q_write_fwd_valid_r[qk] <=
-                (t_we_calc[qk] && (t_waddr_calc[qk] == q_idx[qk])) ||
-                (t3_t_we[qk] && (t3_t_waddr[qk] == q_idx[qk]));
-            q_write_fwd_data_r[qk] <=
-                (t_we_calc[qk] && (t_waddr_calc[qk] == q_idx[qk]))
-                ? t_wdata_calc[qk] : t3_t_wdata[qk];
         end
         q_bidx_r <= q_base_idx;
         q_base_fwd_valid_r <=
-            (base_we_calc && (base_waddr_calc == q_base_idx)) ||
-            (t3_base_we && (t3_base_waddr == q_base_idx));
-        q_base_fwd_data_r <=
-            (base_we_calc && (base_waddr_calc == q_base_idx))
-            ? base_wdata_calc : t3_base_wdata;
+            t3_base_we && (t3_base_waddr == q_base_idx);
+        q_base_fwd_data_r <= t3_base_wdata;
     end
 end
 
-// Query response uses only registered RAM data or a collision recorded in
-// the query-issue cycle.  Training addresses cannot feed next-PC logic here.
+// The query port intentionally uses the BRAM result directly.  A same-edge
+// training write may therefore be visible one query later; prediction remains
+// recoverable, while removing the TAGE-result -> next-index -> collision loop.
 wire [3:0] thit;
 wire [TENTRY_W-1:0] t_q_entry_eff [0:3];
 generate
 for (g = 0; g < 4; g = g + 1) begin : gen_thit
-    assign t_q_entry_eff[g] =
-        q_write_fwd_valid_r[g] ? q_write_fwd_data_r[g] : t_q_rdata[g];
+    assign t_q_entry_eff[g] = t_q_rdata[g];
     assign thit[g] = q_valid_r
                     && t_q_entry_eff[g][TENTRY_W-1]
                     && (t_q_entry_eff[g][TENTRY_W-2 -: `TAGE_TAG_W] == q_tag_r[g]);

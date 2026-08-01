@@ -34,7 +34,21 @@ module rs_mem(
     input  wire [`ROB_W-1:0]          push_src1_robid_i,
     input  wire [31:0]                push_imm_i,          // si12/si14 偏移
 
+    input  wire                       push1_valid_i,
+    input  wire [`ROB_W-1:0]          push1_robid_i,
+    input  wire [`MEM_OP_NUM-1:0]     push1_mem_op_i,
+    input  wire                       push1_is_cacop_i,
+    input  wire [4:3]                 push1_cacop_op_i,
+    input  wire                       push1_src0_ready_i,
+    input  wire [31:0]                push1_src0_val_i,
+    input  wire [`ROB_W-1:0]          push1_src0_robid_i,
+    input  wire                       push1_src1_ready_i,
+    input  wire [31:0]                push1_src1_val_i,
+    input  wire [`ROB_W-1:0]          push1_src1_robid_i,
+    input  wire [31:0]                push1_imm_i,
+
     output wire                       can_accept_o,
+    output wire                       can_accept_two_o,
     output wire [`RS_MEM_OCC_W-1:0]   occupancy_o,
 
     // ---------------- 写回唤醒总线 ×4 ----------------
@@ -116,6 +130,7 @@ reg [`RS_MEM_OCC_W-1:0] count;
 
 integer i;
 integer a;
+localparam ISSUE_SCAN_N = 4;
 wire issue_fire;
 reg  [`RS_MEM_IDX_W-1:0] issue_idx;
 reg                      issue_sel_valid;
@@ -165,8 +180,18 @@ for (gw = 0; gw < `RS_MEM_SIZE; gw = gw + 1) begin : g_wake
                              ((early0_valid_i && (early0_robid_i == s1_robid[gw])) ||
                               (early1_valid_i && (early1_robid_i == s1_robid[gw])) ||
                               (early2_valid_i && (early2_robid_i == s1_robid[gw])));
-    assign s0_fasttag[gw] = !s0_val_valid[gw] && (fast2_robid_i == s0_robid[gw]);
-    assign s1_fasttag[gw] = !s1_val_valid[gw] && (fast2_robid_i == s1_robid[gw]);
+    wire entry_is_store = mem_op[gw][`MEM_OP_ST_W]
+                       || mem_op[gw][`MEM_OP_ST_B]
+                       || mem_op[gw][`MEM_OP_ST_H]
+                       || mem_op[gw][`MEM_OP_SC_W];
+    assign s0_fasttag[gw] = (`RS_MEM_LOAD_FAST_BYPASS != 0)
+                          && !s0_val_valid[gw]
+                          && (fast2_robid_i == s0_robid[gw]);
+    assign s1_fasttag[gw] = ((`RS_MEM_LOAD_FAST_BYPASS != 0)
+                          || ((`RS_MEM_STORE_DATA_FAST_BYPASS != 0)
+                              && entry_is_store))
+                          && !s1_val_valid[gw]
+                          && (fast2_robid_i == s1_robid[gw]);
     assign s0_wbdat[gw] = (wb0_valid_i && (wb0_robid_i == s0_robid[gw])) ? wb0_data_i :
                           (wb1_valid_i && (wb1_robid_i == s0_robid[gw])) ? wb1_data_i :
                           (wb2_valid_i && (wb2_robid_i == s0_robid[gw])) ? wb2_data_i :
@@ -207,7 +232,9 @@ always @(*) begin
     fast_issue_valid = 1'b0;
     base_scan_stop = 1'b0;
     fast_scan_stop = 1'b0;
-    for (a = 0; a < `RS_MEM_SIZE; a = a + 1) begin
+    // Keep the timing-sensitive same-cycle wakeup/oldest-ready cone at four
+    // entries even though the FIFO has eight storage slots.
+    for (a = 0; a < ISSUE_SCAN_N; a = a + 1) begin
         scan_idx = head + a[`RS_MEM_IDX_W-1:0];
         if (!base_issue_valid && !base_scan_stop
             && (a[`RS_MEM_OCC_W-1:0] < count) && valid[scan_idx]) begin
@@ -276,8 +303,36 @@ wire [31:0] push_s1_wbdat = (wb0_valid_i && (wb0_robid_i == push_src1_robid_i)) 
                             (wb2_valid_i && (wb2_robid_i == push_src1_robid_i)) ? wb2_data_i :
                             (wb3_valid_i && (wb3_robid_i == push_src1_robid_i)) ? wb3_data_i : 32'b0;
 
+wire        push1_s0_wbhit = !push1_src0_ready_i &&
+                           ((wb0_valid_i && (wb0_robid_i == push1_src0_robid_i)) ||
+                            (wb1_valid_i && (wb1_robid_i == push1_src0_robid_i)) ||
+                            (wb2_valid_i && (wb2_robid_i == push1_src0_robid_i)) ||
+                            (wb3_valid_i && (wb3_robid_i == push1_src0_robid_i)));
+wire        push1_s1_wbhit = !push1_src1_ready_i &&
+                           ((wb0_valid_i && (wb0_robid_i == push1_src1_robid_i)) ||
+                            (wb1_valid_i && (wb1_robid_i == push1_src1_robid_i)) ||
+                            (wb2_valid_i && (wb2_robid_i == push1_src1_robid_i)) ||
+                            (wb3_valid_i && (wb3_robid_i == push1_src1_robid_i)));
+wire        push1_s0_early = !push1_src0_ready_i && !push1_s0_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push1_src0_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push1_src0_robid_i)));
+wire        push1_s1_early = !push1_src1_ready_i && !push1_s1_wbhit &&
+                           ((early0_valid_i && (early0_robid_i == push1_src1_robid_i)) ||
+                            (early1_valid_i && (early1_robid_i == push1_src1_robid_i)));
+wire [31:0] push1_s0_wbdat = (wb0_valid_i && (wb0_robid_i == push1_src0_robid_i)) ? wb0_data_i :
+                             (wb1_valid_i && (wb1_robid_i == push1_src0_robid_i)) ? wb1_data_i :
+                             (wb2_valid_i && (wb2_robid_i == push1_src0_robid_i)) ? wb2_data_i :
+                             (wb3_valid_i && (wb3_robid_i == push1_src0_robid_i)) ? wb3_data_i : 32'b0;
+wire [31:0] push1_s1_wbdat = (wb0_valid_i && (wb0_robid_i == push1_src1_robid_i)) ? wb0_data_i :
+                             (wb1_valid_i && (wb1_robid_i == push1_src1_robid_i)) ? wb1_data_i :
+                             (wb2_valid_i && (wb2_robid_i == push1_src1_robid_i)) ? wb2_data_i :
+                             (wb3_valid_i && (wb3_robid_i == push1_src1_robid_i)) ? wb3_data_i : 32'b0;
+
 assign occupancy_o = count;
 assign can_accept_o = (count != `RS_MEM_SIZE);
+assign can_accept_two_o = (count <= (`RS_MEM_SIZE - 2));
+wire push0_fire = push_valid_i && can_accept_o;
+wire push1_fire = push1_valid_i && can_accept_two_o && push0_fire;
 assign issue_valid_o = issue_sel_valid && lsu_ready_i;
 assign issue_fire = issue_valid_o;
 
@@ -348,7 +403,7 @@ always @(posedge clk) begin
             head <= head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1};
         end
 
-        if (push_valid_i && can_accept_o) begin
+        if (push0_fire) begin
             valid[tail] <= 1'b1;
             robid[tail] <= push_robid_i;
             mem_op[tail] <= push_mem_op_i;
@@ -365,12 +420,43 @@ always @(posedge clk) begin
                             push_src1_ready_i ? push_src1_val_i : 32'b0;
             s1_robid[tail] <= push_src1_robid_i;
             imm[tail] <= push_imm_i;
-            tail <= tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1};
         end
 
-        case ({push_valid_i && can_accept_o, issue_fire})
-            2'b10: count <= count + {{(`RS_MEM_OCC_W-1){1'b0}}, 1'b1};
-            2'b01: count <= count - {{(`RS_MEM_OCC_W-1){1'b0}}, 1'b1};
+        if (push1_fire) begin
+            valid[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= 1'b1;
+            robid[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= push1_robid_i;
+            mem_op[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= push1_mem_op_i;
+            is_cacop[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= push1_is_cacop_i;
+            cacop_op[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= push1_cacop_op_i;
+            s0_ready[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <=
+                push1_src0_ready_i || push1_s0_wbhit || push1_s0_early;
+            s0_val_valid[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <=
+                push1_src0_ready_i || push1_s0_wbhit;
+            s0_val[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <=
+                push1_s0_wbhit ? push1_s0_wbdat :
+                push1_src0_ready_i ? push1_src0_val_i : 32'b0;
+            s0_robid[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= push1_src0_robid_i;
+            s1_ready[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <=
+                push1_src1_ready_i || push1_s1_wbhit || push1_s1_early;
+            s1_val_valid[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <=
+                push1_src1_ready_i || push1_s1_wbhit;
+            s1_val[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <=
+                push1_s1_wbhit ? push1_s1_wbdat :
+                push1_src1_ready_i ? push1_src1_val_i : 32'b0;
+            s1_robid[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= push1_src1_robid_i;
+            imm[tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}] <= push1_imm_i;
+        end
+
+        if (push1_fire)
+            tail <= tail + 2'd2;
+        else if (push0_fire)
+            tail <= tail + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1};
+
+        case ({push1_fire, push0_fire, issue_fire})
+            3'b110: count <= count + 3'd2;
+            3'b111: count <= count + 3'd1;
+            3'b010: count <= count + 3'd1;
+            3'b001: count <= count - 3'd1;
             default: count <= count;
         endcase
     end
@@ -381,11 +467,53 @@ end
 reg [63:0] rsm_full_stall_cyc;
 reg [63:0] rsm_src_stall_cyc;
 reg [63:0] rsm_lsu_stall_cyc;
+reg [63:0] rsm_dual_ready_opp;
+reg [63:0] rsm_dual_ready_same_line;
+reg [63:0] rsm_dual_ready_diff_bank;
+reg [63:0] rsm_dual_ready_same_bank_diff_line;
+reg [63:0] rsm_head_pair_same_line;
+reg [`RS_MEM_IDX_W-1:0] rsm_pair_scan_idx;
+reg [`RS_MEM_IDX_W-1:0] rsm_pair_second_idx;
+reg rsm_pair_second_valid;
+reg rsm_pair_scan_stop;
+reg [31:0] rsm_pair_vaddr0;
+reg [31:0] rsm_pair_vaddr1;
+integer rsm_pair_age;
+always @(*) begin
+    rsm_pair_second_idx = head;
+    rsm_pair_second_valid = 1'b0;
+    rsm_pair_scan_stop = 1'b0;
+    for (rsm_pair_age = 0; rsm_pair_age < `RS_MEM_SIZE;
+         rsm_pair_age = rsm_pair_age + 1) begin
+        rsm_pair_scan_idx = head + rsm_pair_age[`RS_MEM_IDX_W-1:0];
+        if (!rsm_pair_second_valid && !rsm_pair_scan_stop
+            && (rsm_pair_age[`RS_MEM_OCC_W-1:0] < count)
+            && valid[rsm_pair_scan_idx]) begin
+            if (is_ord_barrier[rsm_pair_scan_idx]) begin
+                rsm_pair_scan_stop = 1'b1;
+            end else if ((rsm_pair_scan_idx != issue_idx)
+                         && entry_ready[rsm_pair_scan_idx]) begin
+                rsm_pair_second_idx = rsm_pair_scan_idx;
+                rsm_pair_second_valid = 1'b1;
+            end
+        end
+    end
+    rsm_pair_vaddr0 = issue_base_o + issue_imm_o;
+    rsm_pair_vaddr1 = (s0_wbhit[rsm_pair_second_idx]
+                       ? s0_wbdat[rsm_pair_second_idx]
+                       : s0_val[rsm_pair_second_idx])
+                    + imm[rsm_pair_second_idx];
+end
 always @(posedge clk) begin
     if (reset) begin
         rsm_full_stall_cyc <= 64'd0;
         rsm_src_stall_cyc  <= 64'd0;
         rsm_lsu_stall_cyc  <= 64'd0;
+        rsm_dual_ready_opp  <= 64'd0;
+        rsm_dual_ready_same_line <= 64'd0;
+        rsm_dual_ready_diff_bank <= 64'd0;
+        rsm_dual_ready_same_bank_diff_line <= 64'd0;
+        rsm_head_pair_same_line <= 64'd0;
     end else if (!flush_i) begin
         if (!can_accept_o && push_valid_i)
             rsm_full_stall_cyc <= rsm_full_stall_cyc + 64'd1;
@@ -393,6 +521,29 @@ always @(posedge clk) begin
             rsm_src_stall_cyc <= rsm_src_stall_cyc + 64'd1;
         if (issue_sel_valid && !lsu_ready_i)
             rsm_lsu_stall_cyc <= rsm_lsu_stall_cyc + 64'd1;
+        if (issue_fire && !is_ord_barrier[issue_idx]
+            && rsm_pair_second_valid) begin
+            rsm_dual_ready_opp <= rsm_dual_ready_opp + 64'd1;
+            if (rsm_pair_vaddr0[31:5] == rsm_pair_vaddr1[31:5])
+                rsm_dual_ready_same_line <= rsm_dual_ready_same_line + 64'd1;
+            else if (rsm_pair_vaddr0[5] != rsm_pair_vaddr1[5])
+                rsm_dual_ready_diff_bank <= rsm_dual_ready_diff_bank + 64'd1;
+            else
+                rsm_dual_ready_same_bank_diff_line <=
+                    rsm_dual_ready_same_bank_diff_line + 64'd1;
+        end
+        if (issue_fire && (issue_idx == head)
+            && (count >= {{(`RS_MEM_OCC_W-2){1'b0}}, 2'd2})
+            && valid[head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}]
+            && entry_ready[head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}]
+            && !is_ord_barrier[head]
+            && !is_ord_barrier[head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}]
+            && (((issue_base_o + issue_imm_o) >> 5)
+                == (((s0_wbhit[head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}]
+                     ? s0_wbdat[head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}]
+                     : s0_val[head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}])
+                    + imm[head + {{(`RS_MEM_IDX_W-1){1'b0}}, 1'b1}]) >> 5)))
+            rsm_head_pair_same_line <= rsm_head_pair_same_line + 64'd1;
     end
 end
 // synthesis translate_on

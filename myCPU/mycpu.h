@@ -51,10 +51,10 @@
 `define RS_ALU_SIZE     4   // 每个 ALU 保留站项数（乱序发射）
 `define RS_ALU_IDX_W    2   // $clog2(RS_ALU_SIZE)
 `define RS_ALU_OCC_W    3   // $clog2(RS_ALU_SIZE+1)，occupancy 0..SIZE
-`define RS_MEM_SIZE     4   // 访存保留站项数（FIFO + 有限 load 越过）；加深只会把
+`define RS_MEM_SIZE     8   // dual-enqueue experiment: cover short LSU backpressure bursts
                             // 反压转移到 ROB，D$ miss 延迟不变，因此保持 4 项
-`define RS_MEM_IDX_W    2   // $clog2(RS_MEM_SIZE)
-`define RS_MEM_OCC_W    3   // $clog2(RS_MEM_SIZE+1)
+`define RS_MEM_IDX_W    3   // $clog2(RS_MEM_SIZE)
+`define RS_MEM_OCC_W    4   // $clog2(RS_MEM_SIZE+1)
 `define RS_MDU_SIZE     2   // 乘除保留站项数（FIFO 顺序发射）
 
 `define SB_SIZE         8   // store buffer 项数（提交后写缓冲；行聚合+同字旁路合并）
@@ -89,6 +89,14 @@
 // 避免消费者在写回数据可用前提前唤醒。
 `define LSU_DC_HIT_BYPASS 1           // 保持命中当拍算出 WB 数据
 `define LSU_WB_PIPE       1           // 常规 LSU 写回打一拍；ALU 另用不写 RS 状态的专用快速旁路
+// Load fast data仍供两个整数RS使用；MEM RS禁止消费该组合旁路，切断
+// D$ tag/data -> MEM RS select -> AGU -> DTLB/D$ 的整拍反馈环。
+`ifndef RS_MEM_LOAD_FAST_BYPASS
+`define RS_MEM_LOAD_FAST_BYPASS 0
+`endif
+`ifndef RS_MEM_STORE_DATA_FAST_BYPASS
+`define RS_MEM_STORE_DATA_FAST_BYPASS 1
+`endif
 // The routed 70 MHz reports show that sending the unregistered DCache hit or
 // MSHR completion directly to ROB result RAM still creates two setup
 // violations (DCache req/tag/MSHR state -> ROB result D).  ROB completion is
@@ -101,10 +109,16 @@
 `define LSU_EARLY2_PIPE   0
 `define ALU_EARLY_WAKEUP_ENABLE 0     // 禁止 D$→ALU issue→early→第二级 RS 的超长组合链
 `define IFU_FTQ_DIRECT    1           // 1: 允许同拍 FTQ→I$；仅在 mmu_i_direct_ok（无主 TLB）时开火
+// 90 MHz P0 experiment: a direct-indexed 64-set x 2-way predictor owns
+// next-PC steering. uBTB/FTB/TAGE remain enabled for P1 correction/training.
+`ifndef P0_DIRECT_PREDICTOR_ONLY
+`define P0_DIRECT_PREDICTOR_ONLY 0
+`endif
 // NSCSCC on-chip RAM is at PA 0x1c000000~0x1c0fffff.  Do NOT silently
 // promote software MAT=0 (UC) to cached here: lab19 self-modifying tests
 // (n73 icacop) rely on DMW MAT=0 stores reaching memory before Index inv.
-// A previous COMPETITION_BOOT_RAM_CACHE promote broke that contract.
+// A previous COMPETITION_BOOT_RAM_CACHE promote broke that contract (0x700).
+// `define COMPETITION_BOOT_RAM_CACHE 1
 // FPGA BRAM contents are initialized by the bitstream.  Let FTB entries power
 // up invalid instead of spending the first 2048 clocks clearing every set and
 // discarding all cold-start queries/training.

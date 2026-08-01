@@ -986,6 +986,11 @@ always @(posedge clk) begin
                 mshr_ld_resp_pend[mi] <= 1'b0;
             case (mshr_state[mi])
                 M_IDLE: begin
+                    // Contents of an idle MSHR are architecturally dead.
+                    // Preload the line every idle cycle so its CE depends
+                    // only on the local MSHR state, not on the long
+                    // req_paddr -> hit/victim -> allocation decision.
+                    mshr_line[mi] <= req_is_st ? req_wdata : {LINEW{1'b0}};
                     if (mshr_alloc && (mshr_free_idx == mi[MSHR_W-1:0])) begin
                         mshr_is_st[mi]        <= req_is_st;
                         mshr_from_ld[mi]      <= req_is_ld;
@@ -995,11 +1000,10 @@ always @(posedge clk) begin
                         mshr_way[mi]          <= pick_way;
                         if (req_is_st) begin
                             mshr_stb_line[mi] <= req_stb_line;
-                            // beat1 前 line 作 store 叠层（整行）
-                            mshr_line[mi]     <= req_wdata;
+                            // The idle preload above already captured the
+                            // complete store overlay line.
                         end else begin
                             mshr_stb_line[mi] <= 32'b0;
-                            mshr_line[mi]     <= {LINEW{1'b0}};
                         end
                         mshr_state[mi]        <= M_RREQ;
                     end

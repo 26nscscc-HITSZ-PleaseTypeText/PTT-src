@@ -176,12 +176,31 @@ module csr_exception_commit_handler (
         .Esubcode(Esubcode)
     );
 
-    // TLB 地址类 Ecode（与 wb_ex_addr_err 中 TLB 子集一致），用于同拍写 TLBEHI。
-    wire wb_ex_tlb_fault_ecode = (Ecode == `TLBR_ECODE) || (Ecode == `PIF_ECODE) || (Ecode == `PPI_ECODE)
-        || (Ecode == `PIL_ECODE) || (Ecode == `PIS_ECODE) || (Ecode == `PME_ECODE);
-
-    wire tlb_ex_any = (TLB_EX_valid[0] === 1'b1) | (TLB_EX_valid[1] === 1'b1) | (TLB_EX_valid[2] === 1'b1)
-                    | (TLB_EX_valid[3] === 1'b1) | (TLB_EX_valid[4] === 1'b1) | (TLB_EX_valid[5] === 1'b1);
+    // Direct exception-class selects.  Ecode is still written to ESTAT, but
+    // decoding Ecode again for CSR enables made the ROB exception RAM pass
+    // through the full priority encoder and six equality comparators.
+    // These terms are the same priority order as exception_Decoder.
+    wire higher_than_front_tlb = INT_valid || ADEF_valid || ALE_valid;
+    wire front_tlb_any = TLB_EX_valid[`TLB_EX_TLBR]
+                      || TLB_EX_valid[`TLB_EX_PIF]
+                      || TLB_EX_valid[`TLB_EX_PPI];
+    wire data_tlb_any = TLB_EX_valid[`TLB_EX_PIL]
+                     || TLB_EX_valid[`TLB_EX_PIS]
+                     || TLB_EX_valid[`TLB_EX_PME];
+    wire mid_non_addr_excp = INE_valid || IPE_valid || SYS_valid || BRK_valid;
+    wire selected_tlbr = !higher_than_front_tlb
+                       && TLB_EX_valid[`TLB_EX_TLBR];
+    wire selected_pif = !higher_than_front_tlb
+                      && !TLB_EX_valid[`TLB_EX_TLBR]
+                      && TLB_EX_valid[`TLB_EX_PIF];
+    wire selected_tlb_fault = !higher_than_front_tlb
+                            && (front_tlb_any
+                                || (!mid_non_addr_excp && !ADEM_valid
+                                    && data_tlb_any));
+    wire selected_addr_fault = !INT_valid
+                             && (ADEF_valid || ALE_valid || front_tlb_any
+                                 || (!mid_non_addr_excp
+                                     && (ADEM_valid || data_tlb_any)));
 
     reg [7:0] csr_estat_ecode; // 提前定义ESTAT 的 ECODE 域
 
@@ -243,7 +262,7 @@ module csr_exception_commit_handler (
             csr_crmd_datf <= 2'b00;
             csr_crmd_datm <= 2'b00;
         end
-        else if (wb_csr_ex && (Ecode == `TLBR_ECODE)) begin
+        else if (wb_csr_ex && selected_tlbr) begin
             csr_crmd_da <= 1'b1;
             csr_crmd_pg <= 1'b0;
         end
@@ -358,7 +377,7 @@ module csr_exception_commit_handler (
     // ERA 的 PC 域
     reg [31:0] csr_era_pc;
     wire wb_adef_valid = (ADEF_valid === 1'b1);
-    wire wb_pif_valid  = (Ecode === `PIF_ECODE);
+    wire wb_pif_valid  = selected_pif;
     // PIF：手册/测试套件期望 ERA 记录 fault VA（与 BADV 一致）；其余 TLB/常规例外为 faulting PC。
     // ADEF/PIF 的精确异常地址来自 IF/TLB 传下来的虚地址；流水提交 PC 可能已经受取指节奏影响。
     // 其余常规异常记录提交槽自己的 PC。
@@ -379,9 +398,7 @@ module csr_exception_commit_handler (
 
     // BADV 的 VADDR 域（与 TLBEHI 硬件更新一起在下方 TLB CSR always 中维护，避免多 always 对 wb_vaddr 的仿真次序问题）
     reg [31:0] csr_badv_vaddr;
-    wire wb_ex_addr_err = (Ecode == `ADEF_ECODE || Ecode == `ADEM_ECODE || Ecode == `ALE_ECODE
-                        || Ecode == `TLBR_ECODE || Ecode == `PIF_ECODE || Ecode == `PIL_ECODE
-                        || Ecode == `PIS_ECODE || Ecode == `PPI_ECODE || Ecode == `PME_ECODE);
+    wire wb_ex_addr_err = selected_addr_fault;
 
     // EENTRY 的 VA 域
     reg [25:0] csr_eentry_va;
@@ -427,7 +444,7 @@ module csr_exception_commit_handler (
             // BADV 与 TLB 类例外的 TLBEHI 同拍、同源 wb_vaddr；TLBRD 的 r_e 硬化见 tlb_manager.v。
             if (wb_csr_ex && wb_ex_addr_err) begin
                 csr_badv_vaddr <= wb_vaddr;
-                if (tlb_ex_any && wb_ex_tlb_fault_ecode)
+                if (selected_tlb_fault)
                     csr_tlbehi <= {wb_vaddr[31:13], 13'b0};
             end else if (csr_we && csr_num == `CSR_BADV) begin
                 csr_badv_vaddr <= (csr_wmask & csr_wvalue) | (~csr_wmask & csr_badv_vaddr);
@@ -698,7 +715,7 @@ module csr_exception_commit_handler (
     assign has_int = (((csr_estat_is[12:0] & csr_ecfg_lie[12:0]) != 13'b0) === 1'b1) && (csr_crmd_ie === 1'b1);
 
     // csr_next_pc
-    assign csr_next_pc = csr_take_ex   ? ((Ecode == `TLBR_ECODE) ? csr_tlbrentry_rvalue : csr_eentry_rvalue)
+    assign csr_next_pc = csr_take_ex   ? (selected_tlbr ? csr_tlbrentry_rvalue : csr_eentry_rvalue)
                         : csr_take_ertn ? csr_era_rvalue
                         : 32'b0;
 

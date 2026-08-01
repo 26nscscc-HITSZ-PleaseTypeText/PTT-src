@@ -328,11 +328,22 @@ wire ib0_l0_csr_wr = ib0_eff_v && ib0_priv_vec_i[`PRIV_CSR_WR]
                   && `CSR_NUM_IS_L0_NOFLUSH(ib0_csr_num_i);
 wire ib1_l0_csr_wr = ib1_eff_v && ib1_priv_vec_i[`PRIV_CSR_WR]
                   && `CSR_NUM_IS_L0_NOFLUSH(ib1_csr_num_i);
+// Resource-pairing only needs the decoded instruction classes.  Do not put
+// the exception/no-execute decision on the slot-1 RAT/ROB allocation path:
+// for a no-execute entry the raw class can only make pairing more
+// conservative, never admit an illegal pair.  The precise *_l0_csr_wr terms
+// below are still used for the architectural drain state.
+wire ib0_l0_csr_class = ib0_valid_i && ib0_priv_vec_i[`PRIV_CSR_WR]
+                     && `CSR_NUM_IS_L0_NOFLUSH(ib0_csr_num_i);
+wire ib1_l0_csr_class = ib1_valid_i && ib1_priv_vec_i[`PRIV_CSR_WR]
+                     && `CSR_NUM_IS_L0_NOFLUSH(ib1_csr_num_i);
 reg l0_csr_drain_r;
-wire dual_issue_ok = !((ib0_eff_v && ib1_eff_v && ib0_futype_i[`FU_MEM] && ib1_futype_i[`FU_MEM]) ||
-                       (ib0_eff_v && ib1_eff_v && ib0_futype_i[`FU_MDU] && ib1_futype_i[`FU_MDU]) ||
-                       (ib0_l0_csr_wr && ib1_eff_v) ||
-                       (ib1_l0_csr_wr && ib0_eff_v));
+wire both_slots_valid = ib0_valid_i && ib1_valid_i;
+// RS_MEM has two enqueue ports in this experiment, so MEM/MEM bundles no
+// longer need to be split across rename cycles.  MDU remains single-enqueue.
+wire dual_issue_ok = !((both_slots_valid && ib0_futype_i[`FU_MDU] && ib1_futype_i[`FU_MDU]) ||
+                       (ib0_l0_csr_class && ib1_valid_i) ||
+                       (ib1_l0_csr_class && ib0_valid_i));
 
 assign can_go = (ib0_valid_i | ib1_valid_i) && !rob_full_i && dispatch_ready_i
              && !flush_i && !l0_csr_drain_r;
@@ -407,6 +418,62 @@ assign src1_1_ready = !ib1_use_src1_i ? 1'b1 :
                       !rat_rbusy3_i;
 assign src1_1_val = ib1_use_src1_i ? arf_rdata3_i : 32'b0;
 assign src1_1_robid = ib1_src1_raw_from_ib0 ? robid0 : rat_rnum3_i;
+
+// Simulation-only probe for the first dual-load bottleneck.  VA[5] is the
+// parity of the 32-byte DCache set and lies inside the page offset, so it is
+// unchanged by address translation.
+`ifdef SYNTHESIS
+// synthesis translate_off
+wire ren_ib0_plain_load = ib0_is_load_i && !ib0_mem_op_i[`MEM_OP_LL_W]
+                        && !ib0_priv_vec_i[`PRIV_CACOP];
+wire ren_ib1_plain_load = ib1_is_load_i && !ib1_mem_op_i[`MEM_OP_LL_W]
+                        && !ib1_priv_vec_i[`PRIV_CACOP];
+wire ren_dual_plain_load = both_slots_valid
+                         && ren_ib0_plain_load && ren_ib1_plain_load;
+wire ren_dual_load_indep = ren_dual_plain_load
+                         && !ib1_src0_raw_from_ib0 && !ib1_src1_raw_from_ib0;
+wire ren_dual_load_ready = ren_dual_load_indep
+                         && src0_0_ready && src1_0_ready;
+wire [31:0] ren_load_vaddr0 = src0_0_val + ib0_imm_i;
+wire [31:0] ren_load_vaddr1 = src1_0_val + ib1_imm_i;
+wire ren_dual_load_diff_bank = ren_dual_load_ready
+                             && (ren_load_vaddr0[5] != ren_load_vaddr1[5]);
+reg [63:0] ren_mem_pair_at_dispatch;
+reg [63:0] ren_dual_plain_load_pair;
+reg [63:0] ren_dual_load_independent;
+reg [63:0] ren_dual_load_bases_ready;
+reg [63:0] ren_dual_load_same_line;
+reg [63:0] ren_dual_load_same_bank;
+reg [63:0] ren_dual_load_diff_bank_count;
+always @(posedge clk) begin
+    if (reset) begin
+        ren_mem_pair_at_dispatch       <= 64'd0;
+        ren_dual_plain_load_pair       <= 64'd0;
+        ren_dual_load_independent      <= 64'd0;
+        ren_dual_load_bases_ready      <= 64'd0;
+        ren_dual_load_same_line        <= 64'd0;
+        ren_dual_load_same_bank        <= 64'd0;
+        ren_dual_load_diff_bank_count  <= 64'd0;
+    end else if (!flush_i && can_go) begin
+        if (both_slots_valid && ib0_futype_i[`FU_MEM] && ib1_futype_i[`FU_MEM])
+            ren_mem_pair_at_dispatch <= ren_mem_pair_at_dispatch + 64'd1;
+        if (ren_dual_plain_load)
+            ren_dual_plain_load_pair <= ren_dual_plain_load_pair + 64'd1;
+        if (ren_dual_load_indep)
+            ren_dual_load_independent <= ren_dual_load_independent + 64'd1;
+        if (ren_dual_load_ready)
+            ren_dual_load_bases_ready <= ren_dual_load_bases_ready + 64'd1;
+        if (ren_dual_load_ready
+            && (ren_load_vaddr0[31:5] == ren_load_vaddr1[31:5]))
+            ren_dual_load_same_line <= ren_dual_load_same_line + 64'd1;
+        if (ren_dual_load_ready && !ren_dual_load_diff_bank)
+            ren_dual_load_same_bank <= ren_dual_load_same_bank + 64'd1;
+        if (ren_dual_load_diff_bank)
+            ren_dual_load_diff_bank_count <= ren_dual_load_diff_bank_count + 64'd1;
+    end
+end
+// synthesis translate_on
+`endif
 
 // 第四步——RAT 占用写（组合输出，RAT 内部时序写）：
 //      rat_wen0_o = can_go && ib0_valid_i && ib0_rf_we_i && (rd!=r0)；wnum0={1'b0,rob_tail_i}

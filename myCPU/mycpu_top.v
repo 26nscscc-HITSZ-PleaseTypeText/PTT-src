@@ -190,6 +190,7 @@ module core_top #(
     // IFU <-> MMU I 通道
     wire                      ifu_mmu_req;
     wire [31:0]               ifu_mmu_vaddr;
+    wire                      mmu_i_ready;
     wire [31:0]               mmu_i_paddr;
     wire [1:0]                mmu_i_mat;
     wire                      mmu_i_adef;
@@ -369,6 +370,7 @@ module core_top #(
         .ras_checkpoint_nonempty_i(ras_checkpoint_nonempty),
         .mmu_i_req_o          (ifu_mmu_req),
         .mmu_i_vaddr_o        (ifu_mmu_vaddr),
+        .mmu_i_ready_i        (mmu_i_ready),
         .mmu_i_paddr_i        (mmu_i_paddr),
         .mmu_i_mat_i          (mmu_i_mat),
         .mmu_i_excp_adef_i    (mmu_i_adef),
@@ -442,9 +444,28 @@ module core_top #(
     wire         l2_ic_ret_last;
     wire [127:0] l2_ic_ret_data;
     // commit -> I$ cache 维护
-    wire         cmt_icacop_valid;
-    wire [1:0]   cmt_icacop_op;
-    wire [31:0]  cmt_icacop_addr;
+    wire         cmt_icacop_issue;
+    wire [1:0]   cmt_icacop_issue_op;
+    wire [31:0]  cmt_icacop_issue_addr;
+    reg          cmt_icacop_valid;
+    reg  [1:0]   cmt_icacop_op;
+    reg  [31:0]  cmt_icacop_addr;
+
+    // Cache maintenance is architecturally ordered by the commit flush.  Put
+    // its payload behind a register before driving IFU/I$ state and RAM CEs;
+    // otherwise the ROB head/exception RAM select spans all the way into the
+    // ICache FSM.  Consecutive CACOPs still sustain one operation per cycle.
+    always @(posedge clk) begin
+        if (reset) begin
+            cmt_icacop_valid <= 1'b0;
+            cmt_icacop_op    <= 2'b0;
+            cmt_icacop_addr  <= 32'b0;
+        end else begin
+            cmt_icacop_valid <= cmt_icacop_issue;
+            cmt_icacop_op    <= cmt_icacop_issue_op;
+            cmt_icacop_addr  <= cmt_icacop_issue_addr;
+        end
+    end
 
     icache u_icache(
         .clk            (clk),
@@ -1082,6 +1103,9 @@ module core_top #(
     wire                      mem_fast_wb_valid;
     wire [`ROB_W-1:0]         mem_fast_wb_robid;
     wire [31:0]               mem_fast_wb_data;
+    wire                      mem_fast_safe_valid;
+    wire [`ROB_W-1:0]         mem_fast_safe_robid;
+    wire [31:0]               mem_fast_safe_data;
     wire                      mem_hold_wb_valid;
     wire [`ROB_W-1:0]         mem_hold_wb_robid;
     wire [31:0]               mem_hold_wb_data;
@@ -1139,6 +1163,7 @@ module core_top #(
     wire [31:0]               rsa1_issue_br_offs;
     // rs_mem 入站/发射
     wire                      rsm_can_accept;
+    wire                      rsm_can_accept_two;
     wire [`RS_MEM_OCC_W-1:0]  rsm_occupancy;
     wire                      rsm_push_valid;
     wire [`ROB_W-1:0]         rsm_push_robid;
@@ -1149,6 +1174,15 @@ module core_top #(
     wire [31:0]               rsm_push_src0_val,   rsm_push_src1_val;
     wire [`ROB_W-1:0]         rsm_push_src0_robid, rsm_push_src1_robid;
     wire [31:0]               rsm_push_imm;
+    wire                      rsm_push1_valid;
+    wire [`ROB_W-1:0]         rsm_push1_robid;
+    wire [`MEM_OP_NUM-1:0]    rsm_push1_mem_op;
+    wire                      rsm_push1_is_cacop;
+    wire [4:3]                rsm_push1_cacop_op;
+    wire                      rsm_push1_src0_ready, rsm_push1_src1_ready;
+    wire [31:0]               rsm_push1_src0_val, rsm_push1_src1_val;
+    wire [`ROB_W-1:0]         rsm_push1_src0_robid, rsm_push1_src1_robid;
+    wire [31:0]               rsm_push1_imm;
     wire                      rsm_issue_valid;
     wire [`ROB_W-1:0]         rsm_issue_robid;
     wire [`MEM_OP_NUM-1:0]    rsm_issue_mem_op;
@@ -1284,6 +1318,7 @@ module core_top #(
         .rs_alu1_push_use_imm_o(rsa1_push_use_imm),
         .rs_alu1_push_br_offs_o(rsa1_push_br_offs),
         .rs_mem_can_accept_i (rsm_can_accept),
+        .rs_mem_can_accept_two_i(rsm_can_accept_two),
         .rs_mem_push_valid_o (rsm_push_valid),
         .rs_mem_push_robid_o (rsm_push_robid),
         .rs_mem_push_mem_op_o(rsm_push_mem_op),
@@ -1296,6 +1331,18 @@ module core_top #(
         .rs_mem_push_src1_val_o  (rsm_push_src1_val),
         .rs_mem_push_src1_robid_o(rsm_push_src1_robid),
         .rs_mem_push_imm_o   (rsm_push_imm),
+        .rs_mem_push1_valid_o(rsm_push1_valid),
+        .rs_mem_push1_robid_o(rsm_push1_robid),
+        .rs_mem_push1_mem_op_o(rsm_push1_mem_op),
+        .rs_mem_push1_is_cacop_o(rsm_push1_is_cacop),
+        .rs_mem_push1_cacop_op_o(rsm_push1_cacop_op),
+        .rs_mem_push1_src0_ready_o(rsm_push1_src0_ready),
+        .rs_mem_push1_src0_val_o(rsm_push1_src0_val),
+        .rs_mem_push1_src0_robid_o(rsm_push1_src0_robid),
+        .rs_mem_push1_src1_ready_o(rsm_push1_src1_ready),
+        .rs_mem_push1_src1_val_o(rsm_push1_src1_val),
+        .rs_mem_push1_src1_robid_o(rsm_push1_src1_robid),
+        .rs_mem_push1_imm_o(rsm_push1_imm),
         .rs_mdu_can_accept_i (rsd_can_accept),
         .rs_mdu_push_valid_o (rsd_push_valid),
         .rs_mdu_push_robid_o (rsd_push_robid),
@@ -1344,9 +1391,9 @@ module core_top #(
         .wb2_valid_i    (mem_wb_valid),
         .wb2_robid_i    (mem_wb_robid),
         .wb2_data_i     (mem_wb_data),
-        .fast2_valid_i  (mem_fast_wb_valid),
-        .fast2_robid_i  (mem_fast_wb_robid),
-        .fast2_data_i   (mem_fast_wb_data),
+        .fast2_valid_i  (mem_fast_safe_valid),
+        .fast2_robid_i  (mem_fast_safe_robid),
+        .fast2_data_i   (mem_fast_safe_data),
         .wb3_valid_i    (mdu_wb_valid),
         .wb3_robid_i    (mdu_wb_robid),
         .wb3_data_i     (mdu_wb_data),
@@ -1397,9 +1444,9 @@ module core_top #(
         .wb2_valid_i    (mem_wb_valid),
         .wb2_robid_i    (mem_wb_robid),
         .wb2_data_i     (mem_wb_data),
-        .fast2_valid_i  (mem_fast_wb_valid),
-        .fast2_robid_i  (mem_fast_wb_robid),
-        .fast2_data_i   (mem_fast_wb_data),
+        .fast2_valid_i  (mem_fast_safe_valid),
+        .fast2_robid_i  (mem_fast_safe_robid),
+        .fast2_data_i   (mem_fast_safe_data),
         .wb3_valid_i    (mdu_wb_valid),
         .wb3_robid_i    (mdu_wb_robid),
         .wb3_data_i     (mdu_wb_data),
@@ -1440,7 +1487,20 @@ module core_top #(
         .push_src1_val_i  (rsm_push_src1_val),
         .push_src1_robid_i(rsm_push_src1_robid),
         .push_imm_i     (rsm_push_imm),
+        .push1_valid_i  (rsm_push1_valid),
+        .push1_robid_i  (rsm_push1_robid),
+        .push1_mem_op_i (rsm_push1_mem_op),
+        .push1_is_cacop_i(rsm_push1_is_cacop),
+        .push1_cacop_op_i(rsm_push1_cacop_op),
+        .push1_src0_ready_i(rsm_push1_src0_ready),
+        .push1_src0_val_i(rsm_push1_src0_val),
+        .push1_src0_robid_i(rsm_push1_src0_robid),
+        .push1_src1_ready_i(rsm_push1_src1_ready),
+        .push1_src1_val_i(rsm_push1_src1_val),
+        .push1_src1_robid_i(rsm_push1_src1_robid),
+        .push1_imm_i    (rsm_push1_imm),
         .can_accept_o   (rsm_can_accept),
+        .can_accept_two_o(rsm_can_accept_two),
         .occupancy_o    (rsm_occupancy),
         .wb0_valid_i    (alu0_wb_valid),
         .wb0_robid_i    (alu0_wb_robid),
@@ -1451,9 +1511,15 @@ module core_top #(
         .wb2_valid_i    (mem_wb_valid),
         .wb2_robid_i    (mem_wb_robid),
         .wb2_data_i     (mem_wb_data),
-        .fast2_valid_i  (mem_fast_wb_valid),
-        .fast2_robid_i  (mem_fast_wb_robid),
-        .fast2_data_i   (mem_fast_wb_data),
+        .fast2_valid_i  (((`RS_MEM_LOAD_FAST_BYPASS != 0) ||
+                          (`RS_MEM_STORE_DATA_FAST_BYPASS != 0)) &&
+                         mem_fast_safe_valid),
+        .fast2_robid_i  (((`RS_MEM_LOAD_FAST_BYPASS != 0) ||
+                          (`RS_MEM_STORE_DATA_FAST_BYPASS != 0)) ?
+                         mem_fast_safe_robid : {`ROB_W{1'b0}}),
+        .fast2_data_i   (((`RS_MEM_LOAD_FAST_BYPASS != 0) ||
+                          (`RS_MEM_STORE_DATA_FAST_BYPASS != 0)) ?
+                         mem_fast_safe_data : 32'b0),
         .wb3_valid_i    (mdu_wb_valid),
         .wb3_robid_i    (mdu_wb_robid),
         .wb3_data_i     (mdu_wb_data),
@@ -1618,6 +1684,7 @@ module core_top #(
     wire        lsu_mmu_is_store;
     wire [31:0] mmu_d_paddr;
     wire [1:0]  mmu_d_mat;
+    wire        mmu_d_ready;
     wire        mmu_d_ex_tlbr, mmu_d_ex_pil, mmu_d_ex_pis;
     wire        mmu_d_ex_ppi,  mmu_d_ex_pme;
     wire        mmu_d_adem;
@@ -1639,8 +1706,13 @@ module core_top #(
     wire [31:0] dc_lsu_mshr_rdata;
     wire [`ROB_W-1:0] dc_lsu_mshr_robid;
     // LSU <-> store buffer 前递查询
+    wire        lsu_sb_qvalid;
     wire [31:2] lsu_sb_qpaddr;
     wire        lsu_sb_quncached;
+    wire        sb_q_resp_valid;
+    wire [31:2] sb_q_resp_paddr;
+    wire        sb_q_resp_uncached;
+    wire        sb_q_maybe;
     // commit→SB→LSU STQ 释放（须在 LSU 例化前声明）
     wire        cmt_sb_push_valid;
     wire [`ROB_W-1:0] cmt_sb_push_robid;
@@ -1681,6 +1753,7 @@ module core_top #(
         .mmu_d_is_store_o (lsu_mmu_is_store),
         .mmu_d_paddr_i    (mmu_d_paddr),
         .mmu_d_mat_i      (mmu_d_mat),
+        .mmu_d_ready_i    (mmu_d_ready),
         .mmu_d_excp_tlbr_i(mmu_d_ex_tlbr),
         .mmu_d_excp_pil_i (mmu_d_ex_pil),
         .mmu_d_excp_pis_i (mmu_d_ex_pis),
@@ -1703,11 +1776,17 @@ module core_top #(
         .dc_mshr_data_ok_i(dc_lsu_mshr_ok),
         .dc_mshr_rdata_i  (dc_lsu_mshr_rdata),
         .dc_mshr_robid_i  (dc_lsu_mshr_robid),
+        .sb_query_valid_o (lsu_sb_qvalid),
         .sb_query_paddr_o (lsu_sb_qpaddr),
         .sb_query_uncached_o(lsu_sb_quncached),
+        .sb_query_resp_valid_i(sb_q_resp_valid),
+        .sb_query_resp_paddr_i(sb_q_resp_paddr),
+        .sb_query_resp_uncached_i(sb_q_resp_uncached),
+        .sb_query_maybe_i (sb_q_maybe),
         .sb_query_hit_i   (sb_q_hit),
         .sb_query_data_i  (sb_q_data),
         .sb_query_partial_i(sb_q_partial),
+        .sb_empty_i       (sb_empty),
         .rob_head_robid_i (lsu_rob_head_enc),
         .rob_head_valid_i (~rob_empty),
         .st_retire_valid_i(cmt_sb_push_valid),
@@ -1731,6 +1810,31 @@ module core_top #(
         .early_wakeup_valid_o(lsu_early_valid_raw),
         .early_wakeup_robid_o(lsu_early_robid_raw)
     );
+
+    // Keep the LSU auxiliary wakeup bus, but never let raw DCache lookup
+    // data cross directly into the ALU reservation stations.  Hold results
+    // already originate in LSU registers; direct DCache hits are captured
+    // here first.  Normal mem_wb remains the architectural writeback path.
+    reg                      mem_dc_fast_valid_r;
+    reg [`ROB_W-1:0]         mem_dc_fast_robid_r;
+    reg [31:0]               mem_dc_fast_data_r;
+    wire mem_dc_fast_raw = mem_fast_wb_valid && !mem_hold_wb_valid;
+    always @(posedge clk) begin
+        if (reset || flush) begin
+            mem_dc_fast_valid_r <= 1'b0;
+            mem_dc_fast_robid_r <= {`ROB_W{1'b0}};
+            mem_dc_fast_data_r  <= 32'b0;
+        end else begin
+            mem_dc_fast_valid_r <= mem_dc_fast_raw;
+            mem_dc_fast_robid_r <= mem_fast_wb_robid;
+            mem_dc_fast_data_r  <= mem_fast_wb_data;
+        end
+    end
+    assign mem_fast_safe_valid = mem_hold_wb_valid || mem_dc_fast_valid_r;
+    assign mem_fast_safe_robid = mem_hold_wb_valid
+                               ? mem_hold_wb_robid : mem_dc_fast_robid_r;
+    assign mem_fast_safe_data  = mem_hold_wb_valid
+                               ? mem_hold_wb_data : mem_dc_fast_data_r;
 
     // `LSU_WB_PIPE` 打开时，LSU 写回整总线打一拍再进 RS/ROB，
     // 切断 D$ hit → mem_wb_valid → RS 组合长链（合规 RTL 切割，非改综实参数）。
@@ -1863,8 +1967,13 @@ module core_top #(
         .dc_wr_uncached_o(sb_dc_wr_uncached),
         .dc_wr_addr_ok_i (dc_sb_addr_ok),
         .dc_wr_done_i    (dc_sb_done),
+        .query_valid_i   (lsu_sb_qvalid),
         .query_paddr_i   (lsu_sb_qpaddr),
         .query_uncached_i(lsu_sb_quncached),
+        .query_resp_valid_o(sb_q_resp_valid),
+        .query_resp_paddr_o(sb_q_resp_paddr),
+        .query_resp_uncached_o(sb_q_resp_uncached),
+        .query_maybe_o   (sb_q_maybe),
         .query_hit_o     (sb_q_hit),
         .query_data_o    (sb_q_data),
         .query_partial_o (sb_q_partial)
@@ -2088,6 +2197,35 @@ module core_top #(
         .cmt_clear1_i     (cmt_rob_clear1)
     );
 
+    // The normal LSU writeback bus is already registered by LSU_WB_PIPE.
+    // When that registered result is at the ROB head, let commit consume it
+    // in the same cycle in which ROB stores it.  This removes one retirement
+    // bubble without restoring any raw DCache -> ROB/commit path.
+    wire [`ROB_W-1:0] rob_head_robid1 =
+        {1'b1, rob_head_robid0[`ROB_PAIR_W-1:0]};
+    wire cmt_mem_bypass0 = mem_wb_valid
+                         && (mem_wb_robid == rob_head_robid0);
+    wire cmt_mem_bypass1 = mem_wb_valid
+                         && (mem_wb_robid == rob_head_robid1);
+    wire cmt0_complete_eff = rob_cmt0_complete || cmt_mem_bypass0;
+    wire cmt1_complete_eff = rob_cmt1_complete || cmt_mem_bypass1;
+    wire [31:0] cmt0_result_eff = cmt_mem_bypass0 ? mem_wb_data : rob_cmt0_result;
+    wire [31:0] cmt1_result_eff = cmt_mem_bypass1 ? mem_wb_data : rob_cmt1_result;
+    wire [31:0] cmt0_paddr_eff = cmt_mem_bypass0 ? mem_wb_paddr : rob_cmt0_paddr;
+    wire [31:0] cmt1_paddr_eff = cmt_mem_bypass1 ? mem_wb_paddr : rob_cmt1_paddr;
+    wire [31:0] cmt0_vaddr_eff = cmt_mem_bypass0 ? mem_wb_vaddr : rob_cmt0_vaddr;
+    wire [31:0] cmt1_vaddr_eff = cmt_mem_bypass1 ? mem_wb_vaddr : rob_cmt1_vaddr;
+    wire [3:0] cmt0_wstrb_eff = cmt_mem_bypass0 ? mem_wb_wstrb : rob_cmt0_wstrb;
+    wire [3:0] cmt1_wstrb_eff = cmt_mem_bypass1 ? mem_wb_wstrb : rob_cmt1_wstrb;
+    wire [2:0] cmt0_size_eff = cmt_mem_bypass0 ? mem_wb_size : rob_cmt0_size;
+    wire [2:0] cmt1_size_eff = cmt_mem_bypass1 ? mem_wb_size : rob_cmt1_size;
+    wire cmt0_uncached_eff = cmt_mem_bypass0 ? mem_wb_uncached : rob_cmt0_uncached;
+    wire cmt1_uncached_eff = cmt_mem_bypass1 ? mem_wb_uncached : rob_cmt1_uncached;
+    wire [`EXCP_NUM-1:0] cmt0_excp_eff = rob_cmt0_excp
+                                      | ({`EXCP_NUM{cmt_mem_bypass0}} & mem_wb_excp);
+    wire [`EXCP_NUM-1:0] cmt1_excp_eff = rob_cmt1_excp
+                                      | ({`EXCP_NUM{cmt_mem_bypass1}} & mem_wb_excp);
+
 //--------------------------------------------------
 // commit：提交级（双提交仲裁 + 异常/特权/误预测处理）
 //--------------------------------------------------
@@ -2095,20 +2233,20 @@ module core_top #(
         .flush_pending_i   (flush),   // ctrl 寄存器版 flush:广播拍闸住退休,防误提交
         .head_robid0_i     (rob_head_robid0),
         .cmt0_valid_i      (rob_cmt0_valid),
-        .cmt0_complete_i   (rob_cmt0_complete),
+        .cmt0_complete_i   (cmt0_complete_eff),
         .cmt0_pc_i         (rob_cmt0_pc),
         .cmt0_inst_i       (rob_cmt0_inst),
         .cmt0_inst_is_b0_i (rob_cmt0_inst_is_b0),
         .cmt0_rf_we_i      (rob_cmt0_rf_we),
         .cmt0_rd_i         (rob_cmt0_rd),
-        .cmt0_result_i     (rob_cmt0_result),
+        .cmt0_result_i     (cmt0_result_eff),
         .cmt0_result2_i    (rob_cmt0_result2),
         .cmt0_is_store_i   (rob_cmt0_is_store),
-        .cmt0_paddr_i      (rob_cmt0_paddr),
-        .cmt0_vaddr_i      (rob_cmt0_vaddr),
-        .cmt0_wstrb_i      (rob_cmt0_wstrb),
-        .cmt0_size_i       (rob_cmt0_size),
-        .cmt0_uncached_i   (rob_cmt0_uncached),
+        .cmt0_paddr_i      (cmt0_paddr_eff),
+        .cmt0_vaddr_i      (cmt0_vaddr_eff),
+        .cmt0_wstrb_i      (cmt0_wstrb_eff),
+        .cmt0_size_i       (cmt0_size_eff),
+        .cmt0_uncached_i   (cmt0_uncached_eff),
         .cmt0_is_branch_i  (rob_cmt0_is_branch),
         .cmt0_br_type_i    (rob_cmt0_br_type),
         .cmt0_pred_taken_i (rob_cmt0_pred_taken),
@@ -2120,23 +2258,23 @@ module core_top #(
         .cmt0_csr_num_i    (rob_cmt0_csr_num),
         .cmt0_tlb_op_i     (rob_cmt0_tlb_op),
         .cmt0_cacop_code_i (rob_cmt0_cacop_code),
-        .cmt0_excp_i       (rob_cmt0_excp),
+        .cmt0_excp_i       (cmt0_excp_eff),
         .cmt1_valid_i      (rob_cmt1_valid),
-        .cmt1_complete_i   (rob_cmt1_complete),
+        .cmt1_complete_i   (cmt1_complete_eff),
         .cmt1_pc_i         (rob_cmt1_pc),
         .cmt1_inst_i       (rob_cmt1_inst),
         .cmt1_inst_is_b0_i (rob_cmt1_inst_is_b0),
         .cmt1_is_direct_b_i(rob_cmt1_is_direct_b),
         .cmt1_rf_we_i      (rob_cmt1_rf_we),
         .cmt1_rd_i         (rob_cmt1_rd),
-        .cmt1_result_i     (rob_cmt1_result),
+        .cmt1_result_i     (cmt1_result_eff),
         .cmt1_result2_i    (rob_cmt1_result2),
         .cmt1_is_store_i   (rob_cmt1_is_store),
-        .cmt1_paddr_i      (rob_cmt1_paddr),
-        .cmt1_vaddr_i      (rob_cmt1_vaddr),
-        .cmt1_wstrb_i      (rob_cmt1_wstrb),
-        .cmt1_size_i       (rob_cmt1_size),
-        .cmt1_uncached_i   (rob_cmt1_uncached),
+        .cmt1_paddr_i      (cmt1_paddr_eff),
+        .cmt1_vaddr_i      (cmt1_vaddr_eff),
+        .cmt1_wstrb_i      (cmt1_wstrb_eff),
+        .cmt1_size_i       (cmt1_size_eff),
+        .cmt1_uncached_i   (cmt1_uncached_eff),
         .cmt1_is_branch_i  (rob_cmt1_is_branch),
         .cmt1_br_type_i    (rob_cmt1_br_type),
         .cmt1_pred_taken_i (rob_cmt1_pred_taken),
@@ -2148,7 +2286,7 @@ module core_top #(
         .cmt1_csr_num_i    (rob_cmt1_csr_num),
         .cmt1_tlb_op_i     (rob_cmt1_tlb_op),
         .cmt1_cacop_code_i (rob_cmt1_cacop_code),
-        .cmt1_excp_i       (rob_cmt1_excp),
+        .cmt1_excp_i       (cmt1_excp_eff),
         .rob_pop_o         (cmt_rob_pop),
         .rob_clear0_o      (cmt_rob_clear0),
         .rob_clear1_o      (cmt_rob_clear1),
@@ -2198,9 +2336,9 @@ module core_top #(
         .tlb_op_cmt_o      (cmt_tlb_op),
         .invtlb_asid_o     (cmt_invtlb_asid),
         .invtlb_vpn_o      (cmt_invtlb_vpn),
-        .icacop_valid_o    (cmt_icacop_valid),
-        .icacop_op_o       (cmt_icacop_op),
-        .icacop_addr_o     (cmt_icacop_addr),
+        .icacop_valid_o    (cmt_icacop_issue),
+        .icacop_op_o       (cmt_icacop_issue_op),
+        .icacop_addr_o     (cmt_icacop_issue_addr),
         .dcacop_valid_o    (cmt_dcacop_valid),
         .dcacop_op_o       (cmt_dcacop_op),
         .dcacop_addr_o     (cmt_dcacop_addr),
@@ -2272,6 +2410,7 @@ module core_top #(
     wire [31:0] mmu_tlbm_data_vaddr;
     wire [31:0] tlbm_inst_paddr;
     wire [1:0]  tlbm_inst_mat;
+    wire        tlbm_inst_ready;
     wire        tlbm_inst_ex_adef;   // PLV3 取指越界（ADEF 特权子情形）
     wire        tlbm_inst_ex_tlbr, tlbm_inst_ex_pif, tlbm_inst_ex_ppi;
     wire        tlbm_inst_direct_ok;
@@ -2280,6 +2419,7 @@ module core_top #(
     wire        tlbm_inst_direct_excp; // 直发路径专用（仅 CAM 口径）
     wire [31:0] tlbm_data_paddr;
     wire [1:0]  tlbm_data_mat;
+    wire        tlbm_data_ready;
     wire        tlbm_data_ex_adem;   // PLV3 访存越界（ADEM）
     wire        tlbm_data_ex_tlbr, tlbm_data_ex_pil, tlbm_data_ex_pis;
     wire        tlbm_data_ex_ppi,  tlbm_data_ex_pme;
@@ -2301,6 +2441,7 @@ module core_top #(
     mmu u_mmu(
         .i_req_i           (ifu_mmu_req),
         .i_vaddr_i         (ifu_mmu_vaddr),
+        .i_ready_o         (mmu_i_ready),
         .i_paddr_o         (mmu_i_paddr),
         .i_mat_o           (mmu_i_mat),
         .i_excp_adef_o     (mmu_i_adef),
@@ -2312,6 +2453,7 @@ module core_top #(
         .d_req_i           (lsu_mmu_req),
         .d_is_store_i      (lsu_mmu_is_store),
         .d_vaddr_i         (lsu_mmu_vaddr),
+        .d_ready_o         (mmu_d_ready),
         .d_paddr_o         (mmu_d_paddr),
         .d_mat_o           (mmu_d_mat),
         .d_excp_adem_o     (mmu_d_adem),
@@ -2327,6 +2469,7 @@ module core_top #(
         .tlbm_data_vaddr_o (mmu_tlbm_data_vaddr),
         .tlbm_inst_paddr_i (tlbm_inst_paddr),
         .tlbm_inst_mat_i   (tlbm_inst_mat),
+        .tlbm_inst_ready_i (tlbm_inst_ready),
         .tlbm_inst_ex_adef_i(tlbm_inst_ex_adef),
         .tlbm_inst_ex_tlbr_i(tlbm_inst_ex_tlbr),
         .tlbm_inst_ex_pif_i(tlbm_inst_ex_pif),
@@ -2337,6 +2480,7 @@ module core_top #(
         .tlbm_inst_direct_excp_i(tlbm_inst_direct_excp),
         .tlbm_data_paddr_i (tlbm_data_paddr),
         .tlbm_data_mat_i   (tlbm_data_mat),
+        .tlbm_data_ready_i (tlbm_data_ready),
         .tlbm_data_ex_tlbr_i(tlbm_data_ex_tlbr),
         .tlbm_data_ex_pil_i(tlbm_data_ex_pil),
         .tlbm_data_ex_pis_i(tlbm_data_ex_pis),
@@ -2393,6 +2537,7 @@ module core_top #(
         .invtlb_vpn     (cmt_invtlb_vpn),
         .inst_paddr     (tlbm_inst_paddr),
         .inst_mat       (tlbm_inst_mat),
+        .inst_ready     (tlbm_inst_ready),
         .inst_ex_adef   (tlbm_inst_ex_adef),
         .inst_ex_tlbr   (tlbm_inst_ex_tlbr),
         .inst_ex_pif    (tlbm_inst_ex_pif),
@@ -2403,6 +2548,7 @@ module core_top #(
         .inst_direct_excp(tlbm_inst_direct_excp),
         .data_paddr     (tlbm_data_paddr),
         .data_mat       (tlbm_data_mat),
+        .data_ready     (tlbm_data_ready),
         .data_ex_adem   (tlbm_data_ex_adem),
         .data_ex_tlbr   (tlbm_data_ex_tlbr),
         .data_ex_pil    (tlbm_data_ex_pil),
@@ -2933,13 +3079,14 @@ module core_top #(
             cmt0_ld_en_r    <= (cmt_dbg0_valid && rob_cmt0_is_load)
                                ? {2'b0, dbg0_is_ll_w, dbg0_is_ld_w, dbg0_is_ld_hu,
                                   dbg0_is_ld_h, dbg0_is_ld_bu, dbg0_is_ld_b} : 8'b0;
-            cmt0_ld_paddr_r <= rob_cmt0_paddr;
-            cmt0_ld_vaddr_r <= rob_cmt0_vaddr;
+            // Match commit/SB: same-cycle mem_wb bypass sees ROB before NBA writeback.
+            cmt0_ld_paddr_r <= cmt0_paddr_eff;
+            cmt0_ld_vaddr_r <= cmt0_vaddr_eff;
             cmt0_st_en_r    <= (cmt_dbg0_valid && rob_cmt0_is_store)
                                ? {4'b0, dbg0_is_sc_w, dbg0_is_st_w, dbg0_is_st_h, dbg0_is_st_b} : 8'b0;
-            cmt0_st_paddr_r <= rob_cmt0_paddr;
-            cmt0_st_vaddr_r <= rob_cmt0_vaddr;
-            cmt0_st_data_r  <= rob_cmt0_result;
+            cmt0_st_paddr_r <= cmt0_paddr_eff;
+            cmt0_st_vaddr_r <= cmt0_vaddr_eff;
+            cmt0_st_data_r  <= cmt0_result_eff;
             cmt0_is_cnt_r   <= cmt_dbg0_valid && dbg0_is_cntinst;
             cmt0_timer64_r  <= dbg0_timer64;
             cmt0_is_tlbfill_r  <= cmt_dbg0_valid && dbg0_is_tlbfill;
@@ -2960,13 +3107,13 @@ module core_top #(
             cmt1_ld_en_r    <= (cmt_dbg1_valid && rob_cmt1_is_load)
                                ? {2'b0, dbg1_is_ll_w, dbg1_is_ld_w, dbg1_is_ld_hu,
                                   dbg1_is_ld_h, dbg1_is_ld_bu, dbg1_is_ld_b} : 8'b0;
-            cmt1_ld_paddr_r <= rob_cmt1_paddr;
-            cmt1_ld_vaddr_r <= rob_cmt1_vaddr;
+            cmt1_ld_paddr_r <= cmt1_paddr_eff;
+            cmt1_ld_vaddr_r <= cmt1_vaddr_eff;
             cmt1_st_en_r    <= (cmt_dbg1_valid && rob_cmt1_is_store)
                                ? {4'b0, dbg1_is_sc_w, dbg1_is_st_w, dbg1_is_st_h, dbg1_is_st_b} : 8'b0;
-            cmt1_st_paddr_r <= rob_cmt1_paddr;
-            cmt1_st_vaddr_r <= rob_cmt1_vaddr;
-            cmt1_st_data_r  <= rob_cmt1_result;
+            cmt1_st_paddr_r <= cmt1_paddr_eff;
+            cmt1_st_vaddr_r <= cmt1_vaddr_eff;
+            cmt1_st_data_r  <= cmt1_result_eff;
             cmt1_is_cnt_r   <= cmt_dbg1_valid && dbg1_is_cntinst;
             cmt1_timer64_r  <= dbg1_timer64;
             cmt1_is_tlbfill_r  <= cmt_dbg1_valid && dbg1_is_tlbfill;
@@ -3610,12 +3757,40 @@ final begin
              u_lsu.lsu_stq_full_cyc, perf_rate(u_lsu.lsu_stq_full_cyc, perf_cycle_count),
              perf_avg_occ(u_lsu.lsu_stq_occ_sum, perf_cycle_count),
              u_lsu.lsu_stq_occ_max, `STQ_DEPTH);
+    $display("LSU pipe diag:      issue=%0d qfull=%0d ablock=%0d dc_fire=%0d cached=%0d uncached=%0d",
+             u_lsu.lsu_issue_accept_cnt, u_lsu.lsu_q_full_cyc,
+             u_lsu.lsu_a_block_cyc, u_lsu.lsu_dc_fire_cnt,
+             u_lsu.lsu_dc_cached_fire_cnt, u_lsu.lsu_dc_uncached_fire_cnt);
+    $display("LSU D load cycles:  cached=%0d uncached=%0d uc_not_head=%0d uc_head=%0d",
+             u_lsu.lsu_d_cached_load_cyc, u_lsu.lsu_d_uncached_load_cyc,
+             u_lsu.lsu_d_uncached_not_head_cyc, u_lsu.lsu_d_uncached_head_cyc);
+    $display("LSU D blockers:     no_token=%0d sb_wait=%0d hold=%0d dc_not_accept=%0d",
+             u_lsu.lsu_d_no_token_cyc, u_lsu.lsu_d_sb_wait_cyc,
+             u_lsu.lsu_d_h_wait_cyc, u_lsu.lsu_d_dc_not_accept_cyc);
     $display("RS_MEM src stall:   %0d  (%.2f%%)",
              u_rs_mem.rsm_src_stall_cyc, perf_rate(u_rs_mem.rsm_src_stall_cyc, perf_cycle_count));
     $display("RS_MEM LSU stall:   %0d  (%.2f%%)",
              u_rs_mem.rsm_lsu_stall_cyc, perf_rate(u_rs_mem.rsm_lsu_stall_cyc, perf_cycle_count));
     $display("RS_MEM full stall:  %0d  (%.2f%%)",
              u_rs_mem.rsm_full_stall_cyc, perf_rate(u_rs_mem.rsm_full_stall_cyc, perf_cycle_count));
+    $display("Dual-load decode:   mem_pair=%0d plain_load=%0d independent=%0d bases_ready=%0d",
+             u_rename.ren_mem_pair_at_dispatch,
+             u_rename.ren_dual_plain_load_pair,
+             u_rename.ren_dual_load_independent,
+             u_rename.ren_dual_load_bases_ready);
+    $display("Dual-load banks:    diff=%0d same=%0d same_line=%0d (diff/ready=%.2f%%)",
+             u_rename.ren_dual_load_diff_bank_count,
+             u_rename.ren_dual_load_same_bank,
+             u_rename.ren_dual_load_same_line,
+             perf_rate(u_rename.ren_dual_load_diff_bank_count,
+                       u_rename.ren_dual_load_bases_ready));
+    $display("Dual-load RS ready: opp=%0d same_line=%0d diff_bank=%0d same_bank_diff_line=%0d",
+             u_rs_mem.rsm_dual_ready_opp,
+             u_rs_mem.rsm_dual_ready_same_line,
+             u_rs_mem.rsm_dual_ready_diff_bank,
+             u_rs_mem.rsm_dual_ready_same_bank_diff_line);
+    $display("Dual-load head pair: same_line=%0d",
+             u_rs_mem.rsm_head_pair_same_line);
     // MPKI / RAS-predec / IB-FTQ / D$ outstanding / flush-redirect
     $display("---- frontend / branch / D$ outstanding ----");
     $display("Branch MPKI:        all=%.3f  cond=%.3f  (mispred*1000/retire)",

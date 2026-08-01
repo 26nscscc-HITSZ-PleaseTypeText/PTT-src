@@ -55,6 +55,7 @@ module l1_tlb #(
     output wire [19:0]   cam_ppn_o,
     output wire [1:0]    cam_mat_o,
     output wire          cam_v_o,
+    output wire          cam_d_o,
     output wire [1:0]    cam_plv_o,
 
     // ---------------- 下游主 TLB 查询口（连 tlb.v 的 s0 或 s1 口）----------------
@@ -141,6 +142,7 @@ assign plv_o   = l1_hit ? hit_plv : tlb_plv_i;
 assign cam_ppn_o = hit_ppn;
 assign cam_mat_o = hit_mat;
 assign cam_v_o   = hit_v;
+assign cam_d_o   = hit_d;
 assign cam_plv_o = hit_plv;
 
 // ---------------- 回填（FIFO 替换）----------------

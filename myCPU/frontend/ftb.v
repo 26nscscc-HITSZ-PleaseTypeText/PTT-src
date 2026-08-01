@@ -37,7 +37,12 @@ module ftb(
 );
 
 localparam TAGW    = 32 - 2 - `FTB_INDEX_W;        // pc[31:(2+INDEX)]；2048 组时为 19
-localparam ENTRY_W = 1 + TAGW + `BR_TYPE_W + `BLK_LEN_W + 32;  // 57
+localparam TARGET_LSB = 0;
+localparam FALL_LSB   = TARGET_LSB + 32;
+localparam LEN_LSB    = FALL_LSB + 32;
+localparam BTYPE_LSB  = LEN_LSB + `BLK_LEN_W;
+localparam ENTRY_W =
+    1 + TAGW + `BR_TYPE_W + `BLK_LEN_W + 32 + 32;
 localparam FTB_UPDATE_Q_DEPTH = `FTB_UPDATE_Q_DEPTH;
 localparam FTB_UPDATE_Q_PTR_W =
     (FTB_UPDATE_Q_DEPTH <= 1) ? 1 : $clog2(FTB_UPDATE_Q_DEPTH);
@@ -53,11 +58,14 @@ reg [`BR_TYPE_W-1:0]  u0_btype;
 reg                   u1_valid;
 reg [31:2]            u1_pc_word;
 reg [31:0]            u1_target;
+reg [31:0]            u1_fall;
 reg [`BR_TYPE_W-1:0]  u1_btype;
 reg [`BLK_LEN_W-1:0]  u1_len;
 
 wire [`BLK_LEN_W-1:0] u0_len =
     u0_ft_wordoff - u0_pc_word[`BLK_LEN_W+1:2];
+wire [31:2] u0_fall_word =
+    u0_pc_word + {{(30-`BLK_LEN_W){1'b0}}, u0_len};
 
 wire [`FTB_INDEX_W-1:0] q_index = query_pc_i[2 +: `FTB_INDEX_W];
 wire [`FTB_INDEX_W-1:0] u1_index= u1_pc_word[2 +: `FTB_INDEX_W];
@@ -166,14 +174,15 @@ always @(*) begin
         if (q_hit[qi]) q_way = qi[1:0];
 end
 
-wire [`BLK_LEN_W-1:0] q_len = way_rdata[q_way][32 +: `BLK_LEN_W];
+wire [`BLK_LEN_W-1:0] q_len =
+    way_rdata[q_way][LEN_LSB +: `BLK_LEN_W];
 
 assign hit_o          = |q_hit;
 assign resp_valid_o   = q_valid_r;
 assign hit_way_o      = q_way;
-assign jump_target_o  = way_rdata[q_way][31:0];
-assign fall_through_o = q_pc_r + {27'b0, q_len, 2'b00};
-assign br_type_o      = way_rdata[q_way][32+`BLK_LEN_W +: `BR_TYPE_W];
+assign jump_target_o  = way_rdata[q_way][TARGET_LSB +: 32];
+assign fall_through_o = way_rdata[q_way][FALL_LSB +: 32];
+assign br_type_o      = way_rdata[q_way][BTYPE_LSB +: `BR_TYPE_W];
 
 // ---------------- 更新流水 ----------------
 // U1 拍：U0 读出的 4 路与 u1 tag 比较
@@ -205,7 +214,8 @@ wire [1:0] wr_way = u_found ? u_way : u_inv_found ? u_inv_way : victim_rr;
 
 always @(*) begin
     way_we    = {`FTB_NWAY{1'b0}};
-    way_wdata = {1'b1, u1_tag, u1_btype, u1_len, u1_target};
+    way_wdata = {1'b1, u1_tag, u1_btype, u1_len,
+                 u1_fall, u1_target};
     if (u1_valid) way_we[wr_way] = 1'b1;
 end
 
@@ -263,6 +273,7 @@ always @(posedge clk) begin
         if (u0_valid) begin
             u1_pc_word<= u0_pc_word;
             u1_target <= u0_target;
+            u1_fall   <= {u0_fall_word, 2'b00};
             u1_btype  <= u0_btype;
             u1_len    <= u0_len;                    // 块长（1~4 条指令）
         end
@@ -341,7 +352,9 @@ endmodule
 // ftb_way_ram：简单双口 RAM 模板（1R + 1W，推断 BRAM）
 // ------------------------------------------------------------
 module ftb_way_ram #(
-    parameter ENTRY_W = 1 + (32 - 2 - `FTB_INDEX_W) + `BR_TYPE_W + `BLK_LEN_W + 32
+    parameter ENTRY_W =
+        1 + (32 - 2 - `FTB_INDEX_W) + `BR_TYPE_W +
+        `BLK_LEN_W + 32 + 32
 )(
     input  wire                      clk,
     input  wire [`FTB_INDEX_W-1:0]   raddr,

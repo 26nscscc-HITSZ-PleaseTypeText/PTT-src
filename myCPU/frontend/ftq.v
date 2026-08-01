@@ -152,7 +152,22 @@ assign ifu_target_o = head_p1_bypass ? p1_target_i : blk_target[ifu_ptr];
 assign ifu_ftq_id_o = ifu_ptr;
 
 // ---------------- commit 查询口 ----------------
-assign cmt_blk_target_o = blk_target[cmt_query_id_i];
+// cmt_ptr is, by construction, the FTQ id of the oldest ROB instruction:
+// it advances only when commit releases the last instruction of a block.
+// Reading with that registered pointer avoids sending ROB-valid selection
+// through the target RAM address, target comparison, slot-1 eligibility and
+// finally back into commit/rename in one cycle.  Keep cmt_query_id_i in the
+// interface for compatibility and simulation observability.
+assign cmt_blk_target_o = blk_target[cmt_ptr];
+`ifdef SIMU
+always @(posedge clk) begin
+    if (!reset && !flush_i && cmt_valid_i &&
+        (cmt_query_id_i !== cmt_ptr)) begin
+        $error("FTQ commit pointer mismatch: query=%0d cmt_ptr=%0d",
+               cmt_query_id_i, cmt_ptr);
+    end
+end
+`endif
 
 // cmt_ptr 只随提交释放推进，predec 重定向不改变它。重定向块 R 的指令
 // 本拍才进入 IB；R 之后被 squash 的推测块尚未提交，也不会再到达提交侧。

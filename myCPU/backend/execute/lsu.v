@@ -43,6 +43,7 @@ module lsu(
     output wire                       mmu_d_is_store_o,    // 区分 PIL/PIS 与 PME
     input  wire [31:0]                mmu_d_paddr_i,
     input  wire [1:0]                 mmu_d_mat_i,
+    input  wire                       mmu_d_ready_i,
     input  wire                       mmu_d_excp_tlbr_i,
     input  wire                       mmu_d_excp_pil_i,
     input  wire                       mmu_d_excp_pis_i,
@@ -69,12 +70,18 @@ module lsu(
     input  wire [31:0]                dc_mshr_rdata_i,
     input  wire [`ROB_W-1:0]          dc_mshr_robid_i,     // 与 data_ok 同拍
 
-    // ---------------- store buffer 前递查询（DC 级组合）----------------
+    // ---------------- store buffer 前递查询（DC 级，一拍返回）----------------
+    output wire                       sb_query_valid_o,
     output wire [31:2]                sb_query_paddr_o,
     output wire                       sb_query_uncached_o, // 本查询来自 uncached load
+    input  wire                       sb_query_resp_valid_i,
+    input  wire [31:2]                sb_query_resp_paddr_i,
+    input  wire                       sb_query_resp_uncached_i,
+    input  wire                       sb_query_maybe_i,
     input  wire                       sb_query_hit_i,      // 整字可由 SB 合并前递
     input  wire [31:0]                sb_query_data_i,
     input  wire                       sb_query_partial_i,  // 部分命中：load 等排空重试
+    input  wire                       sb_empty_i,
 
     // ---------------- uncached load 许可（与 ROB head 比较）----------------
     input  wire [`ROB_W-1:0]          rob_head_robid_i,    // 编码：MSB=槽0 仍未提交，低位=head 对指针（顶层拼装，见 mycpu_top）
@@ -430,9 +437,18 @@ wire store_order_block = d_uncached ? stq_any
 // ---------------- DC 级行为 ----------------
 wire d_excp_any = |d_excp;
 
-// SB 前递查询（DC 级持续驱动）
+// SB 前递查询。空 SB 是短旁路；非空时由 SB 内部寄存完整扫描结果，
+// 返回 tag 必须与保持中的 D 级物理字地址及缓存属性一致。
 assign sb_query_paddr_o    = d_paddr[31:2];
 assign sb_query_uncached_o = d_valid && d_is_load && d_uncached;
+wire sb_query_needed = d_valid && d_is_load && !d_excp_any
+                     && (d_uncached || !stq_fwd_hit)
+                     && !sb_empty_i && sb_query_maybe_i;
+assign sb_query_valid_o = sb_query_needed;
+wire sb_query_resp_match = sb_query_resp_valid_i
+                         && (sb_query_resp_paddr_i == d_paddr[31:2])
+                         && (sb_query_resp_uncached_i == d_uncached);
+wire sb_query_ready = !sb_query_needed || sb_query_resp_match;
 
 // uncached load 许可：自己是最老未提交指令
 wire d_at_head = (d_robid[`ROB_PAIR_W-1:0] == head_pair)
@@ -447,13 +463,19 @@ assign uncached_ld_inflight_o = d_is_unc_load || u_valid;
 // - hold 槽空（防瞬态完成三方碰撞，见头注仲裁说明）；
 // - uncached load 额外等：到 ROB 头 + SB 无 uncached 残留（query_partial）
 wire d_ld_gate = !store_order_block && !h_valid && t_has_free
-              && (!d_uncached || (d_at_head && !sb_query_partial_i));
+              && sb_query_ready
+              && (!d_uncached
+                  || (d_at_head
+                      && !(sb_query_resp_match && sb_query_partial_i)));
 
 // load 处理分支
 wire d_stq_hit    = d_valid && d_is_load && !d_excp_any && !d_uncached && stq_fwd_hit;
 wire d_sb_hit     = d_valid && d_is_load && !d_excp_any && !d_uncached
-                  && !d_stq_hit && sb_query_hit_i;
-wire d_sb_partial = d_valid && d_is_load && !d_excp_any && !d_uncached && sb_query_partial_i;
+                  && !d_stq_hit && sb_query_needed
+                  && sb_query_resp_match && sb_query_hit_i;
+wire d_sb_partial = d_valid && d_is_load && !d_excp_any && !d_uncached
+                  && sb_query_needed && sb_query_resp_match
+                  && sb_query_partial_i;
 
 wire d_need_dc = d_valid && d_is_load && !d_excp_any
               && !d_stq_hit && !d_sb_hit && !d_sb_partial;
@@ -595,7 +617,9 @@ wire a_older_than_u = !u_valid
 wire u_reload = u_at_head && (!d_valid || d_done || d_uc_yield);
 wire d_free   = !d_valid || d_done
              || (d_uc_yield && !u_valid && a_valid && a_older_than_d && !u_reload);
-wire a_go     = a_valid && d_free && !u_reload && a_older_than_u;
+wire a_translate_ready = a_no_trans || mmu_d_ready_i;
+wire a_go     = a_valid && a_translate_ready
+              && d_free && !u_reload && a_older_than_u;
 wire d_park   = (d_uc_yield && a_go && !u_valid) || (d_uc_yield && u_reload);
 
 // Do not use a_go here: a_go contains the SB lookup result and formed the
@@ -802,6 +826,20 @@ assign early_wakeup_robid_o = dc_return ? t_robid[t_match_idx] : d_robid;
 reg [63:0] lsu_store_order_stall_cyc;
 reg [63:0] lsu_dc_wait_cyc;
 reg [63:0] lsu_stq_full_cyc;
+reg [63:0] lsu_issue_accept_cnt;
+reg [63:0] lsu_q_full_cyc;
+reg [63:0] lsu_a_block_cyc;
+reg [63:0] lsu_d_cached_load_cyc;
+reg [63:0] lsu_d_uncached_load_cyc;
+reg [63:0] lsu_d_uncached_not_head_cyc;
+reg [63:0] lsu_d_uncached_head_cyc;
+reg [63:0] lsu_d_no_token_cyc;
+reg [63:0] lsu_d_sb_wait_cyc;
+reg [63:0] lsu_d_h_wait_cyc;
+reg [63:0] lsu_d_dc_not_accept_cyc;
+reg [63:0] lsu_dc_fire_cnt;
+reg [63:0] lsu_dc_cached_fire_cnt;
+reg [63:0] lsu_dc_uncached_fire_cnt;
 reg [7:0]  lsu_stq_occ_now;
 reg [7:0]  lsu_stq_occ_max;
 reg [63:0] lsu_stq_occ_sum;
@@ -817,6 +855,20 @@ always @(posedge clk) begin
         lsu_store_order_stall_cyc <= 64'd0;
         lsu_dc_wait_cyc           <= 64'd0;
         lsu_stq_full_cyc          <= 64'd0;
+        lsu_issue_accept_cnt      <= 64'd0;
+        lsu_q_full_cyc            <= 64'd0;
+        lsu_a_block_cyc           <= 64'd0;
+        lsu_d_cached_load_cyc     <= 64'd0;
+        lsu_d_uncached_load_cyc   <= 64'd0;
+        lsu_d_uncached_not_head_cyc <= 64'd0;
+        lsu_d_uncached_head_cyc   <= 64'd0;
+        lsu_d_no_token_cyc        <= 64'd0;
+        lsu_d_sb_wait_cyc         <= 64'd0;
+        lsu_d_h_wait_cyc          <= 64'd0;
+        lsu_d_dc_not_accept_cyc   <= 64'd0;
+        lsu_dc_fire_cnt           <= 64'd0;
+        lsu_dc_cached_fire_cnt    <= 64'd0;
+        lsu_dc_uncached_fire_cnt  <= 64'd0;
         lsu_stq_occ_max           <= 8'd0;
         lsu_stq_occ_sum           <= 64'd0;
     end else if (!flush_i) begin
@@ -826,6 +878,36 @@ always @(posedge clk) begin
             lsu_dc_wait_cyc <= lsu_dc_wait_cyc + 64'd1;
         if (stq_full)
             lsu_stq_full_cyc <= lsu_stq_full_cyc + 64'd1;
+        if (issue_accept)
+            lsu_issue_accept_cnt <= lsu_issue_accept_cnt + 64'd1;
+        if (q_valid)
+            lsu_q_full_cyc <= lsu_q_full_cyc + 64'd1;
+        if (a_valid && !a_go)
+            lsu_a_block_cyc <= lsu_a_block_cyc + 64'd1;
+        if (d_valid && d_is_load && !d_uncached)
+            lsu_d_cached_load_cyc <= lsu_d_cached_load_cyc + 64'd1;
+        if (d_valid && d_is_load && d_uncached) begin
+            lsu_d_uncached_load_cyc <= lsu_d_uncached_load_cyc + 64'd1;
+            if (d_at_head)
+                lsu_d_uncached_head_cyc <= lsu_d_uncached_head_cyc + 64'd1;
+            else
+                lsu_d_uncached_not_head_cyc <= lsu_d_uncached_not_head_cyc + 64'd1;
+        end
+        if (d_valid && d_is_load && !t_has_free)
+            lsu_d_no_token_cyc <= lsu_d_no_token_cyc + 64'd1;
+        if (d_valid && d_is_load && sb_query_needed && !sb_query_ready)
+            lsu_d_sb_wait_cyc <= lsu_d_sb_wait_cyc + 64'd1;
+        if (d_valid && d_is_load && h_valid)
+            lsu_d_h_wait_cyc <= lsu_d_h_wait_cyc + 64'd1;
+        if (dc_req_o && !dc_addr_ok_i)
+            lsu_d_dc_not_accept_cyc <= lsu_d_dc_not_accept_cyc + 64'd1;
+        if (dc_fire) begin
+            lsu_dc_fire_cnt <= lsu_dc_fire_cnt + 64'd1;
+            if (d_uncached)
+                lsu_dc_uncached_fire_cnt <= lsu_dc_uncached_fire_cnt + 64'd1;
+            else
+                lsu_dc_cached_fire_cnt <= lsu_dc_cached_fire_cnt + 64'd1;
+        end
         lsu_stq_occ_sum <= lsu_stq_occ_sum + {56'd0, lsu_stq_occ_now};
         if (lsu_stq_occ_now > lsu_stq_occ_max)
             lsu_stq_occ_max <= lsu_stq_occ_now;

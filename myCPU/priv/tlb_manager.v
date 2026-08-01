@@ -85,6 +85,7 @@ module tlb_manager #(
 
     output wire [31:0]                  inst_paddr,
     output wire [1:0]                   inst_mat,
+    output wire                         inst_ready,
     output wire                         inst_ex_adef,   // PLV3 取指越界（ADEF 特权子情形）
     output wire                         inst_ex_tlbr,
     output wire                         inst_ex_pif,
@@ -97,6 +98,7 @@ module tlb_manager #(
 
     output wire [31:0]                  data_paddr,
     output wire [1:0]                   data_mat,
+    output wire                         data_ready,
     output wire                         data_ex_adem,   // PLV3 访存越界（ADEM）
     output wire                         data_ex_tlbr,
     output wire                         data_ex_pil,
@@ -228,6 +230,7 @@ wire l1i_cam_hit;
 wire [19:0] l1i_cam_ppn;
 wire [1:0] l1i_cam_mat;
 wire l1i_cam_v;
+wire l1i_cam_d_unused;
 wire [1:0] l1i_cam_plv;
 l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
     .clk            (clk),
@@ -246,6 +249,7 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
     .cam_ppn_o      (l1i_cam_ppn),
     .cam_mat_o      (l1i_cam_mat),
     .cam_v_o        (l1i_cam_v),
+    .cam_d_o        (l1i_cam_d_unused),
     .cam_plv_o      (l1i_cam_plv),
     .tlb_vppn_o     (l1i_tlb_vppn),
     .tlb_va_bit12_o (l1i_tlb_va_bit12),
@@ -258,12 +262,14 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_i (
     .tlb_plv_i      (s0_plv)
 );
 
-// D 侧微表连接主表 s1；I/D 共用 l1_tlb 接口，D 侧不消费 CAM 探测属性。
-wire l1d_cam_hit_unused;
-wire [19:0] l1d_cam_ppn_unused;
-wire [1:0] l1d_cam_mat_unused;
-wire l1d_cam_v_unused;
-wire [1:0] l1d_cam_plv_unused;
+// D 侧 CAM 命中在本拍直接完成；只有 CAM miss 才把主 TLB 结果打一拍。
+// 这样把 32 项主 TLB 的匹配/独热选择从 LSU AGU->D$ 关键路径中摘除。
+wire l1d_cam_hit;
+wire [19:0] l1d_cam_ppn;
+wire [1:0] l1d_cam_mat;
+wire l1d_cam_v;
+wire l1d_cam_d;
+wire [1:0] l1d_cam_plv;
 l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_d (
     .clk            (clk),
     .reset          (reset),
@@ -271,17 +277,18 @@ l1_tlb #(.ENTRY_NUM(8)) u_l1_tlb_d (
     .req_valid_i    (data_req),
     .vaddr_i        (data_vaddr[31:12]),
     .found_o        (l1d_found),
-    .l1_hit_o       (l1d_cam_hit_unused),
+    .l1_hit_o       (l1d_cam_hit),
     .ppn_o          (l1d_ppn),
     .ps_o           (l1d_ps),
     .mat_o          (l1d_mat),
     .v_o            (l1d_v),
     .d_o            (l1d_d),
     .plv_o          (l1d_plv),
-    .cam_ppn_o      (l1d_cam_ppn_unused),
-    .cam_mat_o      (l1d_cam_mat_unused),
-    .cam_v_o        (l1d_cam_v_unused),
-    .cam_plv_o      (l1d_cam_plv_unused),
+    .cam_ppn_o      (l1d_cam_ppn),
+    .cam_mat_o      (l1d_cam_mat),
+    .cam_v_o        (l1d_cam_v),
+    .cam_d_o        (l1d_cam_d),
+    .cam_plv_o      (l1d_cam_plv),
     .tlb_vppn_o     (l1d_tlb_vppn),
     .tlb_va_bit12_o (l1d_tlb_va_bit12),
     .tlb_found_i    (s1_found),
@@ -382,12 +389,124 @@ tlb #(.TLBNUM(TLBNUM)) u_tlb (
 // 统一以 L1 微表输出（l1i_*/l1d_*）为准——微表命中时用缓存副本、
 // miss 时即主表结果透传，保证 paddr 与异常判定同源。
 // ------------------------------------------------------------
-wire [31:0] inst_tlb_paddr = (l1i_ps === PS_4KB) ? {l1i_ppn, inst_vaddr[11:0]} : {l1i_ppn[19:10], inst_vaddr[21:0]};
-wire [31:0] data_tlb_paddr = (l1d_ps === PS_4KB) ? {l1d_ppn, data_vaddr[11:0]} : {l1d_ppn[19:10], data_vaddr[21:0]};
-
 // 特权越界（ADEF/ADEM）时地址本身非法，屏蔽 TLB 查表异常
 wire inst_need_tlb = pg_mode && !inst_dmw0_hit && !inst_dmw1_hit && !inst_plv_oob;
 wire data_need_tlb = pg_mode && !data_dmw0_hit && !data_dmw1_hit && !data_plv_oob;
+
+// Keep an L1 I-TLB hit on the same-cycle fetch path.  An L1 miss samples the
+// main TLB here and is consumed on the following cycle while the FTQ head is
+// held.  The main 32-entry associative select no longer reaches IFU PRE D pins.
+reg        imain_valid_q;
+reg [19:0] imain_key_q;
+reg [9:0]  imain_asid_q;
+reg        imain_found_q;
+reg [19:0] imain_ppn_q;
+reg [5:0]  imain_ps_q;
+reg [1:0]  imain_mat_q;
+reg        imain_v_q;
+reg [1:0]  imain_plv_q;
+
+wire imain_match = imain_valid_q && inst_req
+                 && (imain_key_q == inst_vaddr[31:12])
+                 && (imain_asid_q == csr_asid);
+wire inst_main_req = inst_req && inst_need_tlb
+                   && !l1i_cam_hit && !imain_match;
+
+always @(posedge clk) begin
+    if (reset || l1_fence) begin
+        imain_valid_q <= 1'b0;
+        imain_key_q   <= 20'b0;
+        imain_asid_q  <= 10'b0;
+        imain_found_q <= 1'b0;
+        imain_ppn_q   <= 20'b0;
+        imain_ps_q    <= PS_4KB;
+        imain_mat_q   <= 2'b0;
+        imain_v_q     <= 1'b0;
+        imain_plv_q   <= 2'b0;
+    end else if (inst_main_req) begin
+        imain_valid_q <= 1'b1;
+        imain_key_q   <= inst_vaddr[31:12];
+        imain_asid_q  <= csr_asid;
+        imain_found_q <= s0_found;
+        imain_ppn_q   <= s0_ppn;
+        imain_ps_q    <= s0_ps;
+        imain_mat_q   <= s0_mat;
+        imain_v_q     <= s0_v;
+        imain_plv_q   <= s0_plv;
+    end
+end
+
+assign inst_ready = inst_req
+                 && (!inst_need_tlb || l1i_cam_hit || imain_match);
+
+wire        inst_tlb_found = l1i_cam_hit ? 1'b1         : imain_found_q;
+wire [19:0] inst_tlb_ppn   = l1i_cam_hit ? l1i_cam_ppn : imain_ppn_q;
+wire [5:0]  inst_tlb_ps    = l1i_cam_hit ? PS_4KB      : imain_ps_q;
+wire [1:0]  inst_tlb_mat   = l1i_cam_hit ? l1i_cam_mat : imain_mat_q;
+wire        inst_tlb_v     = l1i_cam_hit ? l1i_cam_v   : imain_v_q;
+wire [1:0]  inst_tlb_plv   = l1i_cam_hit ? l1i_cam_plv : imain_plv_q;
+wire [31:0] inst_tlb_paddr = (inst_tlb_ps === PS_4KB)
+                           ? {inst_tlb_ppn, inst_vaddr[11:0]}
+                           : {inst_tlb_ppn[19:10], inst_vaddr[21:0]};
+
+// D 侧二级命中寄存。L1D CAM hit 仍保持零额外拍；L1D miss 时，主 TLB
+// 在本拍组合查询，结果在下一拍交给 LSU。请求在 LSU A 级保持不变，
+// 因而 key/asid 匹配既是返回 valid，也是同址重放保护。
+reg        dmain_valid_q;
+reg [19:0] dmain_key_q;
+reg [9:0]  dmain_asid_q;
+reg        dmain_found_q;
+reg [19:0] dmain_ppn_q;
+reg [5:0]  dmain_ps_q;
+reg [1:0]  dmain_mat_q;
+reg        dmain_v_q;
+reg        dmain_d_q;
+reg [1:0]  dmain_plv_q;
+
+wire dmain_match = dmain_valid_q && data_req
+                 && (dmain_key_q == data_vaddr[31:12])
+                 && (dmain_asid_q == csr_asid);
+wire data_main_req = data_req && data_need_tlb && !l1d_cam_hit && !dmain_match;
+
+always @(posedge clk) begin
+    if (reset || l1_fence) begin
+        dmain_valid_q <= 1'b0;
+        dmain_key_q   <= 20'b0;
+        dmain_asid_q  <= 10'b0;
+        dmain_found_q <= 1'b0;
+        dmain_ppn_q   <= 20'b0;
+        dmain_ps_q    <= PS_4KB;
+        dmain_mat_q   <= 2'b0;
+        dmain_v_q     <= 1'b0;
+        dmain_d_q     <= 1'b0;
+        dmain_plv_q   <= 2'b0;
+    end else if (data_main_req) begin
+        dmain_valid_q <= 1'b1;
+        dmain_key_q   <= data_vaddr[31:12];
+        dmain_asid_q  <= csr_asid;
+        dmain_found_q <= s1_found;
+        dmain_ppn_q   <= s1_ppn;
+        dmain_ps_q    <= s1_ps;
+        dmain_mat_q   <= s1_mat;
+        dmain_v_q     <= s1_v;
+        dmain_d_q     <= s1_d;
+        dmain_plv_q   <= s1_plv;
+    end
+end
+
+assign data_ready = data_req
+                 && (!data_need_tlb || l1d_cam_hit || dmain_match);
+
+wire        data_tlb_found = l1d_cam_hit ? 1'b1       : dmain_found_q;
+wire [19:0] data_tlb_ppn   = l1d_cam_hit ? l1d_cam_ppn : dmain_ppn_q;
+wire [5:0]  data_tlb_ps    = l1d_cam_hit ? PS_4KB      : dmain_ps_q;
+wire [1:0]  data_tlb_mat   = l1d_cam_hit ? l1d_cam_mat : dmain_mat_q;
+wire        data_tlb_v     = l1d_cam_hit ? l1d_cam_v   : dmain_v_q;
+wire        data_tlb_d     = l1d_cam_hit ? l1d_cam_d   : dmain_d_q;
+wire [1:0]  data_tlb_plv   = l1d_cam_hit ? l1d_cam_plv : dmain_plv_q;
+wire [31:0] data_tlb_paddr = (data_tlb_ps === PS_4KB)
+                           ? {data_tlb_ppn, data_vaddr[11:0]}
+                           : {data_tlb_ppn[19:10], data_vaddr[21:0]};
 
 // IFU 同拍发 I$：仅当本拍 paddr/异常判定不需要主 TLB 组合结果
 // （DA / DMW / 不需查表 / L1 CAM 命中）。L1 miss 走 PRE→下一拍 pre_ic_req。
@@ -421,9 +540,10 @@ assign inst_direct_mat = inst_direct_mat_raw;
 
 // TLB 查询结果和异常在同一拍组合给出，供后级直接使用。
 // 完整口径（含主表透传）：供 PRE 级锁存用；不进入 ftq_direct_req。
-assign inst_ex_tlbr = inst_req && inst_need_tlb && !l1i_found;
-assign inst_ex_pif  = inst_req && inst_need_tlb && l1i_found && !l1i_v;
-assign inst_ex_ppi  = inst_req && inst_need_tlb && l1i_found && l1i_v && (csr_crmd_plv > l1i_plv);
+assign inst_ex_tlbr = inst_ready && inst_need_tlb && !inst_tlb_found;
+assign inst_ex_pif  = inst_ready && inst_need_tlb && inst_tlb_found && !inst_tlb_v;
+assign inst_ex_ppi  = inst_ready && inst_need_tlb && inst_tlb_found && inst_tlb_v
+                   && (csr_crmd_plv > inst_tlb_plv);
 
 // 直发异常只依赖 L1 微表 CAM 命中项（cam_v/cam_plv），不含主 TLB。
 // |match0 归约与 s0_v 独热 mux。在 direct_ok=1 前提下与完整口径逐位等价。
@@ -432,11 +552,16 @@ wire inst_ex_ppi_cam = inst_req && inst_need_tlb && l1i_cam_hit && l1i_cam_v
                      && (csr_crmd_plv > l1i_cam_plv);
 assign inst_direct_excp = inst_ex_adef || inst_ex_pif_cam || inst_ex_ppi_cam;
 
-assign data_ex_tlbr = data_req && data_need_tlb && !l1d_found;
-assign data_ex_pil  = data_req && !data_is_store && data_need_tlb && l1d_found && !l1d_v;
-assign data_ex_pis  = data_req && data_is_store  && data_need_tlb && l1d_found && !l1d_v;
-assign data_ex_ppi  = data_req && data_need_tlb && l1d_found && l1d_v && (csr_crmd_plv > l1d_plv);
-assign data_ex_pme  = data_req && data_is_store && data_need_tlb && l1d_found && l1d_v && (csr_crmd_plv <= l1d_plv) && !l1d_d;
+assign data_ex_tlbr = data_ready && data_need_tlb && !data_tlb_found;
+assign data_ex_pil  = data_ready && !data_is_store && data_need_tlb
+                   && data_tlb_found && !data_tlb_v;
+assign data_ex_pis  = data_ready && data_is_store && data_need_tlb
+                   && data_tlb_found && !data_tlb_v;
+assign data_ex_ppi  = data_ready && data_need_tlb && data_tlb_found
+                   && data_tlb_v && (csr_crmd_plv > data_tlb_plv);
+assign data_ex_pme  = data_ready && data_is_store && data_need_tlb
+                   && data_tlb_found && data_tlb_v
+                   && (csr_crmd_plv <= data_tlb_plv) && !data_tlb_d;
 
 assign inst_paddr = (da_mode === 1'b1) ? inst_vaddr :
                     (inst_dmw0_hit === 1'b1) ? {csr_dmw0_pseg, inst_vaddr[28:0]} :
@@ -451,12 +576,12 @@ assign data_paddr = (da_mode === 1'b1) ? data_vaddr :
 wire [1:0] inst_mat_raw = (da_mode === 1'b1) ? csr_crmd_datf :
                           (inst_dmw0_hit === 1'b1) ? csr_dmw0_mat :
                           (inst_dmw1_hit === 1'b1) ? csr_dmw1_mat :
-                          l1i_mat;
+                          inst_tlb_mat;
 
 wire [1:0] data_mat_raw = (da_mode === 1'b1) ? csr_crmd_datm :
                           (data_dmw0_hit === 1'b1) ? csr_dmw0_mat :
                           (data_dmw1_hit === 1'b1) ? csr_dmw1_mat :
-                          l1d_mat;
+                          data_tlb_mat;
 
 // The benchmark start-up maps the on-chip RAM through a DMW with MAT=0 while
 // copying .data and clearing .bss, then changes the same window to MAT=1.

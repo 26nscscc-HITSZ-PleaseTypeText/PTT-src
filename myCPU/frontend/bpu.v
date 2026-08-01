@@ -75,7 +75,10 @@ localparam META_FTB_WAY_LSB    = 41;
 localparam META_FTQ_ID_LSB     = 55;
 
 // ---------------- 取指 PC ----------------
-reg [31:0] pc;
+// P1 correction is a late signal.  Mapping the hold mux onto the FDRE clock
+// enable gives it the shorter CE setup requirement; keep it on the D input so
+// the same logic receives the normal data setup budget.
+(* EXTRACT_ENABLE = "no" *) reg [31:0] pc;
 reg [31:0] pc_r;
 reg        flush_r;
 reg        ftq_full_r;
@@ -90,6 +93,8 @@ reg        p0_fallback_predict_r;
 reg [`BR_TYPE_W-1:0] p0_btype_r;
 reg        p0_retry_pending_r;
 wire                       ubtb_hit;
+wire                       p0_use_ubtb =
+    (`P0_DIRECT_PREDICTOR_ONLY == 0) && ubtb_hit;
 wire                       fallback_use;
 wire                       fallback_predict;
 wire [`BR_TYPE_W-1:0]      p0_btype_c;
@@ -112,11 +117,16 @@ always @(posedge clk) begin
     else
         // 与 FTQ 一致：仅“真正提交的 P0”置 wrote（同拍 p1_diff 则丢弃）
         p0_wrote_r <= p0_valid_o && !p1_diff;
-    if (p0_valid_o && !p1_diff) begin
+    // Capture every issued P0 descriptor.  When a simultaneous P1 correction
+    // cancels that P0, p0_wrote_r remains clear, so none of these payload
+    // registers can be consumed; the retry overwrites them on its next issue.
+    // Keeping p1_diff out of this enable prevents the FTB/TAGE P1 result from
+    // crossing the complete predictor and ending at all P0 register CEs.
+    if (p0_valid_o) begin
         p0_length_r <= p0_length_o;
         p0_taken_r  <= p0_taken_o;
         p0_target_r <= p0_target_o;
-        p0_ubtb_hit_r <= ubtb_hit;
+        p0_ubtb_hit_r <= p0_use_ubtb;
         p0_fallback_hit_r <= fallback_use;
         p0_fallback_predict_r <= fallback_predict;
         p0_btype_r    <= p0_btype_c;
@@ -136,12 +146,15 @@ wire [`BLK_LEN_W-1:0]      fallback_length;
 wire [`BR_TYPE_W-1:0]      fallback_btype;
 wire                       fallback_strong_taken;
 wire                       fallback_static_direct;
-assign fallback_use = !ubtb_hit && fallback_hit;
+assign fallback_use = (`P0_DIRECT_PREDICTOR_ONLY != 0)
+                    ? fallback_hit : (!ubtb_hit && fallback_hit);
 // The direct-mapped fallback is allowed to steer P0 only for descriptors
 // that are safe or highly confident.  All hits may still supply block length.
 assign fallback_predict =
     fallback_use &&
-    (((fallback_btype == `BR_TYPE_COND) && fallback_strong_taken) ||
+    (((fallback_btype == `BR_TYPE_COND)
+      && ((`P0_DIRECT_PREDICTOR_ONLY != 0)
+          ? fallback_taken : fallback_strong_taken)) ||
      (((fallback_btype == `BR_TYPE_UNCOND) ||
        (fallback_btype == `BR_TYPE_CALL)) && fallback_static_direct) ||
      ((fallback_btype == `BR_TYPE_RET) && !ras_empty));
@@ -180,7 +193,9 @@ always @(posedge clk) begin
     else if (predec_redirect_i)
         ras_ftq_alloc_ptr <= predec_redirect_id_i + 1'b1;
     // 与 FTQ bpu_ptr 保持一致，仅在真正接纳 P0 时递增。
-    else if (p0_valid_o && !p1_diff)
+    // Retimed to the registered "P0 really allocated" decision.  Checkpoint
+    // save is already at P1, so this removes the late FTB correction cone.
+    else if (p0_wrote_r)
         ras_ftq_alloc_ptr <= ras_ftq_alloc_ptr + 1'b1;
 end
 
@@ -220,26 +235,37 @@ wire service_predec_pending = !predec_q_empty && !commit_btb_update;
 // uBTB/fallback/FTB write enables.  The former empty-queue direct service made
 // IFU tail/predecode logic drive hundreds of predictor array CEs in one cycle.
 wire service_predec_current = 1'b0;
-wire btb_update_early = service_predec_pending || service_predec_current;
-wire btb_update_valid = commit_btb_update || btb_update_early;
-wire [31:0] btb_update_pc =
+wire btb_update_early_raw = service_predec_pending || service_predec_current;
+wire btb_update_valid_raw = commit_btb_update || btb_update_early_raw;
+wire [31:0] btb_update_pc_raw =
     commit_btb_update      ? train_pc_i :
     service_predec_pending ? predec_q_pc[predec_q_rptr] : 32'b0;
-wire [31:0] btb_update_target =
+wire [31:0] btb_update_target_raw =
     commit_btb_update      ? train_target_i :
     service_predec_pending ? predec_q_target[predec_q_rptr] :
                              32'b0;
-wire [`BLK_LEN_W-1:0] btb_update_length =
+wire [`BLK_LEN_W-1:0] btb_update_length_raw =
     commit_btb_update      ? ubtb_train_len :
     service_predec_pending ? predec_q_length[predec_q_rptr] :
                              {`BLK_LEN_W{1'b0}};
-wire btb_update_taken =
+wire btb_update_taken_raw =
     commit_btb_update      ? train_taken_i :
     service_predec_pending ? predec_q_taken[predec_q_rptr] : 1'b0;
-wire [`BR_TYPE_W-1:0] btb_update_btype =
+wire [`BR_TYPE_W-1:0] btb_update_btype_raw =
     commit_btb_update      ? train_br_type_i :
     service_predec_pending ? predec_q_btype[predec_q_rptr] :
                              {`BR_TYPE_W{1'b0}};
+
+// All predictor writes cross this register boundary.  It removes both the
+// predecode FIFO read pointer and the commit/FTQ metadata mux from hundreds
+// of uBTB/fallback/FTB RAM write-enables without reducing update throughput.
+reg btb_update_valid;
+reg btb_update_early;
+reg [31:0] btb_update_pc;
+reg [31:0] btb_update_target;
+reg [`BLK_LEN_W-1:0] btb_update_length;
+reg btb_update_taken;
+reg [`BR_TYPE_W-1:0] btb_update_btype;
 wire [`BLK_LEN_W+1:2] btb_update_fall_through =
     btb_update_pc[`BLK_LEN_W+1:2] + btb_update_length;
 
@@ -278,9 +304,32 @@ wire commit_ftb_known_hit =
 wire commit_ftb_static_descriptor =
     (train_br_type_i == `BR_TYPE_COND) ||
     (train_br_type_i == `BR_TYPE_RET);
-wire ftb_commit_update_filtered =
+wire ftb_commit_update_filtered_raw =
     commit_btb_update && commit_ftb_known_hit && commit_ftb_static_descriptor;
+reg ftb_commit_update_filtered;
 wire ftb_update_valid = btb_update_valid && !ftb_commit_update_filtered;
+
+always @(posedge clk) begin
+    if (reset) begin
+        btb_update_valid  <= 1'b0;
+        btb_update_early  <= 1'b0;
+        btb_update_pc     <= 32'b0;
+        btb_update_target <= 32'b0;
+        btb_update_length <= {`BLK_LEN_W{1'b0}};
+        btb_update_taken  <= 1'b0;
+        btb_update_btype  <= {`BR_TYPE_W{1'b0}};
+        ftb_commit_update_filtered <= 1'b0;
+    end else begin
+        btb_update_valid  <= btb_update_valid_raw;
+        btb_update_early  <= btb_update_early_raw;
+        btb_update_pc     <= btb_update_pc_raw;
+        btb_update_target <= btb_update_target_raw;
+        btb_update_length <= btb_update_length_raw;
+        btb_update_taken  <= btb_update_taken_raw;
+        btb_update_btype  <= btb_update_btype_raw;
+        ftb_commit_update_filtered <= ftb_commit_update_filtered_raw;
+    end
+end
 
 always @(posedge clk) begin
     if (reset) begin
@@ -438,16 +487,16 @@ wire [`BLK_LEN_W-1:0] p0_len_raw =
 wire [`BLK_LEN_W-1:0] p0_len_c = (p0_len_raw === 3'd0 || p0_len_raw === 3'bx || p0_len_raw === 3'dz)
                                  ? 3'd1 : p0_len_raw;
 wire                  p0_taken_c =
-    ubtb_hit ? ubtb_taken :
+    p0_use_ubtb ? ubtb_taken :
     fallback_predict && fallback_taken;
 wire [`BR_TYPE_W-1:0] p0_selected_btype =
-    ubtb_hit          ? ubtb_btype :
+    p0_use_ubtb       ? ubtb_btype :
     fallback_predict  ? fallback_btype :
                         `BR_TYPE_COND;
 wire [31:0]           p0_target_c =
-    ((ubtb_hit || fallback_predict) &&
+    ((p0_use_ubtb || fallback_predict) &&
      (p0_selected_btype == `BR_TYPE_RET) && !ras_empty) ? ras_top :
-    ubtb_hit                                             ? ubtb_target :
+    p0_use_ubtb                                          ? ubtb_target :
     fallback_predict                                     ? fallback_target :
                                                            32'b0;
 assign p0_btype_c = p0_selected_btype;
@@ -548,7 +597,7 @@ wire p1_ras_pop  = p1_ras_event_valid && (p1_ras_btype == `BR_TYPE_RET);
 // 到达 IFU 并请求预译码回滚，检查点不能处于未初始化状态。
 assign ras_checkpoint_save = p0_wrote_r && !flush_r && !flush_i &&
                              !predec_redirect_i && !reset;
-assign ras_checkpoint_id   = ras_ftq_alloc_ptr - 1'b1;
+assign ras_checkpoint_id   = ras_ftq_alloc_ptr;
 assign ras_spec_push       = p1_ras_push;
 assign ras_spec_push_addr  = p1_ras_fall_through;
 assign ras_spec_pop        = p1_ras_pop;

@@ -70,7 +70,19 @@ localparam integer ROW_W      = `IB_W - BANK_SEL_W;
 (* ram_style = "distributed" *) reg [ENTRY_W-1:0] bank3 [0:BANK_DEPTH-1];
 reg [`IB_W-1:0]   head;
 reg [`IB_W-1:0]   tail;
+// One-hot occupancy removes the decoder/rename-ready -> binary add/subtract
+// cone from the IB state update.  count is retained only as a decoded probe
+// for the simulation statistics in mycpu_top.
+reg [`IB_SIZE:0]  count_oh;
 reg [`IB_W:0]     count;
+integer count_decode_i;
+always @(*) begin
+    count = {(`IB_W+1){1'b0}};
+    for (count_decode_i = 0; count_decode_i <= `IB_SIZE;
+         count_decode_i = count_decode_i + 1)
+        if (count_oh[count_decode_i])
+            count = count_decode_i[`IB_W:0];
+end
 
 wire [ENTRY_W-1:0] push0_entry = {push0_excp_i, push0_ftq_id_i, push0_is_last_i,
                                   push0_pred_taken_i, push0_inst_i, push0_pc_i};
@@ -88,9 +100,9 @@ wire ib_empty_fwft_en = 1'b0;
 `else
 wire ib_empty_fwft_en = 1'b1;
 `endif
-wire stored_pop0_valid_c = (count != {(`IB_W+1){1'b0}});
-wire stored_pop1_valid_c = (count >= {{(`IB_W-1){1'b0}}, 2'd2});
-wire ft_active = ib_empty_fwft_en && (count == {(`IB_W+1){1'b0}})
+wire stored_pop0_valid_c = !count_oh[0];
+wire stored_pop1_valid_c = !(count_oh[0] || count_oh[1]);
+wire ft_active = ib_empty_fwft_en && count_oh[0]
               && push0_valid_i && can_push_o && !flush_i;
 wire pop0_valid_c = ft_active ? (push_n >= 3'd1) : stored_pop0_valid_c;
 `ifdef IB_SINGLE_EMPTY_FALLTHROUGH
@@ -106,20 +118,46 @@ wire [1:0] ft_consume_count = {1'b0, ft_active && pop0_fire}
                             + {1'b0, ft_active && pop1_fire};
 wire [1:0] stored_pop_count = ft_active ? 2'd0 : pop_n;
 wire [2:0] residual_push_count = ft_active ? (push_n - {1'b0, ft_consume_count}) : push_n;
-wire [`IB_W:0] residual_push_count_ext = {{(`IB_W-2){1'b0}}, residual_push_count};
-wire [`IB_W:0] stored_pop_count_ext    = {{(`IB_W-1){1'b0}}, stored_pop_count};
 wire [`IB_W-1:0] push_inc              = {{(`IB_W-3){1'b0}}, push_n};
 wire [`IB_W-1:0] ft_consume_inc        = {{(`IB_W-2){1'b0}}, ft_consume_count};
 wire [`IB_W-1:0] stored_pop_inc        = {{(`IB_W-2){1'b0}}, stored_pop_count};
-wire [`IB_W:0] push_cnt_n = can_push_o ? residual_push_count_ext : {(`IB_W+1){1'b0}};
-wire [`IB_W:0] count_next = ft_active
-                          ? residual_push_count_ext
-                          : (count + push_cnt_n - stored_pop_count_ext);
+wire [2:0] accepted_push_n = can_push_o ? residual_push_count : 3'd0;
+
+reg [`IB_SIZE:0] count_oh_next;
+always @(*) begin
+    count_oh_next = count_oh;
+    if (ft_active) begin
+        case (residual_push_count)
+            3'd0: count_oh_next = {{`IB_SIZE{1'b0}}, 1'b1};
+            3'd1: count_oh_next = {{(`IB_SIZE-1){1'b0}}, 2'b10};
+            3'd2: count_oh_next = {{(`IB_SIZE-2){1'b0}}, 3'b100};
+            3'd3: count_oh_next = {{(`IB_SIZE-3){1'b0}}, 4'b1000};
+            default:
+                count_oh_next = {{(`IB_SIZE-4){1'b0}}, 5'b10000};
+        endcase
+    end else begin
+        case ({accepted_push_n, stored_pop_count})
+            {3'd0,2'd1}: count_oh_next = count_oh >> 1;
+            {3'd0,2'd2}: count_oh_next = count_oh >> 2;
+            {3'd1,2'd0}: count_oh_next = count_oh << 1;
+            {3'd1,2'd2}: count_oh_next = count_oh >> 1;
+            {3'd2,2'd0}: count_oh_next = count_oh << 2;
+            {3'd2,2'd1}: count_oh_next = count_oh << 1;
+            {3'd3,2'd0}: count_oh_next = count_oh << 3;
+            {3'd3,2'd1}: count_oh_next = count_oh << 2;
+            {3'd3,2'd2}: count_oh_next = count_oh << 1;
+            {3'd4,2'd0}: count_oh_next = count_oh << 4;
+            {3'd4,2'd1}: count_oh_next = count_oh << 3;
+            {3'd4,2'd2}: count_oh_next = count_oh << 2;
+            default:     count_oh_next = count_oh;
+        endcase
+    end
+end
 
 // can_push_o 只能依赖寄存器 count，不能依赖 IFU 的 push valid，否则会与
 // ib_can_push_i 构成组合环。预留每拍最大 4 条的空间；count 为 13..16 时会
 // 保守反压，push_cnt_n 仍负责门控计数更新，保证不会溢出。
-assign can_push_o = (count <= (`IB_SIZE - 4));
+assign can_push_o = |count_oh[`IB_SIZE-4:0];
 
 wire [ROW_W-1:0]  head_row = head[`IB_W-1:BANK_SEL_W];
 wire [ROW_W-1:0]  head_row_plus1 = head_row + {{(ROW_W-1){1'b0}}, 1'b1};
@@ -181,7 +219,7 @@ integer i;
 initial begin
     head = {`IB_W{1'b0}};
     tail = {`IB_W{1'b0}};
-    count = {(`IB_W+1){1'b0}};
+    count_oh = {{`IB_SIZE{1'b0}}, 1'b1};
     for (i = 0; i < BANK_DEPTH; i = i + 1) begin
         bank0[i] = {ENTRY_W{1'b0}};
         bank1[i] = {ENTRY_W{1'b0}};
@@ -196,7 +234,7 @@ always @(posedge clk) begin
     if (reset || flush_i) begin
         head <= {`IB_W{1'b0}};
         tail <= {`IB_W{1'b0}};
-        count <= {(`IB_W+1){1'b0}};
+        count_oh <= {{`IB_SIZE{1'b0}}, 1'b1};
     end else begin
         if (can_push_o) begin
             case (tail[1:0])
@@ -239,7 +277,7 @@ always @(posedge clk) begin
             if (can_push_o)
                 tail <= tail + push_inc;
         end
-        count <= count_next;
+        count_oh <= count_oh_next;
     end
 end
 

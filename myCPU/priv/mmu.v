@@ -30,6 +30,7 @@ module mmu (
     // ---------------- I 通道（ifu）----------------
     input  wire        i_req_i,
     input  wire [31:0] i_vaddr_i,
+    output wire        i_ready_o,
     output wire [31:0] i_paddr_o,
     output wire [1:0]  i_mat_o,
     output wire        i_excp_adef_o,
@@ -44,6 +45,7 @@ module mmu (
     input  wire        d_req_i,
     input  wire        d_is_store_i,
     input  wire [31:0] d_vaddr_i,
+    output wire        d_ready_o,
     output wire [31:0] d_paddr_o,
     output wire [1:0]  d_mat_o,
     output wire        d_excp_adem_o,
@@ -62,6 +64,7 @@ module mmu (
 
     input  wire [31:0] tlbm_inst_paddr_i,    // <- tlb_manager.inst_paddr
     input  wire [1:0]  tlbm_inst_mat_i,
+    input  wire        tlbm_inst_ready_i,
     input  wire        tlbm_inst_ex_adef_i,  // <- tlb_manager.inst_ex_adef（PLV3 取指越界）
     input  wire        tlbm_inst_ex_tlbr_i,
     input  wire        tlbm_inst_ex_pif_i,
@@ -72,6 +75,7 @@ module mmu (
     input  wire        tlbm_inst_direct_excp_i, // <- tlb_manager.inst_direct_excp（直发专用）
     input  wire [31:0] tlbm_data_paddr_i,
     input  wire [1:0]  tlbm_data_mat_i,
+    input  wire        tlbm_data_ready_i,
     input  wire        tlbm_data_ex_tlbr_i,
     input  wire        tlbm_data_ex_pil_i,
     input  wire        tlbm_data_ex_pis_i,
@@ -92,6 +96,7 @@ assign tlbm_data_vaddr_o    = d_vaddr_i;
 // 不能让 X 渗入异常位（会顺着 ifu/lsu 的异常向量污染 ROB）。
 assign i_paddr_o     = tlbm_inst_paddr_i;
 assign i_mat_o       = tlbm_inst_mat_i;
+assign i_ready_o     = (i_req_i === 1'b1) && (tlbm_inst_ready_i === 1'b1);
 assign i_direct_ok_o = tlbm_inst_direct_ok_i;
 assign i_direct_paddr_o = tlbm_inst_direct_paddr_i;
 assign i_direct_mat_o   = tlbm_inst_direct_mat_i;
@@ -104,6 +109,7 @@ assign i_direct_excp_o = ((i_req_i === 1'b1) && (i_vaddr_i[1:0] != 2'b00))
                       || ((i_req_i === 1'b1) && (tlbm_inst_direct_excp_i === 1'b1));
 assign d_paddr_o     = tlbm_data_paddr_i;
 assign d_mat_o       = tlbm_data_mat_i;
+assign d_ready_o     = (d_req_i === 1'b1) && (tlbm_data_ready_i === 1'b1);
 assign d_excp_adem_o = (d_req_i === 1'b1) && (tlbm_data_ex_adem_i === 1'b1);
 
 // ---------------- 异常向量打包（位序见 mycpu.h 的 TLB_EX_*）----------------

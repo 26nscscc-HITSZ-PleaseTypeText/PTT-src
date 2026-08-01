@@ -33,6 +33,7 @@ module ifu(
 
     output wire                       mmu_i_req_o,
     output wire [31:0]                mmu_i_vaddr_o,
+    input  wire                       mmu_i_ready_i,
     input  wire [31:0]                mmu_i_paddr_i,
     input  wire [1:0]                 mmu_i_mat_i,
     input  wire                       mmu_i_excp_adef_i,
@@ -152,11 +153,31 @@ reg [`EXCP_NUM-1:0] if_excp_vec;
 reg        if_wait_data;
 reg [31:0] if_paddr;
 reg        if_uncached;
-reg [`CACHE_LINE_BITS-1:0] if_rline;
+// Four instructions aligned to if_pc[4:2] at the IF register boundary.
+// Predecode therefore reads fixed bit positions instead of putting the
+// 8-to-1 line-word mux in the predecode -> next-I$-request feedback cone.
+reg [127:0] if_rline;
 
 initial begin
-    if_rline = {`CACHE_LINE_BITS{1'b0}};
+    if_rline = 128'b0;
 end
+
+function [127:0] align_fetch_bundle;
+    input [`CACHE_LINE_BITS-1:0] line_data;
+    input [2:0] word_off;
+    begin
+        case (word_off)
+            3'd0: align_fetch_bundle = line_data[127:0];
+            3'd1: align_fetch_bundle = line_data[159:32];
+            3'd2: align_fetch_bundle = line_data[191:64];
+            3'd3: align_fetch_bundle = line_data[223:96];
+            3'd4: align_fetch_bundle = line_data[255:128];
+            3'd5: align_fetch_bundle = {32'b0, line_data[255:160]};
+            3'd6: align_fetch_bundle = {64'b0, line_data[255:192]};
+            default: align_fetch_bundle = {96'b0, line_data[255:224]};
+        endcase
+    end
+endfunction
 
 reg ic_outstanding;
 reg [31:5] ic_rsp_line;
@@ -281,6 +302,11 @@ wire if_line_ready = (if_excp === 1'b1)
 // Invalidate must combinationally stop IB push: register clear is next edge.
 wire if_ready_go = (if_v === 1'b1) && ib_can_push && if_line_ready
                 && (ic_invalidate_i !== 1'b1);
+
+// PRE/IF 两级流水：最多 2 块在途。
+// 仅当 PRE 占用且本拍无法前进（IF 占用未走 / PRE 请求未发出）时反压 FTQ；
+// predec 全量重定向当拍不接新块（FTQ 正回滚 ifu_ptr/bpu_ptr），
+// 且 PRE 中的错误路径块被丢弃（见 predec_kill）。
 wire pre_done     = (pre_v === 1'b1)
                  && (pre_excp || (pre_ic_sent === 1'b1)
                      || pre_rsp_reuse || pre_linebuf_hit);
@@ -291,6 +317,7 @@ wire predec_kill  = predec_redirect_o && (predec_fixup_only_o !== 1'b1);
 wire pre_to_if    = pre_ready_go && !predec_kill;
 assign ftq_accept_o = (ftq_valid_i === 1'b1)
                    && ((pre_v !== 1'b1) || pre_ready_go)
+                   && (mmu_i_ready_i === 1'b1)
                    && !predec_kill && (flush_i !== 1'b1)
                    && (ic_invalidate_i !== 1'b1);
 
@@ -349,7 +376,7 @@ always @(posedge clk) begin
         pre_rline      <= {`CACHE_LINE_BITS{1'b0}};
         if_v         <= 1'b0;
         if_wait_data <= 1'b0;
-        if_rline     <= {`CACHE_LINE_BITS{1'b0}};
+        if_rline     <= 128'b0;
         if_pc        <= 32'b0;
     end else begin
         // ---- PRE 级：接收新块 > 前进/被杀 > 记录请求已发 ----
@@ -406,19 +433,19 @@ always @(posedge clk) begin
             if (pre_excp) begin
                 if_wait_data <= 1'b0;
             end else if (pre_line_valid) begin
-                if_rline     <= pre_rline;
+                if_rline     <= align_fetch_bundle(pre_rline, pre_pc[4:2]);
                 if_wait_data <= 1'b0;
             end else if (pre_rsp_reuse) begin
-                if_rline     <= ic_rline_i;
+                if_rline     <= align_fetch_bundle(ic_rline_i, pre_pc[4:2]);
                 if_wait_data <= 1'b0;
             end else if (pre_linebuf_hit) begin
-                if_rline     <= linebuf_data;
+                if_rline     <= align_fetch_bundle(linebuf_data, pre_pc[4:2]);
                 if_wait_data <= 1'b0;
             end else if ((ic_data_ok_i === 1'b1) && pre_rsp_match
                          && (ic_rsp_killed !== 1'b1)) begin
                 // 只消费与 PRE 同一 cache line 的响应；旧路径应答即使与
                 // 新请求同拍返回，也不会被错误配给新块。
-                if_rline     <= ic_rline_i;
+                if_rline     <= align_fetch_bundle(ic_rline_i, pre_pc[4:2]);
                 if_wait_data <= 1'b0;
             end else begin
                 if_wait_data <= 1'b1;
@@ -428,7 +455,7 @@ always @(posedge clk) begin
             if_wait_data <= 1'b0;
         end else if (if_v && if_wait_data && (ic_data_ok_i === 1'b1)
                      && if_rsp_match && (ic_rsp_killed !== 1'b1)) begin
-            if_rline     <= ic_rline_i;
+            if_rline     <= align_fetch_bundle(ic_rline_i, if_pc[4:2]);
             if_wait_data <= 1'b0;
         end
     end
@@ -436,15 +463,12 @@ end
 
 // ---------------- 指令切割 ----------------
 // 命中与 miss 统一使用寄存后的 if_rline，不从 ic_rline_i 组合旁路。
-wire [2:0] line_off = if_pc[`CACHE_LINE_W-1:2];
-
 wire [31:0] cut_inst [0:3];
 wire [31:0] cut_pc   [0:3];
 genvar gi;
 generate
 for (gi = 0; gi < 4; gi = gi + 1) begin : gen_cut
-    assign cut_inst[gi] = if_excp ? 32'b0 :
-                          if_rline[({29'b0, line_off} + gi) * 32 +: 32];
+    assign cut_inst[gi] = if_excp ? 32'b0 : if_rline[gi * 32 +: 32];
     assign cut_pc[gi]   = if_pc + {28'b0, gi[1:0], 2'b00};
 end
 endgenerate
