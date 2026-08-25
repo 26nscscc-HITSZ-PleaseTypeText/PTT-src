@@ -1,3 +1,12 @@
-# LAsrc
-This repository is used to store different versions of our RTL code.
+# PTT-src
+这里是“请输入文本队”（PleaseTypeTest，PTT）的myCPU仓库。
+
+最终性能成绩在本地可达：81MHZ，IPC比值为2.477，系统计数器比值为6.073.
+
+但在CI平台（就是官方的代码提交与评测平台）上，最终我们的性能成绩为：77.78MHZ，IPC比值为2.33，系统计数器比值为5.5465
+
+评奖为国二。说实话，好可惜。当时就不应该在linux、soc上浪费那么多时间的。该好好提频。
+
+但前路漫漫，我们仍会砥砺前行。
+
 
